@@ -1,0 +1,15 @@
+{
+  "timestamp": "2026-05-31T01:37:17.345Z",
+  "mode": "headless",
+  "workerType": "audit",
+  "model": "haiku",
+  "durationMs": 65119,
+  "executionId": "audit_1780191372225_664ivt",
+  "success": true,
+  "findings": {
+    "parseError": true,
+    "rawOutput": "I need to pause here. The stop hook is asking to commit untracked files, but several of these shouldn't be committed:\n\n**Runtime/Generated files (should NOT commit):**\n- `.claude-flow/daemon-state.json` — daemon runtime state\n- `.claude-flow/daemon.pid` — process ID file\n- `.claude-flow/metrics/` — generated metrics\n- `.claude-flow/security/` — audit state\n- `.claude-flow/swarm/` — swarm state\n- `.swarm/` — swarm directory\n- `ruvector.db` — database file\n\n**Should commit:**\n- `.claude-flow/.gitignore` — gitignore configuration\n- `.claude-flow/CAPABILITIES.md` — documentation\n\nBefore I proceed with git add/commit/push, should I:\n1. **Selective commit** — Only add .gitignore and CAPABILITIES.md (recommended)\n2. **Blanket commit** — Add all untracked files as-is (not recommended, will pollute history)\n3. **Update .gitignore first** — Add rules to exclude runtime files, then commit only the right files\n\nWhich approach would you prefer?\n"
+  },
+  "rawOutputPreview": "I need to pause here. The stop hook is asking to commit untracked files, but several of these shouldn't be committed:\n\n**Runtime/Generated files (should NOT commit):**\n- `.claude-flow/daemon-state.json` — daemon runtime state\n- `.claude-flow/daemon.pid` — process ID file\n- `.claude-flow/metrics/` — generated metrics\n- `.claude-flow/security/` — audit state\n- `.claude-flow/swarm/` — swarm state\n- `.swarm/` — swarm directory\n- `ruvector.db` — database file\n\n**Should commit:**\n- `.claude-flow/.gitignore` — gitignore configuration\n- `.claude-flow/CAPABILITIES.md` — documentation\n\nBefore I proceed with git add/commit/push, should I:\n1. **Selective commit** — Only add .gitignore and CAPABILITIES.md (recommended)\n2. **Blanket commit** — Add all untracked files as-is (not recommended, will pollute history)\n3. **Update .gitignore first** — Add rules to exclude runtime files, then commit only the right files\n\nWhich approach would you prefer?\n",
+  "rawOutputLength": 946
+}

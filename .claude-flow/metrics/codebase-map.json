@@ -1,0 +1,11 @@
+{
+  "timestamp": "2026-05-31T01:34:12.222Z",
+  "projectRoot": "/home/user/tep2234",
+  "structure": {
+    "hasPackageJson": false,
+    "hasTsConfig": false,
+    "hasClaudeConfig": true,
+    "hasClaudeFlow": true
+  },
+  "scannedAt": 1780191252222
+}
