@@ -1,0 +1,62 @@
+{
+  "timestamp": "2026-05-31T01:38:52.945Z",
+  "mode": "headless",
+  "workerType": "optimize",
+  "model": "sonnet",
+  "durationMs": 40720,
+  "executionId": "optimize_1780191492225_jd4dse",
+  "success": true,
+  "findings": {
+    "sections": [
+      {
+        "title": "N+1 Query Pattern",
+        "content": "```js\n// BAD — 1 query for posts + N queries for each author\nconst posts = await Post.findAll();\nfor (const post of posts) {\n  post.author = await User.findById(post.authorId); // N queries\n}\n\n// GOOD — 2 queries total\nconst posts = await Post.findAll({ include: [{ model: User, as: 'author' }] });\n```\n\n",
+        "level": 3
+      },
+      {
+        "title": "Unnecessary React Re-renders",
+        "content": "```jsx\n// BAD — new object reference on every render triggers child re-render\nfunction Parent() {\n  const config = { theme: 'dark' }; // recreated every render\n  return <Child config={config} />;\n}\n\n// GOOD\nfunction Parent() {\n  const config = useMemo(() => ({ theme: 'dark' }), []);\n  return <Child config={config} />;\n}\n```\n\n",
+        "level": 3
+      },
+      {
+        "title": "Caching Opportunities",
+        "content": "```js\n// BAD — expensive computation on every call\nfunction getReport(data) {\n  return data.reduce(/* heavy aggregation */);\n}\n\n// GOOD — memoize with a fast cache\nconst cache = new Map();\nfunction getReport(key, data) {\n  if (cache.has(key)) return cache.get(key);\n  const result = data.reduce(/* heavy aggregation */);\n  cache.set(key, result);\n  return result;\n}\n```\n\n",
+        "level": 3
+      },
+      {
+        "title": "Memory Leaks (React)",
+        "content": "```jsx\n// BAD — setInterval keeps running after component unmounts\nuseEffect(() => {\n  const id = setInterval(fetchData, 5000);\n}, []); // missing cleanup\n\n// GOOD\nuseEffect(() => {\n  const id = setInterval(fetchData, 5000);\n  return () => clearInterval(id); // cleanup on unmount\n}, []);\n```\n\n",
+        "level": 3
+      },
+      {
+        "title": "Redundant Computations",
+        "content": "```jsx\n// BAD — filters full list on every keystroke\nfunction List({ items, query }) {\n  const filtered = items.filter(i => i.name.includes(query)); // runs every render\n  ...\n}\n\n// GOOD\nfunction List({ items, query }) {\n  const filtered = useMemo(\n    () => items.filter(i => i.name.includes(query)),\n    [items, query]\n  );\n  ...\n}\n```\n\nShare your actual code or path and I'll apply this analysis directly to it.",
+        "level": 3
+      }
+    ],
+    "codeBlocks": [
+      {
+        "language": "js",
+        "code": "// BAD — 1 query for posts + N queries for each author\nconst posts = await Post.findAll();\nfor (const post of posts) {\n  post.author = await User.findById(post.authorId); // N queries\n}\n\n// GOOD — 2 queries total\nconst posts = await Post.findAll({ include: [{ model: User, as: 'author' }] });"
+      },
+      {
+        "language": "jsx",
+        "code": "// BAD — new object reference on every render triggers child re-render\nfunction Parent() {\n  const config = { theme: 'dark' }; // recreated every render\n  return <Child config={config} />;\n}\n\n// GOOD\nfunction Parent() {\n  const config = useMemo(() => ({ theme: 'dark' }), []);\n  return <Child config={config} />;\n}"
+      },
+      {
+        "language": "js",
+        "code": "// BAD — expensive computation on every call\nfunction getReport(data) {\n  return data.reduce(/* heavy aggregation */);\n}\n\n// GOOD — memoize with a fast cache\nconst cache = new Map();\nfunction getReport(key, data) {\n  if (cache.has(key)) return cache.get(key);\n  const result = data.reduce(/* heavy aggregation */);\n  cache.set(key, result);\n  return result;\n}"
+      },
+      {
+        "language": "jsx",
+        "code": "// BAD — setInterval keeps running after component unmounts\nuseEffect(() => {\n  const id = setInterval(fetchData, 5000);\n}, []); // missing cleanup\n\n// GOOD\nuseEffect(() => {\n  const id = setInterval(fetchData, 5000);\n  return () => clearInterval(id); // cleanup on unmount\n}, []);"
+      },
+      {
+        "language": "jsx",
+        "code": "// BAD — filters full list on every keystroke\nfunction List({ items, query }) {\n  const filtered = items.filter(i => i.name.includes(query)); // runs every render\n  ...\n}\n\n// GOOD\nfunction List({ items, query }) {\n  const filtered = useMemo(\n    () => items.filter(i => i.name.includes(query)),\n    [items, query]\n  );\n  ...\n}"
+      }
+    ]
+  },
+  "rawOutputPreview": "This repository contains no application source code — only tooling configuration files (CLAUDE.md, .mcp.json, swarm/memory helpers). There are no React components, backend API files, or database query code to analyze for N+1 patterns, re-renders, memory leaks, or redundant computations.\n\n**To proceed, please clarify:**\n\n1. **Did you mean a different directory?** If your app code lives elsewhere, share the path (e.g. `/home/user/myapp`).\n2. **Do you want to paste code snippets here?** I can analyze any code you provide directly.\n3. **Are you starting a new project?** I can provide a reference guide with examples of all five anti-patterns and how to fix them.\n\n---\n\nIf you'd like a reference guide in the meantime, here's a concise overview of each pattern and its fix:\n\n### N+1 Query Pattern\n```js\n// BAD — 1 query for posts + N queries for each author\nconst posts = await Post.findAll();\nfor (const post of posts) {\n  post.author = await User.findById(post.authorId); // N queries\n}\n\n// GOOD — 2 queries total\nconst posts = await Post.findAll({ include: [{ model: User, as: 'author' }] });\n```\n\n### Unnecessary React Re-renders\n```jsx\n// BAD — new object reference on every render triggers child re-render\nfunction Parent() {\n  const config = { theme: 'dark' }; // recreated every render\n  return <Child config={config} />;\n}\n\n// GOOD\nfunction Parent() {\n  const config = useMemo(() => ({ theme: 'dark' }), []);\n  return <Child config={config} />;\n}\n```\n\n### Caching Opportunities\n```js\n// BAD — expensive computation on every call\nfunction getReport(data) {\n  return data.reduce(/* heavy aggregation */);\n}\n\n// GOOD — memoize with a fast cache\nconst cache = new Map();\nfunction getReport(key, data) {\n  if (cache.has(key)) return cache.get(key);\n  const result = data.reduce(/* heavy aggregation */);\n  cache.set(key, result);\n  return result;\n}\n```\n\n### Memory Leaks (React)\n```jsx\n// BAD — setInterval keeps running after component unmounts\nuseEffect(() => {\n  const id = setInterval(fetch",
+  "rawOutputLength": 2621
+}
