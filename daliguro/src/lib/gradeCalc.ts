@@ -1,3 +1,81 @@
+import { GradingResult } from '@/types';
+import {
+  ComponentWeights,
+  getDescriptor,
+  getIntervention,
+  transmuteSY2026,
+} from './gradingPolicy';
+
+// ── Three-term DepEd computation engine (SY 2026-2027) ──────────────────────
+
+/**
+ * Compute percentage score for one component.
+ * PS = (learner total) / (highest possible total) × 100
+ */
+export function computePS(rawScore: number, highestPossible: number): number {
+  if (highestPossible <= 0) return 0;
+  return (rawScore / highestPossible) * 100;
+}
+
+/**
+ * Compute weighted score for one component.
+ * WS = PS × weight / 100
+ */
+export function computeWS(ps: number, weight: number): number {
+  return (ps * weight) / 100;
+}
+
+/**
+ * Full three-term grade computation for one student in one term.
+ *
+ * @param wwRaw      Learner's total WW raw score
+ * @param wwHighest  Highest possible WW raw score
+ * @param ptRaw      Learner's total PT raw score
+ * @param ptHighest  Highest possible PT raw score
+ * @param stTeRaw    Learner's STs-TE raw score (0 when no term exam)
+ * @param stTeHighest Highest possible STs-TE (0 when no term exam)
+ * @param weights    ComponentWeights from gradingPolicy
+ */
+export function computeTermGrade(
+  wwRaw: number,
+  wwHighest: number,
+  ptRaw: number,
+  ptHighest: number,
+  stTeRaw: number,
+  stTeHighest: number,
+  weights: ComponentWeights,
+): GradingResult {
+  const wwPS = computePS(wwRaw, wwHighest);
+  const ptPS = computePS(ptRaw, ptHighest);
+  const stTePS = weights.stTe !== null ? computePS(stTeRaw, stTeHighest) : 0;
+
+  const wwWS = computeWS(wwPS, weights.ww);
+  const ptWS = computeWS(ptPS, weights.pt);
+  const stTeWS = weights.stTe !== null ? computeWS(stTePS, weights.stTe) : 0;
+
+  const initialGrade = wwWS + ptWS + stTeWS;
+  const transmuted = transmuteSY2026(initialGrade);
+
+  return {
+    wwPS: round2(wwPS),
+    ptPS: round2(ptPS),
+    stTePS: round2(stTePS),
+    wwWS: round2(wwWS),
+    ptWS: round2(ptWS),
+    stTeWS: round2(stTeWS),
+    initialGrade: round2(initialGrade),
+    transmutedGrade: transmuted,
+    descriptor: getDescriptor(transmuted),
+    intervention: getIntervention(transmuted),
+  };
+}
+
+function round2(n: number): number {
+  return Math.round(n * 100) / 100;
+}
+
+// ── Legacy helpers (kept for backward compatibility) ────────────────────────
+
 export function getHighestScore(scores: (number | null)[]): number {
   const valid = scores.filter((s): s is number => s !== null && !isNaN(s));
   if (valid.length === 0) return 0;

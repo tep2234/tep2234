@@ -1,3 +1,36 @@
+// ── DepEd Grading Policy Types ───────────────────────────────────────────────
+export type KeyStage = 'KS1' | 'KS2' | 'KS3' | 'KS4';
+
+export type GradeCategory = 'WW' | 'PT' | 'QA' | 'STTE';
+// WW = Written/Oral Works, PT = Performance Tasks,
+// QA = Quarterly Assessment (legacy 4-quarter), STTE = Summative Tests + Term Exam (3-term)
+
+export interface GradingResult {
+  wwPS: number;    // WW percentage score
+  ptPS: number;    // PT percentage score
+  stTePS: number;  // STs-TE percentage score (0 when no term exam)
+  wwWS: number;    // WW weighted score
+  ptWS: number;    // PT weighted score
+  stTeWS: number;  // STs-TE weighted score
+  initialGrade: number;
+  transmutedGrade: number;
+  descriptor: string;
+  intervention: string;
+}
+
+export interface KS1Rating {
+  id: string;
+  studentId: string;
+  subjectId: string;
+  term: number;
+  competency: string;
+  descriptor: string;
+  teacherRemarks?: string;
+  createdAt: string;
+}
+
+// ── Core domain types ────────────────────────────────────────────────────────
+
 export interface Class {
   id: string;
   gradLevel: string;
@@ -39,17 +72,26 @@ export interface Subject {
   classId: string;
   name: string;
   code: string;
+  // Legacy 4-quarter weights (kept for backward compat)
   wwWeight: number;
   ptWeight: number;
   qaWeight: number;
+  // DepEd three-term policy fields (SY 2026-2027)
+  keyStage?: KeyStage;
+  subjectGroup?: string;
+  useThreeTerms?: boolean; // true = 3-term system (Terms 1–3)
+  // Per-subject weight overrides (null stTe = no term exam)
+  wwWeightPolicy?: number;
+  ptWeightPolicy?: number;
+  stTeWeightPolicy?: number | null;
 }
 
 export interface GradeEntry {
   id: string;
   subjectId: string;
   studentId: string;
-  quarter: number;
-  category: 'WW' | 'PT' | 'QA';
+  quarter: number; // 1–4 (legacy) or 1–3 (three-term, Term 1–3)
+  category: GradeCategory;
   columnIndex: number;
   score: number | null;
 }
