@@ -1,0 +1,152 @@
+@import "tailwindcss";
+
+@theme {
+  --color-lavender-50: #f7f5fc;
+  --color-lavender-100: #efe9f9;
+  --color-lavender-200: #ddd1f2;
+  --color-lavender-300: #c4aee8;
+  --color-lavender-400: #a886d9;
+  --color-lavender-500: #8d63c8;
+  --color-lavender-600: #7549ad;
+  --color-lavender-700: #5f3a8c;
+  --color-lavender-800: #4d3170;
+  --color-lavender-900: #3f2a5b;
+
+  --font-sans: 'Plus Jakarta Sans', system-ui, 'Segoe UI', Roboto, sans-serif;
+  --font-display: 'Plus Jakarta Sans', system-ui, 'Segoe UI', Roboto, sans-serif;
+}
+
+:root {
+  color-scheme: light;
+  scroll-behavior: smooth;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    scroll-behavior: auto;
+  }
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+body {
+  margin: 0;
+  font-family: var(--font-sans);
+  color: #2d2438;
+  background: #fdfcff;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+::selection {
+  background: var(--color-lavender-200);
+  color: #2d2438;
+}
+
+:focus-visible {
+  outline: 2px solid var(--color-lavender-500);
+  outline-offset: 3px;
+  border-radius: 4px;
+}
+
+/* ---------- Scroll reveal ---------- */
+.reveal {
+  opacity: 0;
+  transform: translateY(28px);
+  transition: opacity 0.7s cubic-bezier(0.21, 0.47, 0.32, 0.98),
+    transform 0.7s cubic-bezier(0.21, 0.47, 0.32, 0.98);
+  will-change: opacity, transform;
+}
+.reveal.is-visible {
+  opacity: 1;
+  transform: translateY(0);
+}
+.reveal-delay-1 { transition-delay: 0.08s; }
+.reveal-delay-2 { transition-delay: 0.16s; }
+.reveal-delay-3 { transition-delay: 0.24s; }
+.reveal-delay-4 { transition-delay: 0.32s; }
+
+@media (prefers-reduced-motion: reduce) {
+  .reveal {
+    opacity: 1;
+    transform: none;
+    transition: none;
+  }
+}
+
+/* ---------- Card hover lift ---------- */
+.lift {
+  transition: transform 0.35s cubic-bezier(0.21, 0.47, 0.32, 0.98),
+    box-shadow 0.35s cubic-bezier(0.21, 0.47, 0.32, 0.98);
+}
+.lift:hover,
+.lift:focus-within {
+  transform: translateY(-6px);
+  box-shadow: 0 20px 45px -15px rgba(117, 73, 173, 0.35);
+}
+
+/* ---------- Floating / parallax decorative shapes ---------- */
+@keyframes float-slow {
+  0%, 100% { transform: translate3d(0, 0, 0) rotate(0deg); }
+  50% { transform: translate3d(0, -22px, 0) rotate(4deg); }
+}
+@keyframes float-slower {
+  0%, 100% { transform: translate3d(0, 0, 0) rotate(0deg); }
+  50% { transform: translate3d(0, 18px, 0) rotate(-3deg); }
+}
+.float-slow { animation: float-slow 9s ease-in-out infinite; }
+.float-slower { animation: float-slower 12s ease-in-out infinite; }
+
+@media (prefers-reduced-motion: reduce) {
+  .float-slow,
+  .float-slower {
+    animation: none;
+  }
+}
+
+/* ---------- CSS-only 3D hero scene ---------- */
+.scene-3d {
+  perspective: 1400px;
+}
+.scene-3d-stage {
+  position: relative;
+  transform-style: preserve-3d;
+  transition: transform 0.2s ease-out;
+}
+.scene-card {
+  position: absolute;
+  transform-style: preserve-3d;
+  border-radius: 18px;
+  backdrop-filter: blur(6px);
+  box-shadow: 0 25px 60px -20px rgba(95, 58, 140, 0.45);
+  transition: transform 0.4s cubic-bezier(0.21, 0.47, 0.32, 0.98);
+}
+
+/* ---------- Badge entrance ---------- */
+@keyframes badge-pop {
+  0% { opacity: 0; transform: scale(0.6) translateY(10px); }
+  70% { opacity: 1; transform: scale(1.05) translateY(0); }
+  100% { opacity: 1; transform: scale(1) translateY(0); }
+}
+.badge-pop {
+  animation: badge-pop 0.6s cubic-bezier(0.21, 0.47, 0.32, 0.98) both;
+}
+
+/* ---------- Timeline reveal ---------- */
+.timeline-line {
+  background: linear-gradient(180deg, var(--color-lavender-300), var(--color-lavender-100));
+}
+
+/* ---------- Gradient text ---------- */
+.gradient-text {
+  background: linear-gradient(120deg, #7549ad 0%, #a886d9 50%, #c4aee8 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
