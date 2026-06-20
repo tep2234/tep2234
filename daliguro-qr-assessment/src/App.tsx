@@ -1,6 +1,5 @@
 import { useState } from "react";
 import { useQrStore } from "./lib/useQrStore";
-import type { QrAssessmentState } from "./lib/types";
 import type { PanelProps } from "./components/panel-types";
 import SetupPanel from "./components/SetupPanel";
 import ItemsPanel from "./components/ItemsPanel";
@@ -8,6 +7,7 @@ import LearnersPanel from "./components/LearnersPanel";
 import SheetsPanel from "./components/SheetsPanel";
 import CheckPanel from "./components/CheckPanel";
 import ResultsPanel from "./components/ResultsPanel";
+import AnalysisPanel from "./components/AnalysisPanel";
 
 type TabId =
   | "setup"
@@ -33,16 +33,6 @@ const TABS: TabDef[] = [
   { id: "results", label: "Results", icon: "🎯" },
   { id: "analysis", label: "Analysis", icon: "📊" },
 ];
-
-const TAB_TITLES: Record<TabId, string> = {
-  setup: "Assessment Setup",
-  items: "Items & Answer Key",
-  learners: "Learner Manager",
-  sheets: "QR Answer Sheets",
-  check: "Assisted Checking",
-  results: "Results Dashboard",
-  analysis: "Analysis Dashboard",
-};
 
 export default function App() {
   const { state, setState, loaded } = useQrStore();
@@ -126,66 +116,5 @@ function renderTab(tab: TabId, panelProps: PanelProps) {
   if (tab === "sheets") return <SheetsPanel {...panelProps} />;
   if (tab === "check") return <CheckPanel {...panelProps} />;
   if (tab === "results") return <ResultsPanel {...panelProps} />;
-  return <PlaceholderPanel tab={tab} state={panelProps.state} />;
-}
-
-interface Counts {
-  assessments: number;
-  items: number;
-  learners: number;
-  results: number;
-}
-
-function summarize(state: QrAssessmentState): Counts {
-  return {
-    assessments: state.assessments.length,
-    items: state.items.length,
-    learners: state.learners.length,
-    results: state.results.length,
-  };
-}
-
-function PlaceholderPanel({
-  tab,
-  state,
-}: {
-  tab: TabId;
-  state: QrAssessmentState;
-}) {
-  const title = TAB_TITLES[tab];
-  const counts = summarize(state);
-
-  return (
-    <section>
-      <h1 className="text-2xl font-extrabold">{title}</h1>
-      <p className="mt-1 text-slate-500">
-        This panel is part of the build spine. Later phases fill it in.
-      </p>
-
-      <div className="mt-5 grid grid-cols-2 gap-3 sm:grid-cols-4">
-        <StatCard label="Assessments" value={counts.assessments} />
-        <StatCard label="Items" value={counts.items} />
-        <StatCard label="Learners" value={counts.learners} />
-        <StatCard label="Results" value={counts.results} />
-      </div>
-
-      <div className="mt-6 rounded-xl border border-dashed border-slate-300 bg-white p-8 text-center text-slate-500">
-        <div className="text-lg font-semibold text-slate-700">
-          “{title}” coming in a later phase
-        </div>
-        <p className="mt-2 text-sm">
-          Counts above are loaded from local storage and survive a page reload.
-        </p>
-      </div>
-    </section>
-  );
-}
-
-function StatCard({ label, value }: { label: string; value: number }) {
-  return (
-    <div className="rounded-xl border border-slate-200 bg-white p-4 text-center">
-      <div className="text-3xl font-extrabold text-indigo-700">{value}</div>
-      <div className="mt-1 text-sm font-semibold text-slate-500">{label}</div>
-    </div>
-  );
+  return <AnalysisPanel {...panelProps} />;
 }

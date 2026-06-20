@@ -22,6 +22,7 @@ import {
 } from "../lib/scoring";
 import { uid } from "../lib/ids";
 import { ActiveGate } from "./ActiveGate";
+import { ScannerPlaceholder } from "./ScannerPlaceholder";
 import { Button, Empty } from "./ui";
 
 export default function CheckPanel(props: PanelProps) {
@@ -158,6 +159,8 @@ function CheckEditor({
           </p>
         </div>
       </div>
+
+      <ScannerPlaceholder />
 
       {/* Selection */}
       <div className="mt-4 rounded-xl border border-slate-200 bg-white p-4">

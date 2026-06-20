@@ -28,8 +28,8 @@ npm run build    # typecheck (tsc -b) + production build
 | 7 | QR answer-sheet generator | ✅ done |
 | 8 | Assisted checking + scoring | ✅ done |
 | 9 | Results dashboard + CSV export | ✅ done |
-| 10 | Analysis dashboard | ⬜ pending |
-| 11 | QR camera scanner placeholder | ⬜ pending |
+| 10 | Analysis dashboard | ✅ done |
+| 11 | QR camera scanner placeholder | ✅ done |
 
 Tabs: **Setup · Items · Learners · QR Sheets · Check · Results · Analysis**
 
@@ -50,6 +50,20 @@ src/
 Answer keys live only in local storage and are **never** embedded in QR codes.
 The QR payload carries identity only: `assessmentId`, `learnerId`, `section`,
 `gradeLevel`, `version`, `securityToken`.
+
+## Future QR camera scanner
+
+Phase 11 ships only a placeholder (in the Check tab). Manual learner selection
+and QR-payload paste remain the workflow. The future camera scanner will:
+
+- open the camera (with permission handling),
+- detect a QR code in the video stream,
+- parse the learner + assessment identity payload,
+- validate `assessmentId` against the active assessment,
+- select the learner and version,
+- open the checking grid.
+
+No OMR and no OCR are planned for the spine — checking stays assisted.
 
 ## Mastery bands
 
