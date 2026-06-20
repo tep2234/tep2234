@@ -21,6 +21,11 @@ export function usesAcceptedAnswers(type: ItemType): boolean {
   return TEXT_ACCEPT_TYPES.includes(type);
 }
 
+// Items scored manually by the teacher (no auto-scoring).
+export function isManual(type: ItemType): boolean {
+  return !isObjective(type) && !usesAcceptedAnswers(type);
+}
+
 // Returns the fixed choice set for button-style objective items,
 // or null when the answer is entered as free text (e.g. Sequencing).
 export function optionSet(item: Item): string[] | null {

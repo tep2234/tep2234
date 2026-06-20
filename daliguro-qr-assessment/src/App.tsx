@@ -6,6 +6,7 @@ import SetupPanel from "./components/SetupPanel";
 import ItemsPanel from "./components/ItemsPanel";
 import LearnersPanel from "./components/LearnersPanel";
 import SheetsPanel from "./components/SheetsPanel";
+import CheckPanel from "./components/CheckPanel";
 
 type TabId =
   | "setup"
@@ -122,6 +123,7 @@ function renderTab(tab: TabId, panelProps: PanelProps) {
   if (tab === "items") return <ItemsPanel {...panelProps} />;
   if (tab === "learners") return <LearnersPanel {...panelProps} />;
   if (tab === "sheets") return <SheetsPanel {...panelProps} />;
+  if (tab === "check") return <CheckPanel {...panelProps} />;
   return <PlaceholderPanel tab={tab} state={panelProps.state} />;
 }
 

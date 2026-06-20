@@ -116,6 +116,8 @@ export interface ItemScore {
   blank: boolean;
   // True for subjective items scored manually by the teacher.
   manual: boolean;
+  // True when the teacher overrode the auto-computed score.
+  overridden: boolean;
   remarks: string;
 }
 
@@ -131,7 +133,9 @@ export interface Result {
   percentage: number;
   masteryStatus: MasteryStatus;
   reviewed: boolean;
+  // createdAt doubles as checkedAt; updatedAt changes on every re-save.
   createdAt: number;
+  updatedAt: number;
 }
 
 // ---- Answer keys -------------------------------------------

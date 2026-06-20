@@ -10,13 +10,16 @@ export function QrImage({ text, size = 96 }: { text: string; size?: number }) {
 
   useEffect(() => {
     let active = true;
-    setFailed(false);
     QRCode.toDataURL(text, { width: size, margin: 1, errorCorrectionLevel: "M" })
       .then((url) => {
-        if (active) setDataUrl(url);
+        if (!active) return;
+        setDataUrl(url);
+        setFailed(false);
       })
       .catch(() => {
-        if (active) setFailed(true);
+        if (!active) return;
+        setDataUrl("");
+        setFailed(true);
       });
     return () => {
       active = false;
