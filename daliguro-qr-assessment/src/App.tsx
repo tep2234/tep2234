@@ -3,6 +3,8 @@ import { useQrStore } from "./lib/useQrStore";
 import type { QrAssessmentState } from "./lib/types";
 import type { PanelProps } from "./components/panel-types";
 import SetupPanel from "./components/SetupPanel";
+import ItemsPanel from "./components/ItemsPanel";
+import LearnersPanel from "./components/LearnersPanel";
 
 type TabId =
   | "setup"
@@ -108,14 +110,17 @@ export default function App() {
           </div>
         ) : null}
 
-        {tab === "setup" ? (
-          <SetupPanel {...panelProps} />
-        ) : (
-          <PlaceholderPanel tab={tab} state={state} />
-        )}
+        {renderTab(tab, panelProps)}
       </main>
     </div>
   );
+}
+
+function renderTab(tab: TabId, panelProps: PanelProps) {
+  if (tab === "setup") return <SetupPanel {...panelProps} />;
+  if (tab === "items") return <ItemsPanel {...panelProps} />;
+  if (tab === "learners") return <LearnersPanel {...panelProps} />;
+  return <PlaceholderPanel tab={tab} state={panelProps.state} />;
 }
 
 interface Counts {

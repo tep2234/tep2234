@@ -22,9 +22,9 @@ npm run build    # typecheck (tsc -b) + production build
 | 1 | Route/shell + 7-tab navigation | ✅ done |
 | 2 | Data model (`src/lib/types.ts`) | ✅ done |
 | 3 | Offline storage (`src/lib/offline-store.ts`) | ✅ done |
-| 4 | Assessment setup form | ⬜ pending |
-| 5 | Item + answer-key editor | ⬜ pending |
-| 6 | Learner manager (manual + CSV) | ⬜ pending |
+| 4 | Assessment setup form | ✅ done |
+| 5 | Item + answer-key editor | ✅ done |
+| 6 | Learner manager (manual + CSV) | ✅ done |
 | 7 | QR answer-sheet generator | ⬜ pending |
 | 8 | Assisted checking + scoring | ⬜ pending |
 | 9 | Results dashboard + CSV export | ⬜ pending |
