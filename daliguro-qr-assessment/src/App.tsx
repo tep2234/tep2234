@@ -1,6 +1,8 @@
 import { useState } from "react";
 import { useQrStore } from "./lib/useQrStore";
 import type { QrAssessmentState } from "./lib/types";
+import type { PanelProps } from "./components/panel-types";
+import SetupPanel from "./components/SetupPanel";
 
 type TabId =
   | "setup"
@@ -27,9 +29,20 @@ const TABS: TabDef[] = [
   { id: "analysis", label: "Analysis", icon: "📊" },
 ];
 
+const TAB_TITLES: Record<TabId, string> = {
+  setup: "Assessment Setup",
+  items: "Items & Answer Key",
+  learners: "Learner Manager",
+  sheets: "QR Answer Sheets",
+  check: "Assisted Checking",
+  results: "Results Dashboard",
+  analysis: "Analysis Dashboard",
+};
+
 export default function App() {
-  const { state, loaded } = useQrStore();
+  const { state, setState, loaded } = useQrStore();
   const [tab, setTab] = useState<TabId>("setup");
+  const [activeId, setActiveId] = useState<string | null>(null);
 
   if (!loaded) {
     return (
@@ -38,6 +51,9 @@ export default function App() {
       </div>
     );
   }
+
+  const active = state.assessments.find((a) => a.id === activeId) ?? null;
+  const panelProps: PanelProps = { state, setState, activeId, setActiveId };
 
   return (
     <div className="min-h-screen">
@@ -55,8 +71,8 @@ export default function App() {
       {/* Tab navigation */}
       <nav className="sticky top-0 z-10 flex gap-1 overflow-x-auto border-b border-slate-200 bg-white px-3 py-2">
         {TABS.map((t) => {
-          const active = t.id === tab;
-          const cls = active
+          const isActiveTab = t.id === tab;
+          const cls = isActiveTab
             ? "bg-indigo-700 text-white"
             : "bg-transparent text-slate-500 hover:bg-slate-100";
           return (
@@ -77,7 +93,26 @@ export default function App() {
 
       {/* Tab content */}
       <main className="mx-auto max-w-5xl p-4">
-        <TabPanel tab={tab} counts={summarize(state)} />
+        {active && tab !== "setup" ? (
+          <div className="mb-3 flex items-center justify-between rounded-lg border border-indigo-200 bg-indigo-50 px-3 py-2 text-sm">
+            <span>
+              Active assessment: <b>{active.title}</b> · {active.subject} ·{" "}
+              {active.section}
+            </span>
+            <button
+              className="font-bold text-indigo-700"
+              onClick={() => setActiveId(null)}
+            >
+              clear
+            </button>
+          </div>
+        ) : null}
+
+        {tab === "setup" ? (
+          <SetupPanel {...panelProps} />
+        ) : (
+          <PlaceholderPanel tab={tab} state={state} />
+        )}
       </main>
     </div>
   );
@@ -99,24 +134,21 @@ function summarize(state: QrAssessmentState): Counts {
   };
 }
 
-const TAB_TITLES: Record<TabId, string> = {
-  setup: "Assessment Setup",
-  items: "Items & Answer Key",
-  learners: "Learner Manager",
-  sheets: "QR Answer Sheets",
-  check: "Assisted Checking",
-  results: "Results Dashboard",
-  analysis: "Analysis Dashboard",
-};
-
-function TabPanel({ tab, counts }: { tab: TabId; counts: Counts }) {
+function PlaceholderPanel({
+  tab,
+  state,
+}: {
+  tab: TabId;
+  state: QrAssessmentState;
+}) {
   const title = TAB_TITLES[tab];
+  const counts = summarize(state);
 
   return (
     <section>
       <h1 className="text-2xl font-extrabold">{title}</h1>
       <p className="mt-1 text-slate-500">
-        This panel is part of the build spine. Phases 4–10 fill it in.
+        This panel is part of the build spine. Later phases fill it in.
       </p>
 
       <div className="mt-5 grid grid-cols-2 gap-3 sm:grid-cols-4">
@@ -131,8 +163,7 @@ function TabPanel({ tab, counts }: { tab: TabId; counts: Counts }) {
           “{title}” coming in a later phase
         </div>
         <p className="mt-2 text-sm">
-          The route, shell, data model, and offline storage are working. Counts
-          above are loaded from local storage and survive a page reload.
+          Counts above are loaded from local storage and survive a page reload.
         </p>
       </div>
     </section>
