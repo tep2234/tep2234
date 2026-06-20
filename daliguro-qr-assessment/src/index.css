@@ -11,12 +11,18 @@ body {
   color: #0f172a;
 }
 
-/* Print rules for QR answer sheets (used in a later phase). */
+/* Print rules for QR answer sheets. */
 @media print {
   .no-print {
     display: none !important;
   }
   body {
     background: #ffffff;
+  }
+  .sheet {
+    page-break-after: always;
+    box-shadow: none !important;
+    border: none !important;
+    max-width: 100% !important;
   }
 }

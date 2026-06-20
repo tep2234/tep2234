@@ -148,6 +148,7 @@ export type AnswerKeyMap = Record<string, AssessmentKeys>;
 export interface QrPayload {
   assessmentId: string;
   learnerId: string;
+  lrn: string;
   section: string;
   gradeLevel: string;
   version: TestVersion;

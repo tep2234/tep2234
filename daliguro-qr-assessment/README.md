@@ -25,7 +25,7 @@ npm run build    # typecheck (tsc -b) + production build
 | 4 | Assessment setup form | ✅ done |
 | 5 | Item + answer-key editor | ✅ done |
 | 6 | Learner manager (manual + CSV) | ✅ done |
-| 7 | QR answer-sheet generator | ⬜ pending |
+| 7 | QR answer-sheet generator | ✅ done |
 | 8 | Assisted checking + scoring | ⬜ pending |
 | 9 | Results dashboard + CSV export | ⬜ pending |
 | 10 | Analysis dashboard | ⬜ pending |
