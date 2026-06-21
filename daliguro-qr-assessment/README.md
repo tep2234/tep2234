@@ -34,6 +34,15 @@ npm test         # unit tests for the pure logic (scoring, analysis, qr, offline
 
 Tabs: **Setup · Items · Learners · QR Sheets · Check · Results · Analysis**
 
+## Real-device testing required before DALIguro integration
+
+The build passes typecheck, lint, build, and 41 logic unit tests, but QR
+rendering, print behavior, local-storage persistence, CSV download, and
+mobile layout can only be verified in a real browser. Work through
+[`MANUAL_TESTING_GUIDE.md`](./MANUAL_TESTING_GUIDE.md) on a real machine
+(Chrome/Safari desktop, plus a mobile browser if available) and pass it
+**before** starting any DALIguro/Supabase integration.
+
 ## Project layout
 
 ```
