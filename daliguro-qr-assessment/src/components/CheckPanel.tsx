@@ -29,7 +29,8 @@ import {
 } from "../lib/scoring";
 import { uid } from "../lib/ids";
 import { ActiveGate } from "./ActiveGate";
-import { ScannerPlaceholder } from "./ScannerPlaceholder";
+import { ScannerModePanel } from "./scanner/ScannerModePanel";
+import type { QrValidationResult } from "../lib/scanner/qr-payload";
 import { Button, Empty } from "./ui";
 
 export default function CheckPanel(props: PanelProps) {
@@ -156,6 +157,18 @@ function CheckEditor({
   const existing = findResult(state.results, active.id, learnerId, activeVersion);
   const initialInput = inputFromResult(existing);
 
+  function handleCameraScan(result: Extract<QrValidationResult, { ok: true }>) {
+    const { learnerId: lid, version: v } = result.payload;
+    switchSelection(() => {
+      setLearnerId(lid);
+      if (active.versions.includes(v)) setVersion(v);
+      setQrTextValue("");
+    });
+    if (findResult(state.results, active.id, lid, v)) {
+      window.alert("Existing result found. Review before updating.");
+    }
+  }
+
   return (
     <section>
       <div className="flex flex-wrap items-center justify-between gap-2">
@@ -167,7 +180,11 @@ function CheckEditor({
         </div>
       </div>
 
-      <ScannerPlaceholder />
+      <ScannerModePanel
+        activeAssessmentId={active.id}
+        learners={state.learners}
+        onValidScan={handleCameraScan}
+      />
 
       {/* Selection */}
       <div className="mt-4 rounded-xl border border-slate-200 bg-white p-4">

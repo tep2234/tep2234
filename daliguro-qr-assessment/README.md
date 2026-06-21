@@ -75,6 +75,7 @@ same network.
 | 9 | Results dashboard + CSV export | ✅ done |
 | 10 | Analysis dashboard | ✅ done |
 | 11 | QR camera scanner placeholder | ✅ done |
+| 12 | Camera QR Scan (live, identity-only) | ✅ done |
 
 Tabs: **Setup · Items · Learners · QR Sheets · Check · Results · Analysis**
 
@@ -105,19 +106,47 @@ Answer keys live only in local storage and are **never** embedded in QR codes.
 The QR payload carries identity only: `assessmentId`, `learnerId`, `section`,
 `gradeLevel`, `version`, `securityToken`.
 
-## Future QR camera scanner
+## QR camera scanner (Phase 12 — live)
 
-Phase 11 ships only a placeholder (in the Check tab). Manual learner selection
-and QR-payload paste remain the workflow. The future camera scanner will:
+The Check tab has a **Scan Mode** selector: Manual Checking, QR Payload Paste,
+Camera QR Scan, and two "planned" placeholders (Full Sheet Scan, Batch Scan).
+Manual Checking is always the default fallback.
 
-- open the camera (with permission handling),
-- detect a QR code in the video stream,
-- parse the learner + assessment identity payload,
-- validate `assessmentId` against the active assessment,
-- select the learner and version,
-- open the checking grid.
+**Connect Camera Scanner** (`src/components/scanner/CameraQrScanner.tsx`)
+opens the device camera, decodes a QR continuously using the native
+`BarcodeDetector` API where available (Chrome/Android), falling back to
+`jsQR` via canvas frame capture otherwise (Safari/iOS). Once a QR is decoded,
+the payload is validated (`src/lib/scanner/qr-payload.ts`) before anything is
+selected:
 
-No OMR and no OCR are planned for the spine — checking stays assisted.
+- rejects invalid JSON, missing identity fields, wrong assessment, unknown
+  learner, or an invalid version,
+- rejects outright if the payload carries answer-key-shaped data
+  (`answerKey`, `correctAnswer`, `acceptedAnswers`, `score`, `itemScores`, …)
+  even though the writer side never puts it there,
+- on success, only the learner and version are auto-selected — the camera
+  never touches the answer key, item data, learner data, or any saved result.
+
+If a result already exists for the scanned learner/version, the teacher sees
+"Existing result found. Review before updating." instead of a silent
+overwrite. The teacher still reviews and clicks **Save Score** manually.
+
+### Future full-sheet scan (Phase 2–6, not built yet)
+
+1. **Capture** — grab the answer-sheet image, detect page boundaries and the
+   black alignment markers, correct rotation, crop the answer area.
+2. **OMR layout map** — generate a scan map from the answer-sheet layout so
+   the exact x/y position of every bubble and answer zone is known.
+3. **Bubble detection** — detect the selected answer, blank, or multiple
+   marks, with a confidence score per item.
+4. **Scan review** — show item number, scanned answer, correct answer,
+   status, confidence, and a teacher-override control before anything saves.
+5. **Batch scanning** — scan many papers in a row, review only flagged items,
+   save results, move to the next learner.
+
+Confidence levels once OMR exists: 90%+ auto-accepted, 70–89% review
+suggested, below 70% needs review. Perfect accuracy is never promised —
+teacher approval is always required before a score is saved.
 
 ## Mastery bands
 

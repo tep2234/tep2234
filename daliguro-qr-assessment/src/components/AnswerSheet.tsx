@@ -79,7 +79,8 @@ export function AnswerSheet({
       {/* Student instruction */}
       <div className="mt-2 rounded border border-black/40 bg-slate-50 px-2 py-1 text-[10px] font-semibold">
         Shade or mark only one answer per item unless instructed. Write clearly
-        inside the answer space provided.
+        inside the answer space provided. Use dark marks. Do not shade outside
+        answer boxes.
       </div>
 
       {/* Answer area */}
@@ -97,8 +98,8 @@ export function AnswerSheet({
           <span>Version: {version}</span>
         </div>
         <div className="mt-0.5 font-semibold">
-          Teacher note: the QR identifies the learner and assessment only. It
-          does not contain answers.
+          Teacher note: the QR identifies the learner and assessment only.
+          Answer key is stored securely in the app.
         </div>
       </div>
     </div>
