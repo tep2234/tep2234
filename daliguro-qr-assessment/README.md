@@ -13,6 +13,7 @@ tested on its own first, then integrated into the main DALIguro app later.
 npm install
 npm run dev      # start the dev server
 npm run build    # typecheck (tsc -b) + production build
+npm test         # unit tests for the pure logic (scoring, analysis, qr, offline-store, items)
 ```
 
 ## Build status (phase by phase)
