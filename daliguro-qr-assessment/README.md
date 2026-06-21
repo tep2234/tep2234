@@ -16,6 +16,50 @@ npm run build    # typecheck (tsc -b) + production build
 npm test         # unit tests for the pure logic (scoring, analysis, qr, offline-store, items)
 ```
 
+### Open it in a browser for testing
+
+Two ways to run the real app locally (both serve the same React app —
+this is **not** a single double-click HTML file):
+
+**Option A — Dev mode** (hot reload, for active testing)
+
+```bash
+npm run dev
+```
+
+Open the URL Vite prints, usually <http://localhost:5173>.
+
+**Option B — Production build preview** (serves the built `dist/` output)
+
+```bash
+npm run build
+npm run preview
+```
+
+Open the preview URL Vite prints, usually <http://localhost:4173>.
+
+> The build output is a static web app in `dist/` (an `index.html` plus
+> hashed JS/CSS in `dist/assets/`). It is served locally by `npm run
+> preview` (or any static server) — it is not yet a portable
+> open-by-double-click HTML file. If a single-file portable export is
+> needed later, that is a separate strategy; don't hand-copy the React
+> app into one HTML file.
+
+### Test from your phone (same Wi-Fi)
+
+```bash
+npm run dev -- --host 0.0.0.0
+```
+
+Find your Mac's IP, then open `http://YOUR_MAC_IP:5173` on the phone:
+
+- System Settings → Wi-Fi → Details → IP Address, or
+- Terminal: `ipconfig getifaddr en0`
+
+So if `ipconfig getifaddr en0` prints `192.168.1.20`, open
+`http://192.168.1.20:5173` on the phone. Mac and phone must be on the
+same network.
+
 ## Build status (phase by phase)
 
 | Phase | Scope | Status |

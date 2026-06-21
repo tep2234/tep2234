@@ -13,6 +13,8 @@ your own machine before any DALIguro integration.
 
 ## 1. How to run locally
 
+**Option A — Dev mode** (recommended for active testing; hot reload)
+
 ```bash
 cd daliguro-qr-assessment
 npm install
@@ -21,12 +23,44 @@ npm run dev
 
 Open the local URL Vite prints (usually `http://localhost:5173`).
 
+**Option B — Production build preview** (tests the actual `dist/` output)
+
+```bash
+cd daliguro-qr-assessment
+npm install
+npm run build
+npm run preview
+```
+
+Open the preview URL Vite prints (usually `http://localhost:4173`).
+
+Test the full guide in **both** modes if you can — dev mode and the
+built preview can differ (asset paths, minification, base URL).
+
+> The preview serves the static build from `dist/` (an `index.html`
+> plus hashed JS/CSS). It is **not** a double-click HTML file — it is
+> the real web app served locally.
+
 Optional sanity check before you start:
 
 ```bash
 npm test          # 41 logic unit tests, should all pass
 npm run build     # typecheck + production build
 ```
+
+### Test from your phone (same Wi-Fi)
+
+```bash
+npm run dev -- --host 0.0.0.0
+```
+
+Find your Mac's IP and open `http://YOUR_MAC_IP:5173` on the phone:
+
+- System Settings → Wi-Fi → Details → IP Address, or
+- Terminal: `ipconfig getifaddr en0`
+
+Example: if the IP is `192.168.1.20`, open `http://192.168.1.20:5173`
+on the phone. Both devices must be on the same network.
 
 ---
 
