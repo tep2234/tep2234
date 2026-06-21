@@ -16,6 +16,7 @@ import {
   TEST_VERSIONS,
 } from "../lib/types";
 import { uid } from "../lib/ids";
+import { ReadinessChecklist } from "./ReadinessChecklist";
 import { Button, Empty, Field, Pill, Select, TextInput } from "./ui";
 
 const GRADE_LEVELS = ["7", "8", "9", "10", "11", "12"];
@@ -108,6 +109,13 @@ export default function SetupPanel(props: PanelProps) {
           </p>
         </div>
         <Button onClick={startNew}>+ New Assessment</Button>
+      </div>
+
+      <div className="mt-4">
+        <ReadinessChecklist
+          state={state}
+          active={state.assessments.find((a) => a.id === activeId) ?? null}
+        />
       </div>
 
       {state.assessments.length === 0 ? (

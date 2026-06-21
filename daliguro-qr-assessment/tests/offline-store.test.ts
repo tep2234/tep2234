@@ -56,6 +56,32 @@ describe("offline-store (IndexedDB path via fake-indexeddb)", () => {
     expect(loaded.assessments).toHaveLength(0);
   });
 
+  it("back-fills Item.options for older saved items (migration)", async () => {
+    // An item saved before the options field existed.
+    const legacy = {
+      items: [
+        {
+          id: "I1",
+          assessmentId: "a1",
+          itemNumber: 1,
+          type: "Multiple Choice",
+          question: "Q",
+          correctAnswer: "A",
+          acceptedAnswers: [],
+          points: 1,
+          competency: "",
+          difficulty: "Average",
+          choices: 4,
+          // no `options` field
+        },
+      ],
+    } as unknown as ReturnType<typeof emptyState>;
+    await saveState(legacy);
+    const loaded = await loadState();
+    expect(loaded.items).toHaveLength(1);
+    expect(loaded.items[0].options).toEqual([]);
+  });
+
   it("normalizes a partial/corrupt persisted shape instead of crashing", async () => {
     // Simulate a corrupt/old record by writing directly through saveState
     // with a state missing fields, then verify loadState backfills them.

@@ -21,8 +21,13 @@ body {
   }
   .sheet {
     page-break-after: always;
+    break-after: page;
     box-shadow: none !important;
     border: none !important;
     max-width: 100% !important;
+  }
+  .sheet:last-child {
+    page-break-after: auto;
+    break-after: auto;
   }
 }

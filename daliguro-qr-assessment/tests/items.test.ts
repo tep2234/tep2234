@@ -22,6 +22,7 @@ function item(overrides: Partial<Item> = {}): Item {
     competency: "",
     difficulty: "Average",
     choices: 4,
+    options: ["", "", "", ""],
     ...overrides,
   };
 }

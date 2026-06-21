@@ -2,6 +2,7 @@
 
 import type { Item, ItemScore, MasteryStatus, VersionKey } from "./types";
 import {
+  acceptedMatch,
   isManual,
   isObjective,
   normalizeText,
@@ -51,8 +52,8 @@ export function masteryColor(status: MasteryStatus): string {
 
 // Accepted answers for a text item: explicit list plus optional correctAnswer.
 function acceptedFor(item: Item): string[] {
-  const list = item.acceptedAnswers.map(normalizeText).filter((s) => s.length > 0);
-  if (item.correctAnswer.trim()) list.push(normalizeText(item.correctAnswer));
+  const list = item.acceptedAnswers.filter((s) => s.trim().length > 0);
+  if (item.correctAnswer.trim()) list.push(item.correctAnswer);
   return list;
 }
 
@@ -89,7 +90,7 @@ export function scoreItem(
     if (isObjective(item.type)) {
       correct = keyAnswer.trim() !== "" && normalizeText(response) === normalizeText(keyAnswer);
     } else if (usesAcceptedAnswers(item.type)) {
-      correct = acceptedFor(item).includes(normalizeText(response));
+      correct = acceptedMatch(response, acceptedFor(item));
     }
   }
 

@@ -3,7 +3,7 @@
 
 import { useMemo } from "react";
 import type { Assessment, Item, ItemType, Learner, TestVersion } from "../lib/types";
-import { optionSet } from "../lib/items";
+import { optionPairs, optionSet } from "../lib/items";
 import { buildQrPayload, qrText } from "../lib/qr";
 import { QrImage } from "./QrImage";
 
@@ -76,6 +76,12 @@ export function AnswerSheet({
         </div>
       </div>
 
+      {/* Student instruction */}
+      <div className="mt-2 rounded border border-black/40 bg-slate-50 px-2 py-1 text-[10px] font-semibold">
+        Shade or mark only one answer per item unless instructed. Write clearly
+        inside the answer space provided.
+      </div>
+
       {/* Answer area */}
       <div className="mt-3">
         {ordered.map((item) => (
@@ -89,11 +95,10 @@ export function AnswerSheet({
           <span>Assessment ID: {assessment.id}</span>
           <span>Learner ID: {learner.id}</span>
           <span>Version: {version}</span>
-          <span>Page 1</span>
         </div>
-        <div className="mt-0.5">
-          Do not shade outside answer boxes. · QR code identifies learner and
-          assessment only.
+        <div className="mt-0.5 font-semibold">
+          Teacher note: the QR identifies the learner and assessment only. It
+          does not contain answers.
         </div>
       </div>
     </div>
@@ -106,7 +111,10 @@ function Corner({ className }: { className: string }) {
 
 function AnswerSlot({ item }: { item: Item }) {
   return (
-    <div className="border-t border-dashed border-slate-300 py-1.5">
+    <div
+      className="border-t border-dashed border-slate-300 py-1.5"
+      style={{ breakInside: "avoid", pageBreakInside: "avoid" }}
+    >
       <div className="text-xs font-semibold">
         {item.itemNumber}. <span className="font-normal">{slotLabel(item.type)}</span>{" "}
         <span className="text-slate-500">({item.points} pt)</span>
@@ -126,8 +134,24 @@ function slotLabel(type: ItemType): string {
 function AnswerField({ item }: { item: Item }) {
   const options = optionSet(item);
 
-  // Objective with fixed options → bubbles.
+  // Objective with fixed options → bubbles, with option text when available.
   if (options) {
+    const pairs = optionPairs(item);
+    const hasText = pairs.some((p) => p.text.trim());
+    if (hasText) {
+      return (
+        <div className="mt-1 grid gap-0.5">
+          {pairs.map((p) => (
+            <span key={p.letter} className="flex items-center gap-1.5">
+              <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full border-2 border-black text-[10px]">
+                {p.letter}
+              </span>
+              <span className="text-[11px]">{p.text || "—"}</span>
+            </span>
+          ))}
+        </div>
+      );
+    }
     return (
       <div className="mt-1 flex flex-wrap gap-3">
         {options.map((opt) => (

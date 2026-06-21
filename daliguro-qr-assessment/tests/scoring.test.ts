@@ -21,6 +21,7 @@ function item(overrides: Partial<Item> = {}): Item {
     competency: "",
     difficulty: "Average",
     choices: 4,
+    options: ["", "", "", ""],
     ...overrides,
   };
 }
@@ -112,6 +113,19 @@ describe("scoreItem — text accepted-answer items", () => {
 
     input.responses[it1.id] = "nucleus";
     expect(scoreItem(it1, "", input).correct).toBe(false);
+  });
+
+  it("matches teacher-friendly variants (spacing/case/punctuation/compact)", () => {
+    const it1 = item({
+      type: "Identification",
+      correctAnswer: "target market",
+      acceptedAnswers: [],
+    });
+    const input = emptyInput();
+    for (const variant of ["TARGETMARKET", "Target-Market", "target  market"]) {
+      input.responses[it1.id] = variant;
+      expect(scoreItem(it1, "", input).correct).toBe(true);
+    }
   });
 });
 

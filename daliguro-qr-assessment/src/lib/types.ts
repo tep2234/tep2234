@@ -87,6 +87,10 @@ export interface Item {
   difficulty: Difficulty;
   // Number of choices for Multiple Choice / Matching (drives the option set).
   choices: number;
+  // Option text per choice letter (A,B,C,…) for Multiple Choice / Matching.
+  // Index 0 = A, 1 = B, etc. Empty strings are allowed; older items may omit
+  // this entirely (back-filled to [] on load).
+  options: string[];
 }
 
 export interface Learner {

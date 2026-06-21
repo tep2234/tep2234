@@ -5,8 +5,18 @@
 // later be replaced by Supabase without touching the UI.
 // ============================================================
 
-import type { QrAssessmentState } from "./types";
+import type { Item, QrAssessmentState } from "./types";
 import { emptyState } from "./types";
+
+// Back-fill fields added after a learner may already have saved data, so old
+// records keep working. Currently: Item.options (added for choice text).
+function migrateItem(raw: unknown): Item {
+  const item = (raw ?? {}) as Partial<Item> & Record<string, unknown>;
+  const options = Array.isArray(item.options)
+    ? item.options.map((o) => (typeof o === "string" ? o : String(o ?? "")))
+    : [];
+  return { ...(item as Item), options };
+}
 
 const DB_NAME = "daliguro_qr_db";
 const DB_VERSION = 1;
@@ -100,7 +110,7 @@ function normalize(value: Partial<QrAssessmentState> | undefined): QrAssessmentS
   if (!value) return base;
   return {
     assessments: Array.isArray(value.assessments) ? value.assessments : base.assessments,
-    items: Array.isArray(value.items) ? value.items : base.items,
+    items: Array.isArray(value.items) ? value.items.map(migrateItem) : base.items,
     learners: Array.isArray(value.learners) ? value.learners : base.learners,
     answerKeys:
       value.answerKeys && typeof value.answerKeys === "object"

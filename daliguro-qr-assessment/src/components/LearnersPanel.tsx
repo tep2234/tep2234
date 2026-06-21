@@ -1,11 +1,13 @@
-// Phase 6 — Learner Manager.
-// Manual entry, CSV import (paste or file), search, and delete.
-// Learners are shared across assessments.
+// Phase 6 (+ revisions) — Learner Manager.
+// Manual entry plus CSV import (paste or file) with preview, Sex normalisation,
+// and duplicate-LRN handling. Learners are shared across assessments.
 
-import { useRef, useState } from "react";
+import { useState } from "react";
 import type { PanelProps } from "./panel-types";
 import type { Learner, Sex } from "../lib/types";
+import type { ParsedLearner } from "../lib/learner-import";
 import { uid } from "../lib/ids";
+import { LearnerImportSection } from "./LearnerImportSection";
 import { Button, Empty, Field, Select, TextInput } from "./ui";
 
 interface LearnerForm {
@@ -20,102 +22,65 @@ function emptyForm(): LearnerForm {
   return { lrn: "", fullName: "", sex: "M", gradeLevel: "11", section: "" };
 }
 
-// Split a CSV line, tolerating simple quoted fields.
-function splitCsvLine(line: string): string[] {
-  const out: string[] = [];
-  let cur = "";
-  let inQuotes = false;
-  for (let i = 0; i < line.length; i += 1) {
-    const ch = line[i];
-    if (ch === '"') {
-      inQuotes = !inQuotes;
-    } else if (ch === "," && !inQuotes) {
-      out.push(cur);
-      cur = "";
-    } else {
-      cur += ch;
-    }
-  }
-  out.push(cur);
-  return out.map((s) => s.trim());
-}
-
-// Parse CSV text into learners. Header: LRN, Full Name, Sex, Grade Level, Section.
-function parseLearnersCsv(text: string): Learner[] {
-  const lines = text.split(/\r?\n/).filter((l) => l.trim().length > 0);
-  if (lines.length < 2) return [];
-
-  const header = splitCsvLine(lines[0]).map((h) => h.toLowerCase());
-  function indexOfAny(names: string[]): number {
-    for (const name of names) {
-      const pos = header.indexOf(name);
-      if (pos >= 0) return pos;
-    }
-    return -1;
-  }
-
-  const iLrn = indexOfAny(["lrn"]);
-  const iName = indexOfAny(["full name", "name", "fullname"]);
-  const iSex = indexOfAny(["sex"]);
-  const iGrade = indexOfAny(["grade level", "grade"]);
-  const iSection = indexOfAny(["section"]);
-
-  const learners: Learner[] = [];
-  for (let r = 1; r < lines.length; r += 1) {
-    const cols = splitCsvLine(lines[r]);
-    const fullName = iName >= 0 ? cols[iName] ?? "" : cols[0] ?? "";
-    if (!fullName) continue;
-    const sexRaw = iSex >= 0 ? (cols[iSex] ?? "M").toUpperCase() : "M";
-    learners.push({
-      id: uid("L_"),
-      lrn: iLrn >= 0 ? cols[iLrn] ?? "" : "",
-      fullName,
-      sex: sexRaw === "F" ? "F" : "M",
-      gradeLevel: iGrade >= 0 ? cols[iGrade] ?? "11" : "11",
-      section: iSection >= 0 ? cols[iSection] ?? "" : "",
-    });
-  }
-  return learners;
-}
-
 export default function LearnersPanel(props: PanelProps) {
   const { state, setState } = props;
   const [form, setForm] = useState<LearnerForm>(emptyForm);
   const [query, setQuery] = useState("");
-  const [csvText, setCsvText] = useState("");
-  const fileRef = useRef<HTMLInputElement>(null);
 
   function addManual() {
     if (!form.fullName.trim()) {
       window.alert("Full name is required.");
       return;
     }
-    const learner: Learner = { id: uid("L_"), ...form, fullName: form.fullName.trim() };
+    const learner: Learner = {
+      id: uid("L_"),
+      ...form,
+      fullName: form.fullName.trim(),
+    };
     setState((prev) => ({ ...prev, learners: prev.learners.concat(learner) }));
     setForm((prev) => ({ ...prev, lrn: "", fullName: "" }));
   }
 
-  function importText(text: string) {
-    const parsed = parseLearnersCsv(text);
-    if (parsed.length === 0) {
-      window.alert("No learners found. Expected header: LRN, Full Name, Sex, Grade Level, Section");
-      return;
-    }
-    setState((prev) => ({ ...prev, learners: prev.learners.concat(parsed) }));
-    setCsvText("");
-    window.alert("Imported " + parsed.length + " learner(s).");
-  }
-
-  function onFile(e: React.ChangeEvent<HTMLInputElement>) {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    const reader = new FileReader();
-    reader.onload = () => importText(String(reader.result));
-    reader.readAsText(file);
-    e.target.value = "";
+  // Merge an import: add fresh learners, overwrite duplicates by LRN.
+  function importLearners(toAdd: ParsedLearner[], toUpdate: ParsedLearner[]) {
+    setState((prev) => {
+      const updateByLrn = new Map(
+        toUpdate.filter((u) => u.lrn.trim()).map((u) => [u.lrn.trim(), u]),
+      );
+      const learners = prev.learners.map((l) => {
+        const u = updateByLrn.get(l.lrn.trim());
+        return u
+          ? {
+              ...l,
+              fullName: u.fullName,
+              sex: u.sex,
+              gradeLevel: u.gradeLevel,
+              section: u.section,
+            }
+          : l;
+      });
+      const added: Learner[] = toAdd.map((p) => ({
+        id: uid("L_"),
+        lrn: p.lrn,
+        fullName: p.fullName,
+        sex: p.sex,
+        gradeLevel: p.gradeLevel,
+        section: p.section,
+      }));
+      return { ...prev, learners: learners.concat(added) };
+    });
+    window.alert(
+      `Imported ${toAdd.length} new learner(s)` +
+        (toUpdate.length ? `, updated ${toUpdate.length}.` : "."),
+    );
   }
 
   function remove(id: string) {
+    const hasResults = state.results.some((r) => r.learnerId === id);
+    const msg = hasResults
+      ? "This learner has saved results. Deleting them will leave those results without a matching learner. Delete anyway?"
+      : "Delete this learner?";
+    if (!window.confirm(msg)) return;
     setState((prev) => ({
       ...prev,
       learners: prev.learners.filter((l) => l.id !== id),
@@ -128,21 +93,9 @@ export default function LearnersPanel(props: PanelProps) {
 
   return (
     <section>
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <h1 className="text-2xl font-extrabold">
-          Learner Manager ({state.learners.length})
-        </h1>
-        <Button variant="ghost" onClick={() => fileRef.current?.click()}>
-          ⬆ Import CSV file
-        </Button>
-        <input
-          ref={fileRef}
-          type="file"
-          accept=".csv,text/csv"
-          hidden
-          onChange={onFile}
-        />
-      </div>
+      <h1 className="text-2xl font-extrabold">
+        Learner Manager ({state.learners.length})
+      </h1>
       <p className="mt-1 text-xs text-slate-500">
         CSV header: LRN, Full Name, Sex, Grade Level, Section
       </p>
@@ -185,23 +138,10 @@ export default function LearnersPanel(props: PanelProps) {
         <Button onClick={addManual}>+ Add</Button>
       </div>
 
-      {/* CSV paste */}
-      <div className="mt-3 rounded-xl border border-slate-200 bg-white p-4">
-        <span className="mb-1 block text-xs font-bold text-slate-500">
-          Or paste CSV text
-        </span>
-        <textarea
-          value={csvText}
-          onChange={(e) => setCsvText(e.target.value)}
-          placeholder={"LRN,Full Name,Sex,Grade Level,Section\n123456789012,Dela Cruz Juan,M,11,STEM-A"}
-          className="min-h-24 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 font-mono text-xs outline-none focus:border-indigo-500"
-        />
-        <div className="mt-2">
-          <Button variant="small" onClick={() => importText(csvText)}>
-            Import pasted CSV
-          </Button>
-        </div>
-      </div>
+      <LearnerImportSection
+        existingLrns={state.learners.map((l) => l.lrn)}
+        onImport={importLearners}
+      />
 
       {/* Search + table */}
       <div className="mt-4">

@@ -12,7 +12,14 @@ import type {
   TestVersion,
   VersionKey,
 } from "../lib/types";
-import { isManual, isObjective, optionSet, usesAcceptedAnswers } from "../lib/items";
+import {
+  acceptedMatch,
+  isManual,
+  isObjective,
+  optionPairs,
+  optionSet,
+  usesAcceptedAnswers,
+} from "../lib/items";
 import {
   computeScores,
   emptyInput,
@@ -481,6 +488,17 @@ function CheckRow({
         <div className="mt-1 text-xs text-slate-500">{item.question}</div>
       ) : null}
 
+      {/* Option text reference for Multiple Choice / Matching */}
+      {optionPairs(item).some((p) => p.text.trim()) ? (
+        <div className="mt-1 grid gap-0.5 text-xs text-slate-500">
+          {optionPairs(item).map((p) => (
+            <div key={p.letter}>
+              <b>{p.letter}.</b> {p.text || "—"}
+            </div>
+          ))}
+        </div>
+      ) : null}
+
       {/* Objective with fixed options */}
       {options ? (
         <div className="mt-2 flex flex-wrap items-center gap-2">
@@ -572,9 +590,9 @@ function Verdict({ response, keyAnswer }: { response: string; keyAnswer: string 
 function isTextMatch(item: Item, keyAnswer: string, response: string): boolean {
   const norm = (s: string) => s.trim().toLowerCase();
   if (usesAcceptedAnswers(item.type)) {
-    const accepted = item.acceptedAnswers.map(norm);
-    if (item.correctAnswer.trim()) accepted.push(norm(item.correctAnswer));
-    return accepted.includes(norm(response));
+    const accepted = item.acceptedAnswers.filter((s) => s.trim());
+    if (item.correctAnswer.trim()) accepted.push(item.correctAnswer);
+    return acceptedMatch(response, accepted);
   }
   return keyAnswer.trim() !== "" && norm(response) === norm(keyAnswer);
 }
