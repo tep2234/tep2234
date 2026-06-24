@@ -189,7 +189,10 @@ function SheetGenerator({
 
         <div className="mt-3 text-xs text-slate-500">
           🔐 QR encodes identity only: assessment ID, learner ID, LRN, section,
-          grade, version, security token. <b>No answer key inside the QR.</b>
+          grade, version, security token. <b>No answer key inside the QR.</b> The
+          printed OMR sheet has four black corner markers and A–D bubbles —
+          learners shade with black pen/pencil; scan it in Check → Scan Answer
+          Sheet to auto-read and score.
         </div>
 
         {/* Learner picker */}

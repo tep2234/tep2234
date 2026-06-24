@@ -90,7 +90,27 @@ export default function LearnersPanel(props: PanelProps) {
       window.alert("Full name is required.");
       return;
     }
-    const learner: Learner = { id: uid("L_"), ...form, fullName: form.fullName.trim() };
+    const lrn = form.lrn.trim();
+    if (lrn && state.learners.some((l) => l.lrn.trim() === lrn)) {
+      const dupe = state.learners.find((l) => l.lrn.trim() === lrn);
+      if (
+        !window.confirm(
+          'LRN "' +
+            lrn +
+            '" already exists' +
+            (dupe ? " (" + dupe.fullName + ")" : "") +
+            ". Add this learner anyway?",
+        )
+      ) {
+        return;
+      }
+    }
+    const learner: Learner = {
+      id: uid("L_"),
+      ...form,
+      lrn,
+      fullName: form.fullName.trim(),
+    };
     setState((prev) => ({ ...prev, learners: prev.learners.concat(learner) }));
     setForm((prev) => ({ ...prev, lrn: "", fullName: "" }));
   }

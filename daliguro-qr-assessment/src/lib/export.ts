@@ -30,3 +30,13 @@ export function downloadCsv(text: string, filename: string): void {
 export function safeFilename(name: string): string {
   return name.replace(/[^a-z0-9_-]+/gi, "_").replace(/^_+|_+$/g, "") || "export";
 }
+
+export function downloadJson(text: string, filename: string): void {
+  const blob = new Blob([text], { type: "application/json;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  link.click();
+  URL.revokeObjectURL(url);
+}

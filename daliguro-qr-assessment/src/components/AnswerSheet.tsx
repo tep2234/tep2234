@@ -1,11 +1,21 @@
-// Phase 7 — printable answer sheet for one learner.
-// Read-only: builds a QR identity payload and renders answer fields by type.
+// Phase 12 — printable OMR answer sheet for one learner.
+// Renders directly from the canonical OMR template so the printed geometry
+// matches the scanner/detector exactly. QR carries identity only.
 
-import { useMemo } from "react";
-import type { Assessment, Item, ItemType, Learner, TestVersion } from "../lib/types";
-import { optionSet } from "../lib/items";
+import { useEffect, useMemo, useState } from "react";
+import QRCode from "qrcode";
+import type { Assessment, Item, Learner, TestVersion } from "../lib/types";
 import { buildQrPayload, qrText } from "../lib/qr";
-import { QrImage } from "./QrImage";
+import {
+  buildTemplate,
+  columnFor,
+  numberX,
+  omrItemsOf,
+  rowCenterY,
+  type OmrTemplate,
+} from "../lib/scanner/omr-template";
+
+const CHOICE_LETTERS = ["A", "B", "C", "D"];
 
 export function AnswerSheet({
   assessment,
@@ -18,165 +28,108 @@ export function AnswerSheet({
   items: Item[];
   version: TestVersion;
 }) {
-  // Build the identity payload once per learner+version instance.
   const payloadText = useMemo(
     () => qrText(buildQrPayload(assessment.id, learner, version)),
     [assessment.id, learner, version],
   );
+  const [qrUrl, setQrUrl] = useState("");
+  useEffect(() => {
+    let on = true;
+    QRCode.toDataURL(payloadText, { width: 252, margin: 1, errorCorrectionLevel: "M" })
+      .then((u) => on && setQrUrl(u))
+      .catch(() => on && setQrUrl(""));
+    return () => {
+      on = false;
+    };
+  }, [payloadText]);
 
-  const ordered = [...items].sort((a, b) => a.itemNumber - b.itemNumber);
+  const omr = useMemo(() => omrItemsOf(items), [items]);
+  const template = useMemo<OmrTemplate>(() => buildTemplate(Math.max(1, omr.length)), [omr.length]);
+  const manualItems = items
+    .filter((i) => !omr.includes(i))
+    .sort((a, b) => a.itemNumber - b.itemNumber);
 
   return (
-    <div className="sheet relative mx-auto mb-4 max-w-3xl border border-slate-300 bg-white p-6 shadow">
-      {/* Alignment markers */}
-      <Corner className="left-2 top-2" />
-      <Corner className="right-2 top-2" />
-      <Corner className="bottom-2 left-2" />
-      <Corner className="bottom-2 right-2" />
+    <div className="sheet mx-auto mb-6 max-w-3xl bg-white">
+      <svg
+        viewBox={`0 0 ${template.width} ${template.height}`}
+        className="block w-full"
+        style={{ fontFamily: "Arial, sans-serif" }}
+      >
+        <rect x={1} y={1} width={template.width - 2} height={template.height - 2} fill="white" stroke="#bbb" />
 
-      {/* Header */}
-      <div className="flex justify-between gap-4 border-b-2 border-black pb-2">
-        <div>
-          <div className="text-[11px] font-bold tracking-wide text-slate-600">
-            DALIguro QR Assessment
-          </div>
-          <div className="text-base font-extrabold">{assessment.title}</div>
-          <div className="text-xs">
-            {assessment.subject} · Grade {learner.gradeLevel}-
-            {learner.section || assessment.section}
-          </div>
-          <div className="text-xs">
-            {assessment.schoolYear} · {assessment.term} Term ·{" "}
-            {assessment.component}
-          </div>
-          <div className="text-xs">Teacher: {assessment.teacherName || "—"}</div>
-          <div className="mt-1 inline-block border-2 border-black px-2 text-sm font-extrabold">
-            VERSION {version}
-          </div>
-        </div>
-        <div className="text-center">
-          <QrImage text={payloadText} size={96} />
-          <div className="mt-1 text-[8px]">Scan to identify</div>
-        </div>
-      </div>
-
-      {/* Learner block */}
-      <div className="mt-2 grid grid-cols-2 gap-x-6 text-xs">
-        <div>
-          <b>Name:</b> {learner.fullName}
-        </div>
-        <div>
-          <b>LRN:</b> {learner.lrn || "____________"}
-        </div>
-        <div>
-          <b>Sex:</b> {learner.sex}
-        </div>
-        <div>
-          <b>Section:</b> {learner.section || assessment.section}
-        </div>
-      </div>
-
-      {/* Answer area */}
-      <div className="mt-3">
-        {ordered.map((item) => (
-          <AnswerSlot key={item.id} item={item} />
+        {/* Corner alignment markers */}
+        {template.markerRects.map((m, i) => (
+          <rect key={i} x={m.x} y={m.y} width={m.w} height={m.h} fill="black" />
         ))}
-      </div>
 
-      {/* Footer */}
-      <div className="mt-4 border-t border-black pt-1 text-[9px] text-slate-600">
-        <div className="flex justify-between">
-          <span>Assessment ID: {assessment.id}</span>
-          <span>Learner ID: {learner.id}</span>
-          <span>Version: {version}</span>
-          <span>Page 1</span>
-        </div>
-        <div className="mt-0.5">
-          Do not shade outside answer boxes. · QR code identifies learner and
-          assessment only.
-        </div>
-      </div>
-    </div>
-  );
-}
+        {/* Header */}
+        <text x={template.width / 2} y={124} textAnchor="middle" fontSize={30} fontWeight="bold">
+          {assessment.title}
+        </text>
+        <text x={template.width / 2} y={146} textAnchor="middle" fontSize={18} fill="#444">
+          {assessment.subject} · {assessment.component} · DALIguro QR Assessment
+        </text>
 
-function Corner({ className }: { className: string }) {
-  return <div className={"absolute h-3 w-3 bg-black " + className} />;
-}
+        {/* QR (identity only) */}
+        {qrUrl ? (
+          <image href={qrUrl} x={template.qrZone.x} y={template.qrZone.y} width={template.qrZone.w} height={template.qrZone.h} />
+        ) : (
+          <rect x={template.qrZone.x} y={template.qrZone.y} width={template.qrZone.w} height={template.qrZone.h} fill="#eee" />
+        )}
+        <text x={template.width / 2} y={template.qrZone.y + template.qrZone.h + 22} textAnchor="middle" fontSize={16} fill="#444">
+          QR identifies the learner only — no answers inside.
+        </text>
 
-function AnswerSlot({ item }: { item: Item }) {
-  return (
-    <div className="border-t border-dashed border-slate-300 py-1.5">
-      <div className="text-xs font-semibold">
-        {item.itemNumber}. <span className="font-normal">{slotLabel(item.type)}</span>{" "}
-        <span className="text-slate-500">({item.points} pt)</span>
-      </div>
-      {item.question ? (
-        <div className="text-[11px] text-slate-600">{item.question}</div>
-      ) : null}
-      <AnswerField item={item} />
-    </div>
-  );
-}
+        {/* Learner block (fixed, non-overlapping rows below the QR) */}
+        <text x={40} y={template.qrZone.y + template.qrZone.h + 50} fontSize={22} fontWeight="bold">
+          {learner.fullName}
+        </text>
+        <text x={40} y={template.qrZone.y + template.qrZone.h + 76} fontSize={17} fill="#222">
+          {`LRN: ${learner.lrn || "____________"}    Section: ${learner.section || assessment.section}    Version: ${version}`}
+        </text>
 
-function slotLabel(type: ItemType): string {
-  return type;
-}
+        {/* Shading instruction */}
+        <text x={40} y={template.qrZone.y + template.qrZone.h + 104} fontSize={17} fontWeight="bold" fill="#000">
+          Use black pen or pencil. Shade ONE circle per item clearly.
+        </text>
 
-function AnswerField({ item }: { item: Item }) {
-  const options = optionSet(item);
+        {/* Bubble grid */}
+        {omr.map((item, idx) => {
+          const row = idx + 1; // template row number
+          const col = columnFor(row);
+          const cy = rowCenterY(row);
+          const nx = numberX(col, template.columns);
+          const choices = Math.max(2, Math.min(item.choices, 4));
+          const bubbles = template.bubbles.filter((b) => b.item === row && b.choiceIndex < choices);
+          return (
+            <g key={item.id}>
+              <text x={nx} y={cy + 6} fontSize={20} fontWeight="bold">
+                {item.itemNumber}
+              </text>
+              {bubbles.map((b) => (
+                <g key={b.choiceIndex}>
+                  <circle cx={b.cx} cy={b.cy} r={b.r} fill="white" stroke="black" strokeWidth={2} />
+                  <text x={b.cx} y={b.cy + 5} textAnchor="middle" fontSize={13} fill="#333">
+                    {CHOICE_LETTERS[b.choiceIndex]}
+                  </text>
+                </g>
+              ))}
+            </g>
+          );
+        })}
 
-  // Objective with fixed options → bubbles.
-  if (options) {
-    return (
-      <div className="mt-1 flex flex-wrap gap-3">
-        {options.map((opt) => (
-          <span key={opt} className="flex items-center gap-1">
-            <span className="flex h-5 w-5 items-center justify-center rounded-full border-2 border-black text-[10px]">
-              {opt}
-            </span>
-          </span>
-        ))}
-      </div>
-    );
-  }
-
-  // Subjective / free-text fields by type.
-  if (item.type === "Essay") {
-    return <WriteBox height={90} note="Rubric / manual scoring" />;
-  }
-  if (item.type === "Performance Task" || item.type === "Oral Assessment") {
-    return <WriteBox height={60} note="Rubric / manual scoring" />;
-  }
-  if (item.type === "Problem Solving") {
-    return (
-      <div>
-        <WriteBox height={60} note="Solution" />
-        <AnswerLine label="Final answer" />
-      </div>
-    );
-  }
-  // Sequencing, Identification, Fill in the Blank, Short Answer → a line.
-  return <AnswerLine label="Answer" />;
-}
-
-function AnswerLine({ label }: { label: string }) {
-  return (
-    <div className="mt-2 flex items-end gap-2">
-      <span className="text-[9px] text-slate-500">{label}:</span>
-      <span className="h-4 flex-1 border-b border-black" />
-    </div>
-  );
-}
-
-function WriteBox({ height, note }: { height: number; note: string }) {
-  return (
-    <div className="mt-1">
-      <div className="text-[9px] text-slate-500">{note}</div>
-      <div
-        style={{ height }}
-        className="mt-0.5 w-full border border-black"
-      />
+        {/* Footer / scanning guide */}
+        <text x={40} y={template.height - 40} fontSize={15} fill="#444">
+          Teacher: scan with the DALIguro app (Check → Scan Answer Sheet). Keep all four black corner squares visible and the sheet flat.
+        </text>
+        <text x={40} y={template.height - 18} fontSize={13} fill="#777">
+          {`Assessment ${assessment.id} · Learner ${learner.id} · Version ${version}`}
+          {manualItems.length > 0
+            ? ` · Items checked manually: ${manualItems.map((i) => i.itemNumber).join(", ")}`
+            : ""}
+        </text>
+      </svg>
     </div>
   );
 }

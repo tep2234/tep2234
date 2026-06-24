@@ -21,9 +21,14 @@ import {
   type ScoreSummary,
 } from "../lib/scoring";
 import { uid } from "../lib/ids";
+import { parseQrPayload } from "../lib/qr-parse";
 import { ActiveGate } from "./ActiveGate";
-import { ScannerPlaceholder } from "./ScannerPlaceholder";
+import { omrItemsOf } from "../lib/scanner/omr-template";
+import { AnswerSheetScanner, type ScanResult } from "./scanner/AnswerSheetScanner";
+import { ScanReviewPanel } from "./scanner/ScanReviewPanel";
 import { Button, Empty } from "./ui";
+
+type CheckMode = "scan" | "manual" | "paste";
 
 export default function CheckPanel(props: PanelProps) {
   const { state, setState, activeId, setActiveId } = props;
@@ -34,7 +39,9 @@ export default function CheckPanel(props: PanelProps) {
       setActiveId={setActiveId}
       title="Assisted Checking"
     >
-      {(active) => <CheckEditor active={active} state={state} setState={setState} />}
+      {(active) => (
+        <CheckEditor active={active} state={state} setState={setState} setActiveId={setActiveId} />
+      )}
     </ActiveGate>
   );
 }
@@ -72,10 +79,12 @@ function CheckEditor({
   active,
   state,
   setState,
+  setActiveId,
 }: {
   active: Assessment;
   state: QrAssessmentState;
   setState: PanelProps["setState"];
+  setActiveId: PanelProps["setActiveId"];
 }) {
   const items: Item[] = state.items
     .filter((i) => i.assessmentId === active.id)
@@ -85,6 +94,57 @@ function CheckEditor({
   const [version, setVersion] = useState<TestVersion>(active.versions[0] ?? "A");
   const [dirty, setDirty] = useState(false);
   const [qrText, setQrTextValue] = useState("");
+  const [mode, setMode] = useState<CheckMode>("scan");
+  const [scanFeedback, setScanFeedback] = useState("");
+  const [scanResult, setScanResult] = useState<ScanResult | null>(null);
+
+  // Save an OMR scan. Self-contained: scores under the SCANNED assessment (from
+  // the QR), not whatever is active. Fills the scanned letters across that
+  // assessment's items and upserts one result, replacing any prior attempt.
+  function saveScan(result: ScanResult, responses: Record<string, string>) {
+    const a = result.assessment;
+    const aItems = state.items
+      .filter((i) => i.assessmentId === a.id)
+      .sort((x, y) => x.itemNumber - y.itemNumber);
+    const vk = (state.answerKeys[a.id] ?? {})[result.version] ?? {};
+    const summary = computeScores(aItems, vk, { ...emptyInput(), responses });
+    const answers = aItems.map((i) => ({ itemId: i.id, response: responses[i.id] ?? "" }));
+    const now = Date.now();
+    setState((prev) => {
+      const existing = findResult(prev.results, a.id, result.learner.id, result.version);
+      const saved: Result = {
+        id: existing ? existing.id : uid("R_"),
+        assessmentId: a.id,
+        learnerId: result.learner.id,
+        version: result.version,
+        answers,
+        itemScores: summary.itemScores,
+        rawScore: summary.rawScore,
+        totalScore: summary.totalScore,
+        percentage: summary.percentage,
+        masteryStatus: summary.masteryStatus,
+        reviewed: true,
+        createdAt: existing ? existing.createdAt : now,
+        updatedAt: now,
+      };
+      const results = existing
+        ? prev.results.map((r) => (r.id === existing.id ? saved : r))
+        : prev.results.concat(saved);
+      return { ...prev, results };
+    });
+    setScanResult(null);
+    window.alert(
+      "Saved " +
+        result.learner.fullName +
+        ": " +
+        summary.rawScore +
+        "/" +
+        summary.totalScore +
+        " (" +
+        summary.percentage +
+        "%)",
+    );
+  }
 
   const activeVersion = active.versions.includes(version)
     ? version
@@ -116,34 +176,37 @@ function CheckEditor({
     next();
   }
 
-  function applyQr() {
-    const text = qrText.trim();
-    if (!text) return;
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(text);
-    } catch {
-      window.alert("Invalid QR payload: not valid JSON.");
-      return;
-    }
-    const p = parsed as Record<string, unknown>;
-    if (p.assessmentId !== active.id) {
-      window.alert(
-        "QR is for a different assessment. Set that assessment active first.",
-      );
-      return;
-    }
-    const lid = String(p.learnerId ?? "");
-    if (!state.learners.some((l) => l.id === lid)) {
-      window.alert("Learner from QR not found on this device.");
-      return;
-    }
-    const v = String(p.version ?? "") as TestVersion;
-    switchSelection(() => {
-      setLearnerId(lid);
-      if (active.versions.includes(v)) setVersion(v);
-      setQrTextValue("");
+  // Validate a scanned/pasted QR string and, if valid, select its learner +
+  // version. Returns whether the QR was accepted (used by the camera scanner).
+  function acceptQr(text: string): boolean {
+    const res = parseQrPayload(text, {
+      activeAssessmentId: active.id,
+      hasLearner: (id) => state.learners.some((l) => l.id === id),
+      versions: active.versions,
     });
+    if (!res.ok) {
+      setScanFeedback("✗ " + res.reason);
+      return false;
+    }
+    const { payload } = res;
+    const target = state.learners.find((l) => l.id === payload.learnerId);
+    switchSelection(() => {
+      setLearnerId(payload.learnerId);
+      setVersion(payload.version);
+      setQrTextValue("");
+      setScanFeedback(
+        "✓ Selected " +
+          (target ? target.fullName : payload.learnerId) +
+          " · version " +
+          payload.version,
+      );
+    });
+    return true;
+  }
+
+  function applyQr() {
+    if (!qrText.trim()) return;
+    acceptQr(qrText);
   }
 
   const existing = findResult(state.results, active.id, learnerId, activeVersion);
@@ -160,8 +223,79 @@ function CheckEditor({
         </div>
       </div>
 
-      <ScannerPlaceholder />
+      {/* Identify mode */}
+      <div className="mt-4 flex flex-wrap items-center gap-2">
+        <span className="text-xs font-bold text-slate-500">Identify learner by:</span>
+        {(
+          [
+            ["scan", "🗒️ Scan Answer Sheet"],
+            ["manual", "✍ Manual (fallback)"],
+            ["paste", "📋 QR Paste (diagnostic)"],
+          ] as [CheckMode, string][]
+        ).map(([m, label]) => {
+          const on = mode === m;
+          const cls = on
+            ? "border-indigo-700 bg-indigo-700 text-white"
+            : "border-slate-200 bg-white text-slate-600";
+          return (
+            <button
+              key={m}
+              onClick={() => {
+                setMode(m);
+                setScanFeedback("");
+              }}
+              className={"rounded-lg border px-3 py-1.5 text-sm font-bold " + cls}
+            >
+              {label}
+            </button>
+          );
+        })}
+      </div>
 
+      <p className="mt-2 text-xs text-slate-500">
+        {mode === "scan"
+          ? "Scan Answer Sheet: scan the learner's printed sheet — the QR identifies them and the camera reads the shaded answers, then you review and save."
+          : mode === "manual"
+            ? "Manual (fallback): choose the learner and version below, then mark answers by hand."
+            : "QR Paste (diagnostic): paste a copied QR payload below to auto-select the learner and version."}
+      </p>
+
+      {mode === "scan" ? (
+        scanResult ? (
+          <ScanReviewPanel
+            learner={scanResult.learner}
+            version={scanResult.version}
+            assessmentTitle={scanResult.assessment.title}
+            omrItems={omrItemsOf(
+              state.items.filter((i) => i.assessmentId === scanResult.assessment.id),
+            )}
+            versionKey={
+              (state.answerKeys[scanResult.assessment.id] ?? {})[scanResult.version] ?? {}
+            }
+            readings={scanResult.reading.items}
+            alreadySaved={Boolean(
+              findResult(
+                state.results,
+                scanResult.assessment.id,
+                scanResult.learner.id,
+                scanResult.version,
+              ),
+            )}
+            onSave={(_learner, _version, responses) => saveScan(scanResult, responses)}
+            onRescan={() => setScanResult(null)}
+          />
+        ) : (
+          <AnswerSheetScanner
+            state={state}
+            activeId={active.id}
+            onSetActive={setActiveId}
+            onResult={setScanResult}
+          />
+        )
+      ) : null}
+
+      {mode !== "scan" ? (
+        <>
       {/* Selection */}
       <div className="mt-4 rounded-xl border border-slate-200 bg-white p-4">
         <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
@@ -211,23 +345,38 @@ function CheckEditor({
           </div>
         </div>
 
-        {/* Optional QR paste */}
-        <div className="mt-3 flex flex-wrap items-end gap-2">
-          <label className="min-w-60 flex-1">
-            <span className="mb-1 block text-xs font-bold text-slate-500">
-              Paste QR payload (optional) to auto-select learner & version
-            </span>
-            <input
-              value={qrText}
-              onChange={(e) => setQrTextValue(e.target.value)}
-              placeholder='{"assessmentId":"…","learnerId":"…","version":"A"}'
-              className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 font-mono text-xs"
-            />
-          </label>
-          <Button variant="ghost" onClick={applyQr}>
-            Apply QR
-          </Button>
-        </div>
+        {/* QR paste (paste mode only) */}
+        {mode === "paste" ? (
+          <div className="mt-3 flex flex-wrap items-end gap-2">
+            <label className="min-w-60 flex-1">
+              <span className="mb-1 block text-xs font-bold text-slate-500">
+                Paste QR payload to auto-select learner & version
+              </span>
+              <input
+                value={qrText}
+                onChange={(e) => setQrTextValue(e.target.value)}
+                placeholder='{"assessmentId":"…","learnerId":"…","version":"A"}'
+                className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 font-mono text-xs"
+              />
+            </label>
+            <Button variant="ghost" onClick={applyQr}>
+              Apply QR
+            </Button>
+          </div>
+        ) : null}
+
+        {scanFeedback ? (
+          <div
+            className={
+              "mt-3 rounded-lg border p-2 text-sm font-semibold " +
+              (scanFeedback.startsWith("✓")
+                ? "border-emerald-300 bg-emerald-50 text-emerald-800"
+                : "border-red-300 bg-red-50 text-red-700")
+            }
+          >
+            {scanFeedback}
+          </div>
+        ) : null}
 
         {Object.keys(versionKey).length === 0 &&
         items.some((i) => isObjective(i.type)) ? (
@@ -256,6 +405,8 @@ function CheckEditor({
       ) : (
         <Empty text="Select a learner to start checking." />
       )}
+        </>
+      ) : null}
     </section>
   );
 }

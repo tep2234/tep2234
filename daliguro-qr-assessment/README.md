@@ -5,7 +5,9 @@ tested on its own first, then integrated into the main DALIguro app later.
 
 - **Not** connected to the main DALIguro project.
 - **No** Supabase. All data is stored locally on the device.
-- Stack: Vite + React + TypeScript + Tailwind CSS v4. QR via the `qrcode` package.
+- Stack: Vite + React + TypeScript + Tailwind CSS v4. QR generation via the
+  `qrcode` package; QR scanning via the native `BarcodeDetector` with a
+  bundled `jsqr` fallback (no network/runtime dependency — offline-first).
 
 ## Run
 
@@ -47,18 +49,58 @@ Open the preview URL Vite prints, usually <http://localhost:4173>.
 
 ### Test from your phone (same Wi-Fi)
 
-```bash
-npm run dev -- --host 0.0.0.0
+`npm run dev` serves plain **HTTP** with `host: true`, so it works from any
+device on the Wi-Fi without cert warnings. Vite prints both URLs:
+
+```text
+➜  Local:   http://localhost:5173/
+➜  Network: http://192.168.1.9:5173/
 ```
 
-Find your Mac's IP, then open `http://YOUR_MAC_IP:5173` on the phone:
+Open the **Network** URL on the phone (find the IP with
+`ipconfig getifaddr en0`). If a device cannot connect at all, confirm both are
+on the same network and, if the macOS firewall is on, allow incoming
+connections for `node` (System Settings → Network → Firewall → Options).
 
-- System Settings → Wi-Fi → Details → IP Address, or
-- Terminal: `ipconfig getifaddr en0`
+#### Camera scanner on a phone needs HTTPS
 
-So if `ipconfig getifaddr en0` prints `192.168.1.20`, open
-`http://192.168.1.20:5173` on the phone. Mac and phone must be on the
-same network.
+The camera works on **this Mac** over `http://localhost:5173` (localhost is a
+secure context). But on a **remote phone**, iOS/Android Safari/Chrome only
+allow `getUserMedia` over **HTTPS**. For phone camera testing, run:
+
+```bash
+npm run dev:https
+```
+
+This enables a self-signed cert (`@vitejs/plugin-basic-ssl`). Open
+`https://YOUR_MAC_IP:5173` on the phone, accept the one-time
+"connection is not private" warning (Show Details → visit this website), then
+**Check → Camera QR Scan → Start camera**. Without HTTPS the app still loads on
+the phone — only the camera mode is blocked (use QR Paste there instead).
+
+## Install as an app (PWA)
+
+The production build is an installable, offline-capable PWA:
+
+- `public/manifest.webmanifest` (name, icons, standalone display, indigo theme),
+- `public/sw.js` — a service worker that caches the app shell. Navigations are
+  network-first (always update online) with a cached fallback so the app still
+  launches with no Wi-Fi; hashed assets are cache-first.
+- Registered from `src/main.tsx` **in production builds only** (dev keeps clean
+  HMR with no service worker).
+
+A service worker and "Add to Home Screen" need a **secure context**
+(HTTPS or localhost). To try it on a phone:
+
+```bash
+npm run build
+npm run preview:https   # serves dist/ over HTTPS on the LAN
+```
+
+Open `https://YOUR_MAC_IP:4173`, accept the cert warning, then use the browser's
+**Add to Home Screen / Install** option. Launched from the home screen it opens
+full-screen and works offline (all data is already local). Bump `CACHE_VERSION`
+in `public/sw.js` on each release so old caches retire.
 
 ## Build status (phase by phase)
 
@@ -74,18 +116,63 @@ same network.
 | 8 | Assisted checking + scoring | ✅ done |
 | 9 | Results dashboard + CSV export | ✅ done |
 | 10 | Analysis dashboard | ✅ done |
-| 11 | QR camera scanner placeholder | ✅ done |
+| 11 | QR camera scanner (BarcodeDetector + jsQR), strict QR validation, demo data, JSON backup/restore, start guide, items+answer-key CSV import, installable PWA | ✅ done |
 
 Tabs: **Setup · Items · Learners · QR Sheets · Check · Results · Analysis**
 
+The **Check** tab identifies a learner three ways: **Manual select**, **QR
+Paste**, or **Camera QR Scan**. All three feed the same strict validator
+(`src/lib/qr-parse.ts`), which rejects malformed QRs, QRs for another
+assessment, unknown learners, and any QR carrying answer/score-shaped fields.
+Camera scanning is identity-only — checking always happens manually below.
+
 ## Real-device testing required before DALIguro integration
 
-The build passes typecheck, lint, build, and 41 logic unit tests, but QR
-rendering, print behavior, local-storage persistence, CSV download, and
-mobile layout can only be verified in a real browser. Work through
-[`MANUAL_TESTING_GUIDE.md`](./MANUAL_TESTING_GUIDE.md) on a real machine
-(Chrome/Safari desktop, plus a mobile browser if available) and pass it
-**before** starting any DALIguro/Supabase integration.
+The build passes typecheck, lint, build, and 55 logic unit tests, but QR
+rendering, print behavior, local-storage persistence, CSV download, camera
+scanning, and mobile layout can only be verified in a real browser. Work
+through [`MANUAL_TESTING_GUIDE.md`](./MANUAL_TESTING_GUIDE.md) and the
+checklist below on a real machine and pass them **before** starting any
+DALIguro/Supabase integration.
+
+## Browser testing checklist
+
+Fast path: open the app, go to **Setup → Load demo assessment**, then test.
+
+- [ ] **Local dev** — `npm run dev`, open <http://localhost:5173>.
+- [ ] **Demo data** — Setup shows the 5-step start guide and *Load demo
+      assessment*; loading it creates 1 assessment, 10 items, key, 5 learners,
+      versions A & B, and sets it active.
+- [ ] **Persistence** — refresh the browser; all data survives (IndexedDB,
+      localStorage fallback).
+- [ ] **QR sheets** — generate sheets; QR is readable on screen and in print
+      preview; the note states the QR identifies the learner only.
+- [ ] **Check · Manual** — pick a learner + version, mark answers, save score.
+- [ ] **Check · QR Paste** — paste a payload (use the Sheets "QR payload
+      preview"); learner + version auto-select; invalid/foreign/unknown QRs are
+      rejected with a clear message; a QR with answer-key fields is rejected.
+- [ ] **Check · Camera QR Scan** —
+  - **Chrome/Android (BarcodeDetector path):** Start camera → state labels
+    move Not connected → Camera permission needed → Scanning → QR found;
+    learner auto-selects; *Scan another learner* resumes; a cooldown stops one
+    QR from firing repeatedly.
+  - **Safari / iPhone (jsQR fallback):** Safari has no `BarcodeDetector`, so
+    the app shows a "jsQR fallback" badge and decodes frames in JS. Camera
+    access needs **HTTPS or localhost** and permission; on a LAN IP over plain
+    HTTP iOS will block the camera — use the QR Paste tab there, or serve over
+    HTTPS.
+- [ ] **Results** — saved score appears with name, LRN, version, %, mastery;
+      re-checking the same learner/version updates in place (no duplicate);
+      a different version is a separate attempt.
+- [ ] **Analysis** — item analysis, common wrong answers, and mastery update
+      after results are saved; empty state shows when there are no results.
+- [ ] **Backup** — Setup → *Export backup (JSON)*, *Import / restore*, and
+      *Clear all data* (double-confirm). Restore replaces device data.
+
+### Security rule (must stay true)
+
+The QR carries **identity only**. Manual checking is the only scoring path —
+there is no auto-grading of the answer sheet itself yet (no OMR/OCR).
 
 ## Project layout
 
@@ -102,22 +189,46 @@ src/
 ## Security rule
 
 Answer keys live only in local storage and are **never** embedded in QR codes.
-The QR payload carries identity only: `assessmentId`, `learnerId`, `section`,
-`gradeLevel`, `version`, `securityToken`.
+The QR payload carries identity only: `assessmentId`, `learnerId`, `lrn`,
+`section`, `gradeLevel`, `version`, `securityToken`. The validator in
+`src/lib/qr-parse.ts` defensively **rejects** any scanned/pasted QR that
+contains answer-key- or score-shaped fields (`answerKey`, `correctAnswer`,
+`score`, `itemScores`, …), even though this app never produces one.
 
-## Future QR camera scanner
+## QR camera scanner (current behavior)
 
-Phase 11 ships only a placeholder (in the Check tab). Manual learner selection
-and QR-payload paste remain the workflow. The future camera scanner will:
+The Check tab's **Camera QR Scan** mode:
 
-- open the camera (with permission handling),
-- detect a QR code in the video stream,
-- parse the learner + assessment identity payload,
-- validate `assessmentId` against the active assessment,
-- select the learner and version,
-- open the checking grid.
+- opens the rear camera (`facingMode: environment`) with permission handling,
+- decodes with the native `BarcodeDetector` when available, otherwise the
+  bundled `jsqr` fallback (Safari/iPhone),
+- shows explicit states: Not connected → Camera permission needed → Scanning →
+  QR found (and Camera unavailable on failure),
+- validates the payload against the active assessment and known learners,
+- selects the learner + version and reveals the checking grid,
+- applies a short cooldown and a *Scan another learner* button so one QR is not
+  read repeatedly.
 
-No OMR and no OCR are planned for the spine — checking stays assisted.
+No OMR and no OCR are planned for the spine — checking stays assisted (the
+teacher marks answers manually after the learner is identified).
+
+## Bulk import items & answer key (CSV)
+
+The Items tab has **⬆ Import items from CSV** (parser in `src/lib/items-csv.ts`).
+Use **Download template** to get the exact header for the active assessment's
+versions. Recognised columns (case-insensitive, spaces/underscores ignored):
+
+```text
+itemNo, type, question, optionA..optionD, answerVersionA, answerVersionB,
+points, competency, difficulty
+```
+
+- `answerVersionX` letters populate the per-version answer key only — never the
+  QR. Letters outside the choice range are rejected with a row-level note.
+- Identification / Fill-in / Short Answer rows can use `correctAnswer` and
+  `acceptedAnswers` (comma-separated) instead of version columns.
+- Importing **replaces** the active assessment's existing items; keys are set
+  for versions enabled in Setup (others are reported so you can enable them).
 
 ## Mastery bands
 

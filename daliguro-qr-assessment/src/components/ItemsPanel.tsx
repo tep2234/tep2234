@@ -13,9 +13,11 @@ import type {
 } from "../lib/types";
 import { DIFFICULTIES, ITEM_TYPES } from "../lib/types";
 import { isObjective, usesAcceptedAnswers } from "../lib/items";
+import { buildItemsImport, parseItemsCsv } from "../lib/items-csv";
 import { uid } from "../lib/ids";
 import { ActiveGate } from "./ActiveGate";
 import { AnswerKeyEditor } from "./AnswerKeyEditor";
+import { ItemsImport } from "./ItemsImport";
 import { Button, Empty, Field, Pill, Select, TextInput } from "./ui";
 
 export default function ItemsPanel(props: PanelProps) {
@@ -100,6 +102,64 @@ function ItemsEditor({
     });
   }
 
+  // Bulk import items + answer keys from CSV. Replaces this assessment's items.
+  function importItemsCsv(csvText: string) {
+    const parsed = parseItemsCsv(csvText);
+    if (parsed.items.length === 0) {
+      window.alert(
+        "No items imported.\n\n" +
+          (parsed.errors.join("\n") || "Check the CSV header and contents."),
+      );
+      return;
+    }
+    const built = buildItemsImport(active.id, parsed.items);
+
+    // Keys only for versions enabled on this assessment; note the rest.
+    const allowed = parsed.versions.filter((v) => active.versions.includes(v));
+    const notEnabled = parsed.versions.filter((v) => !active.versions.includes(v));
+    const keys: Partial<Record<TestVersion, VersionKey>> = {};
+    allowed.forEach((v) => {
+      if (built.keys[v]) keys[v] = built.keys[v];
+    });
+
+    if (
+      items.length > 0 &&
+      !window.confirm(
+        "Replace this assessment's " +
+          items.length +
+          " existing item(s) with " +
+          built.items.length +
+          " imported item(s)?",
+      )
+    ) {
+      return;
+    }
+
+    setState((prev) => ({
+      ...prev,
+      items: prev.items
+        .filter((i) => i.assessmentId !== active.id)
+        .concat(built.items),
+      answerKeys: { ...prev.answerKeys, [active.id]: keys },
+    }));
+
+    const lines = [
+      "Imported " + built.items.length + " item(s).",
+      "Answer keys set for version(s): " + (allowed.join(", ") || "none"),
+    ];
+    if (notEnabled.length > 0) {
+      lines.push(
+        "CSV also had version(s) " +
+          notEnabled.join(", ") +
+          " — enable them in Setup to use those keys.",
+      );
+    }
+    if (parsed.errors.length > 0) {
+      lines.push("", "Notes:", ...parsed.errors);
+    }
+    window.alert(lines.join("\n"));
+  }
+
   function keyFor(version: TestVersion): VersionKey {
     const assessmentKeys = state.answerKeys[active.id] ?? {};
     return assessmentKeys[version] ?? {};
@@ -133,6 +193,8 @@ function ItemsEditor({
         </div>
         <Button onClick={addItem}>+ Add Item</Button>
       </div>
+
+      <ItemsImport versions={active.versions} onImport={importItemsCsv} />
 
       {items.length === 0 ? (
         <Empty text="No items yet. Add your first question." />

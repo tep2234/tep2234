@@ -11,13 +11,29 @@ body {
   color: #0f172a;
 }
 
-/* Print rules for QR answer sheets. */
+/* Print rules for OMR answer sheets: print ONLY the sheets, never the app
+   chrome (header/nav/controls), so stray UI doesn't land on the paper or
+   confuse the scanner's corner-marker detection. */
 @media print {
-  .no-print {
-    display: none !important;
-  }
   body {
     background: #ffffff;
+  }
+  /* Hide everything, then reveal only the printable sheet area. */
+  body * {
+    visibility: hidden;
+  }
+  .print-area,
+  .print-area * {
+    visibility: visible;
+  }
+  .print-area {
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 100%;
+  }
+  .no-print {
+    display: none !important;
   }
   .sheet {
     page-break-after: always;

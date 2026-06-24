@@ -16,7 +16,10 @@ import {
   TEST_VERSIONS,
 } from "../lib/types";
 import { uid } from "../lib/ids";
-import { Button, Empty, Field, Pill, Select, TextInput } from "./ui";
+import { buildDemoBundle, withDemoBundle } from "../lib/demo";
+import { StartGuide } from "./StartGuide";
+import { BackupTools } from "./BackupTools";
+import { Button, Field, Pill, Select, TextInput } from "./ui";
 
 const GRADE_LEVELS = ["7", "8", "9", "10", "11", "12"];
 
@@ -60,6 +63,15 @@ export default function SetupPanel(props: PanelProps) {
 
   function startNew() {
     setEditing(newAssessment());
+  }
+
+  // Load (or refresh) the shared demo. Fixed IDs => same on every device, so a
+  // sheet from one device's demo scans correctly on another.
+  function loadDemo() {
+    const bundle = buildDemoBundle();
+    setState((prev) => withDemoBundle(prev, bundle));
+    setActiveId(bundle.assessment.id);
+    window.alert("Demo assessment loaded and set active. It has the same IDs on every device, so its printed sheets scan anywhere.");
   }
 
   function save(draft: Assessment) {
@@ -107,11 +119,18 @@ export default function SetupPanel(props: PanelProps) {
             Create an assessment, then set it active to work on it in other tabs.
           </p>
         </div>
-        <Button onClick={startNew}>+ New Assessment</Button>
+        <div className="flex gap-2">
+          <Button variant="ghost" onClick={loadDemo}>⚡ Load demo</Button>
+          <Button onClick={startNew}>+ New Assessment</Button>
+        </div>
       </div>
 
       {state.assessments.length === 0 ? (
-        <Empty text="No assessments yet. Create your first one." />
+        <StartGuide
+          setState={setState}
+          setActiveId={setActiveId}
+          onCreate={startNew}
+        />
       ) : (
         <div className="mt-4 grid gap-3">
           {state.assessments.map((a) => (
@@ -127,6 +146,8 @@ export default function SetupPanel(props: PanelProps) {
           ))}
         </div>
       )}
+
+      <BackupTools state={state} setState={setState} setActiveId={setActiveId} />
     </section>
   );
 }
