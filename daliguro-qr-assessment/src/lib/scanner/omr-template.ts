@@ -39,9 +39,9 @@ const ROWS_PER_COL = 10;
 const ROW_H = (GRID_BOTTOM - GRID_TOP) / ROWS_PER_COL; // 84
 const GRID_L = 60;
 const GRID_R = 60;
-const BUBBLE_R = 12;
+const BUBBLE_R = 14; // increased for better camera detection
 const NUM_OFFSET = 52; // first bubble x within a column, after the item number
-const CHOICE_DX = 34; // spacing between A/B/C/D centres
+const CHOICE_DX = 36; // spacing between A/B/C/D centres (widened for bigger bubbles)
 
 export interface Point {
   x: number;

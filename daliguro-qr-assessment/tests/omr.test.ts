@@ -49,7 +49,8 @@ describe("classifyItem", () => {
     expect(r.detected).toBeNull();
   });
   it("unclear: faint single mark", () => {
-    expect(classifyItem(1, [0.34, 0.1, 0.1, 0.1], 4).status).toBe("unclear");
+    // 0.18 = between MARK_LO (0.12) and MARK_HI (0.25) → faint/ambiguous in adaptive world
+    expect(classifyItem(1, [0.18, 0.1, 0.1, 0.1], 4).status).toBe("unclear");
   });
   it("unclear: two marks too close to separate", () => {
     expect(classifyItem(1, [0.5, 0.46, 0.1, 0.1], 4).status).toBe("multiple");

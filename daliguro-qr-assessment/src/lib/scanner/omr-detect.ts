@@ -36,10 +36,11 @@ export interface SheetReading {
   items: ItemReading[];
 }
 
-// Classification thresholds (darkness ratio 0..1).
-const MARK_HI = 0.45; // clearly shaded
-const MARK_LO = 0.26; // clearly empty
-const MARGIN = 0.14; // needed gap between top and runner-up
+// Adaptive contrast thresholds. markScore = (localBg - innerBrightness) / localBg,
+// so the same physical mark reads consistently regardless of ambient lighting.
+const MARK_HI = 0.25; // clearly shaded (inner 25%+ darker than surrounding paper)
+const MARK_LO = 0.12; // clearly empty (below = no mark; paper noise is 5–10%)
+const MARGIN = 0.08; // gap needed between top choice and runner-up
 
 // --- grayscale ---------------------------------------------------------
 export function toGray(img: RgbaImage): GrayImage {
@@ -258,24 +259,37 @@ function sample(g: GrayImage, x: number, y: number): number {
   return a * (1 - fx) * (1 - fy) + bb * fx * (1 - fy) + c * (1 - fx) * fy + d * fx * fy;
 }
 
-// Mean darkness (0..1) inside a bubble's inner disc, mapped through H.
-function bubbleDarkness(g: GrayImage, h: number[], cx: number, cy: number, r: number): number {
-  const rr = r * 0.62; // inner disc, avoids the printed ring
-  const stepCount = 5;
-  let sum = 0;
-  let n = 0;
-  for (let dy = -stepCount; dy <= stepCount; dy += 1) {
-    for (let dx = -stepCount; dx <= stepCount; dx += 1) {
-      const ox = (dx / stepCount) * rr;
-      const oy = (dy / stepCount) * rr;
-      if (ox * ox + oy * oy > rr * rr) continue;
+// Adaptive markScore: how much darker the bubble interior is vs its local background.
+// Returns 0 (empty) to 1 (fully filled), independent of ambient brightness.
+// innerR samples the mark; the ring between r*0.85 and r*1.35 samples paper background
+// (r*0.85 skips the printed ink outline; r*1.35 stays clear of adjacent bubbles).
+function bubbleAdaptive(g: GrayImage, h: number[], cx: number, cy: number, r: number): number {
+  const innerR = r * 0.55;
+  const outMinR2 = (r * 0.85) * (r * 0.85);
+  const outMaxR = r * 1.35;
+  const outMaxR2 = outMaxR * outMaxR;
+  const step = 7;
+  let innerSum = 0, innerN = 0;
+  let outerSum = 0, outerN = 0;
+  for (let dy = -step; dy <= step; dy += 1) {
+    for (let dx = -step; dx <= step; dx += 1) {
+      const ox = (dx / step) * outMaxR;
+      const oy = (dy / step) * outMaxR;
+      const d2 = ox * ox + oy * oy;
+      if (d2 > outMaxR2) continue;
       const p = applyHomography(h, cx + ox, cy + oy);
-      sum += sample(g, p.x, p.y);
-      n += 1;
+      const v = sample(g, p.x, p.y);
+      if (d2 <= innerR * innerR) {
+        innerSum += v; innerN += 1;
+      } else if (d2 >= outMinR2) {
+        outerSum += v; outerN += 1;
+      }
     }
   }
-  const gray = n > 0 ? sum / n : 255;
-  return 1 - gray / 255; // darkness ratio
+  const inner = innerN > 0 ? innerSum / innerN : 255;
+  const outer = outerN > 0 ? outerSum / outerN : 200;
+  const bg = Math.max(outer, 40); // floor prevents near-zero division in deep shadow
+  return Math.max(0, (bg - inner) / bg);
 }
 
 export function classifyItem(
@@ -295,19 +309,20 @@ export function classifyItem(
   }
   if (marked === 1) {
     if (top.v - second.v >= MARGIN) {
-      const confidence = clamp01(Math.min((top.v - second.v) / 0.25, top.v / 0.6));
+      // Confidence: how dark the mark is AND how cleanly it stands apart.
+      const confidence = clamp01(Math.min((top.v - second.v) / 0.20, top.v / 0.45));
       return { item, detected: CHOICES[top.i], status: "selected", confidence, fill };
     }
     // one is dark but the runner-up is close → ambiguous.
-    return { item, detected: CHOICES[top.i], status: "unclear", confidence: 0.4, fill };
+    return { item, detected: CHOICES[top.i], status: "unclear", confidence: 0.38, fill };
   }
   // nothing crossed the "shaded" threshold.
   if (top.v < MARK_LO) {
-    const confidence = clamp01((MARK_LO - top.v) / MARK_LO + 0.3);
+    const confidence = clamp01((MARK_LO - top.v) / MARK_LO + 0.35);
     return { item, detected: null, status: "blank", confidence, fill };
   }
-  // a faint mark between empty and shaded.
-  return { item, detected: CHOICES[top.i], status: "unclear", confidence: 0.35, fill };
+  // faint mark between empty and shaded — flag for teacher review.
+  return { item, detected: CHOICES[top.i], status: "unclear", confidence: 0.32, fill };
 }
 
 function clamp01(v: number): number {
@@ -340,7 +355,7 @@ export function readSheet(
   const fillByItem = new Map<number, number[]>();
   for (const b of template.bubbles) {
     if (!fillByItem.has(b.item)) fillByItem.set(b.item, [0, 0, 0, 0]);
-    fillByItem.get(b.item)![b.choiceIndex] = bubbleDarkness(g, h, b.cx, b.cy, b.r);
+    fillByItem.get(b.item)![b.choiceIndex] = bubbleAdaptive(g, h, b.cx, b.cy, b.r);
   }
 
   const items: ItemReading[] = [];
