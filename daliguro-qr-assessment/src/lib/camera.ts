@@ -71,17 +71,16 @@ export function isSecureLike(
 // Shown when the page is not a secure context. Kept jargon-free and points to
 // the HTTPS tunnel link, which is the only thing that works on a phone.
 export const INSECURE_MESSAGE =
-  "Camera is blocked because this page is not secure. On iPhone, open the HTTPS " +
-  "Cloudflare tunnel link, for example https://xxxxx.trycloudflare.com (the " +
-  "address must start with https://). You can still use QR Paste or Manual select.";
+  "Camera is blocked because this page is not secure. Open the app at " +
+  "https://daliguro-qr-assessment.vercel.app — the address must start with https://. " +
+  "You can still use QR Paste or Manual select.";
 
 // Visible checklist for fixing camera access on a phone.
 export const SECURE_CONTEXT_CHECKLIST: string[] = [
-  "Make sure the URL starts with https://",
-  "Do not use localhost on iPhone",
-  "Do not use http://192.168…",
-  "Use the Cloudflare tunnel URL (https://….trycloudflare.com)",
-  "Allow camera permission in Safari",
+  "Open the app at https://daliguro-qr-assessment.vercel.app",
+  "Make sure the URL starts with https:// (not http://)",
+  "Do not use localhost or an IP address on your phone",
+  "Allow camera permission when prompted by your browser",
 ];
 
 // Dev-only context log to help diagnose secure-context issues.

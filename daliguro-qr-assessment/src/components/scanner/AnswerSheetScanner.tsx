@@ -395,7 +395,7 @@ export function AnswerSheetScanner({
           <span className="rounded-full bg-slate-100 px-2 py-0.5 text-xs text-slate-500">jsQR fallback</span>
         ) : null}
         <div className="ml-auto flex flex-wrap gap-2">
-          <Button onClick={() => fileInputRef.current?.click()}>📷 Take / upload photo</Button>
+          <Button onClick={() => fileInputRef.current?.click()}>📷 Scan with camera</Button>
           {live ? (
             <>
               <Button variant="small" onClick={capture}>📸 Capture frame</Button>
@@ -407,12 +407,12 @@ export function AnswerSheetScanner({
             </Button>
           )}
         </div>
-        <input ref={fileInputRef} type="file" accept="image/*" hidden onChange={onPhoto} />
+        <input ref={fileInputRef} type="file" accept="image/*" capture="environment" hidden onChange={onPhoto} />
       </div>
 
       <p className="mt-2 text-xs text-slate-500">
-        <b>Recommended:</b> tap <b>📷 Take / upload photo</b> → <b>Take Photo</b>,
-        fit the WHOLE sheet (all four black corners + the QR), flat and well-lit.
+        <b>Recommended:</b> tap <b>📷 Scan with camera</b> and photograph the
+        WHOLE sheet — all four black corners + QR visible, flat and well-lit.
       </p>
 
       {/* Live chips: QR decode + identity + image quality are independent. */}
