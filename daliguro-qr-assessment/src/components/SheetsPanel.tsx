@@ -105,7 +105,9 @@ function SheetGenerator({
       window.alert("Select at least one learner to print.");
       return;
     }
-    window.print();
+    // Let any just-rendered QR images/SVG settle for a paint before printing,
+    // so the print snapshot never captures an unrendered QR placeholder.
+    requestAnimationFrame(() => requestAnimationFrame(() => window.print()));
   }
 
   return (
@@ -117,7 +119,13 @@ function SheetGenerator({
             {active.title} · {items.length} item(s) · {chosen.length} selected
           </p>
         </div>
-        <Button onClick={printSheets}>🖨 Print Selected ({chosen.length})</Button>
+        <div className="text-right">
+          <Button onClick={printSheets}>🖨 Print Selected ({chosen.length})</Button>
+          <p className="mt-1 text-xs text-slate-400">
+            Each sheet fits one A4 page at 100%. In the print dialog: A4 · Portrait ·
+            Scale 100% · Headers/footers off (or “Save as PDF”).
+          </p>
+        </div>
       </div>
 
       {/* Controls */}
