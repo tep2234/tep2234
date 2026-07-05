@@ -95,6 +95,13 @@ create trigger smartscan_results_touch
   before update on public.smartscan_checked_results
   for each row execute function public.touch_updated_at();
 
+-- ---- role grants -------------------------------------------
+-- The signed-in teacher uses the `authenticated` role; grant table access so
+-- the owner-only RLS policies above are actually reached. `anon` is
+-- intentionally NOT granted, so unauthenticated clients stay fully locked out.
+grant select, insert, update, delete on public.smartscan_sessions to authenticated;
+grant select, insert, update, delete on public.smartscan_checked_results to authenticated;
+
 -- ---- realtime ----------------------------------------------
 -- PC dashboard subscribes to these; RLS still applies to realtime payloads.
 alter publication supabase_realtime add table public.smartscan_sessions;
