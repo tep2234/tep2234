@@ -38,6 +38,7 @@ describe("type classification", () => {
       "Identification",
       "Fill in the Blank",
       "Short Answer",
+      "Enumeration",
       "Problem Solving",
       "Essay",
       "Performance Task",

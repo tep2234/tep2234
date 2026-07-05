@@ -14,11 +14,11 @@ import type {
 } from "../lib/types";
 import { COGNITIVE_LEVELS, DIFFICULTIES, ITEM_TYPES } from "../lib/types";
 import { isObjective, usesAcceptedAnswers } from "../lib/items";
-import { buildItemsImport, parseItemsCsv } from "../lib/items-csv";
+import type { buildImport } from "../lib/test-import";
 import { uid } from "../lib/ids";
 import { ActiveGate } from "./ActiveGate";
 import { AnswerKeyEditor } from "./AnswerKeyEditor";
-import { ItemsImport } from "./ItemsImport";
+import { TestImport } from "./TestImport";
 import { Button, Empty, Field, Pill, Select, TextInput } from "./ui";
 
 export default function ItemsPanel(props: PanelProps) {
@@ -105,62 +105,27 @@ function ItemsEditor({
     });
   }
 
-  // Bulk import items + answer keys from CSV. Replaces this assessment's items.
-  function importItemsCsv(csvText: string) {
-    const parsed = parseItemsCsv(csvText);
-    if (parsed.items.length === 0) {
-      window.alert(
-        "No items imported.\n\n" +
-          (parsed.errors.join("\n") || "Check the CSV header and contents."),
-      );
-      return;
-    }
-    const built = buildItemsImport(active.id, parsed.items);
-
-    // Keys only for versions enabled on this assessment; note the rest.
-    const allowed = parsed.versions.filter((v) => active.versions.includes(v));
-    const notEnabled = parsed.versions.filter((v) => !active.versions.includes(v));
+  // Save confirmed Smart Test Import rows. Items arrive without an assessmentId
+  // (the preview doesn't know it); stamp it here, keep only keys for enabled
+  // versions, and replace this assessment's items + keys.
+  function saveImport(
+    imported: ReturnType<typeof buildImport>["items"],
+    importedKeys: Partial<Record<TestVersion, VersionKey>>,
+  ) {
+    const stamped = imported.map((i) => ({ ...i, assessmentId: active.id }));
     const keys: Partial<Record<TestVersion, VersionKey>> = {};
-    allowed.forEach((v) => {
-      if (built.keys[v]) keys[v] = built.keys[v];
+    active.versions.forEach((v) => {
+      if (importedKeys[v]) keys[v] = importedKeys[v];
     });
-
-    if (
-      items.length > 0 &&
-      !window.confirm(
-        "Replace this assessment's " +
-          items.length +
-          " existing item(s) with " +
-          built.items.length +
-          " imported item(s)?",
-      )
-    ) {
-      return;
-    }
-
     setState((prev) => ({
       ...prev,
-      items: prev.items
-        .filter((i) => i.assessmentId !== active.id)
-        .concat(built.items),
+      items: prev.items.filter((i) => i.assessmentId !== active.id).concat(stamped),
       answerKeys: { ...prev.answerKeys, [active.id]: keys },
     }));
-
-    const lines = [
-      "Imported " + built.items.length + " item(s).",
-      "Answer keys set for version(s): " + (allowed.join(", ") || "none"),
-    ];
-    if (notEnabled.length > 0) {
-      lines.push(
-        "CSV also had version(s) " +
-          notEnabled.join(", ") +
-          " — enable them in Setup to use those keys.",
-      );
-    }
-    if (parsed.errors.length > 0) {
-      lines.push("", "Notes:", ...parsed.errors);
-    }
-    window.alert(lines.join("\n"));
+    window.alert(
+      "Imported " + stamped.length + " item(s). Answer keys set for version(s): " +
+        (active.versions.filter((v) => keys[v]).join(", ") || "none") + ".",
+    );
   }
 
   function keyFor(version: TestVersion): VersionKey {
@@ -197,7 +162,11 @@ function ItemsEditor({
         <Button onClick={addItem}>+ Add Item</Button>
       </div>
 
-      <ItemsImport versions={active.versions} onImport={importItemsCsv} />
+      <TestImport
+        versions={active.versions}
+        hasItems={items.length > 0}
+        onSave={saveImport}
+      />
 
       {items.length === 0 ? (
         <Empty text="No items yet. Add your first question." />
