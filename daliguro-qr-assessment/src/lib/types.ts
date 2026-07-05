@@ -26,6 +26,7 @@ export const ITEM_TYPES = [
   "Identification",
   "Fill in the Blank",
   "Short Answer",
+  "Enumeration",
   "Problem Solving",
   "Essay",
   "Performance Task",
@@ -113,6 +114,8 @@ export interface Item {
   cognitiveLevel: CognitiveLevel | "";
   // Number of choices for Multiple Choice / Matching (drives the option set).
   choices: number;
+  // Optional answer explanation / rationale (shown in reports; never in a QR).
+  explanation?: string;
 }
 
 export interface Learner {

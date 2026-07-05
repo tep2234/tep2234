@@ -15,6 +15,7 @@ const TEXT_ACCEPT_TYPES: ItemType[] = [
   "Identification",
   "Fill in the Blank",
   "Short Answer",
+  "Enumeration",
 ];
 
 export function usesAcceptedAnswers(type: ItemType): boolean {

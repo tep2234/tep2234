@@ -11,7 +11,6 @@ import type {
   QrAssessmentState,
   Result,
 } from "../lib/types";
-import { masteryColor } from "../lib/scoring";
 import {
   analyzeItems,
   commonWrongAnswers,
@@ -28,6 +27,7 @@ import {
 import { downloadCsv, safeFilename, toCsv } from "../lib/export";
 import { ActiveGate } from "./ActiveGate";
 import { CopyCard } from "./AnalysisWidgets";
+import { SmartReport } from "./SmartReport";
 import { Button, Empty } from "./ui";
 
 export default function ReportsPanel(props: PanelProps) {
@@ -231,12 +231,6 @@ function ReportsView({
     downloadCsv(toCsv(headers, data), fileBase + "_gradebook.csv");
   }
 
-  const sorted = [...results].sort((a, b) => {
-    const an = learnerOf(a)?.fullName ?? "";
-    const bn = learnerOf(b)?.fullName ?? "";
-    return an.localeCompare(bn);
-  });
-
   return (
     <section>
       <div className="no-print flex flex-wrap items-center justify-between gap-2">
@@ -297,51 +291,9 @@ function ReportsView({
         />
       </div>
 
-      {/* Printable learner result report */}
-      <div className="print-area mt-6">
-        <h2 className="text-lg font-extrabold">
-          Learner Result Report — {active.title}
-        </h2>
-        <p className="text-xs text-slate-500">
-          {active.subject} · {active.component} · Class average {stats.average}% · Passing rate{" "}
-          {stats.passingRate}%
-        </p>
-        <div className="mt-3 grid gap-2">
-          {sorted.map((r) => {
-            const l = learnerOf(r);
-            const weak = weakCompetenciesOf(r, itemsById);
-            const nums = (pred: (s: Result["itemScores"][number]) => boolean) =>
-              r.itemScores.filter(pred).map((s) => s.itemNumber).join(", ");
-            return (
-              <div key={r.id} className="rounded-xl border border-slate-200 bg-white p-3 text-sm">
-                <div className="flex flex-wrap items-center justify-between gap-2">
-                  <div>
-                    <span className="font-extrabold">{l?.fullName ?? "(unknown learner)"}</span>{" "}
-                    <span className="text-xs text-slate-500">
-                      LRN {l?.lrn || "—"} · Version {r.version}
-                    </span>
-                  </div>
-                  <div className="text-right">
-                    <span className="text-lg font-extrabold text-indigo-700">
-                      {r.rawScore}/{r.totalScore}
-                    </span>{" "}
-                    <span className="text-sm font-bold" style={{ color: masteryColor(r.masteryStatus) }}>
-                      {r.percentage}% · {r.masteryStatus}
-                    </span>
-                  </div>
-                </div>
-                <div className="mt-1 grid gap-0.5 text-xs text-slate-600 sm:grid-cols-3">
-                  <div>✓ Correct: {nums((s) => !s.manual && s.correct) || "—"}</div>
-                  <div>✗ Wrong: {nums((s) => !s.manual && !s.correct && !s.blank) || "—"}</div>
-                  <div>␣ Blank: {nums((s) => !s.manual && s.blank) || "—"}</div>
-                </div>
-                {weak.length > 0 ? (
-                  <div className="mt-1 text-xs text-red-600">Weak skill(s): {weak.join(", ")}</div>
-                ) : null}
-              </div>
-            );
-          })}
-        </div>
+      {/* Professional printable Smart Item Analysis Report */}
+      <div className="mt-6">
+        <SmartReport active={active} items={items} results={results} learners={state.learners} />
       </div>
     </section>
   );
