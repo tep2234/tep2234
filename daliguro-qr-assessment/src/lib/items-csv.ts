@@ -15,8 +15,15 @@
 //   acceptedAnswers | accepted          -> extra accepted text answers (comma)
 //   answerVersionA | versionA | keyA …  -> objective key for version A..D
 
-import type { Difficulty, Item, ItemType, TestVersion, VersionKey } from "./types";
-import { DIFFICULTIES, ITEM_TYPES, TEST_VERSIONS } from "./types";
+import type {
+  CognitiveLevel,
+  Difficulty,
+  Item,
+  ItemType,
+  TestVersion,
+  VersionKey,
+} from "./types";
+import { COGNITIVE_LEVELS, DIFFICULTIES, ITEM_TYPES, TEST_VERSIONS } from "./types";
 import { isObjective, LETTERS } from "./items";
 import { uid } from "./ids";
 
@@ -27,7 +34,9 @@ export interface ParsedItem {
   choices: number;
   points: number;
   competency: string;
+  topic: string;
   difficulty: Difficulty;
+  cognitiveLevel: CognitiveLevel | "";
   correctAnswer: string;
   acceptedAnswers: string[];
   // Objective answer letter per version, e.g. { A: "B", B: "D" }.
@@ -84,13 +93,20 @@ function matchDifficulty(raw: string): Difficulty {
   return found ?? "Average";
 }
 
+function matchCognitiveLevel(raw: string): CognitiveLevel | "" {
+  const n = norm(raw);
+  return COGNITIVE_LEVELS.find((c) => norm(c) === n) ?? "";
+}
+
 interface ColumnMap {
   itemNo: number;
   type: number;
   question: number;
   points: number;
   competency: number;
+  topic: number;
   difficulty: number;
+  cognitiveLevel: number;
   correctAnswer: number;
   acceptedAnswers: number;
   options: number[]; // index by option position (0=A,1=B,…)
@@ -104,7 +120,9 @@ function buildColumnMap(header: string[]): ColumnMap {
     question: -1,
     points: -1,
     competency: -1,
+    topic: -1,
     difficulty: -1,
+    cognitiveLevel: -1,
     correctAnswer: -1,
     acceptedAnswers: -1,
     options: [],
@@ -120,7 +138,10 @@ function buildColumnMap(header: string[]): ColumnMap {
     else if (["question", "stem"].includes(h)) map.question = idx;
     else if (["points", "point", "pts"].includes(h)) map.points = idx;
     else if (["competency", "comp", "competencycode"].includes(h)) map.competency = idx;
+    else if (["topic", "lesson"].includes(h)) map.topic = idx;
     else if (["difficulty", "diff"].includes(h)) map.difficulty = idx;
+    else if (["cognitivelevel", "cognitive", "bloom", "bloomslevel"].includes(h))
+      map.cognitiveLevel = idx;
     else if (["correctanswer", "answer", "key"].includes(h)) map.correctAnswer = idx;
     else if (["acceptedanswers", "accepted", "alternates"].includes(h))
       map.acceptedAnswers = idx;
@@ -229,7 +250,10 @@ export function parseItemsCsv(text: string): ParseResult {
       choices,
       points,
       competency: at(col.competency),
+      topic: at(col.topic),
       difficulty: col.difficulty >= 0 ? matchDifficulty(at(col.difficulty)) : "Average",
+      cognitiveLevel:
+        col.cognitiveLevel >= 0 ? matchCognitiveLevel(at(col.cognitiveLevel)) : "",
       correctAnswer: at(col.correctAnswer),
       acceptedAnswers,
       answers,
@@ -263,7 +287,9 @@ export function buildItemsImport(
       acceptedAnswers: p.acceptedAnswers,
       points: p.points,
       competency: p.competency,
+      topic: p.topic,
       difficulty: p.difficulty,
+      cognitiveLevel: p.cognitiveLevel,
       choices: p.choices,
     };
   });

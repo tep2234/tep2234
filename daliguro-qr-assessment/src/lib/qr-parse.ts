@@ -6,6 +6,7 @@
 
 import type { QrPayload, TestVersion } from "./types";
 import { TEST_VERSIONS } from "./types";
+import { payloadChecksum } from "./qr";
 
 // Fields that must NEVER appear in a learner-identity QR. If any of these
 // is present we treat the QR as hostile/malformed and refuse it.
@@ -42,6 +43,21 @@ function isTestVersion(value: unknown): value is TestVersion {
   return typeof value === "string" && (TEST_VERSIONS as readonly string[]).includes(value);
 }
 
+// Verify the integrity checksum when the QR carries one. Old QRs without a
+// checksum still pass; a QR whose checksum no longer matches its identity
+// triple was damaged or edited and is refused.
+function checksumProblem(p: Record<string, unknown>): string | null {
+  const checksum = typeof p.checksum === "string" ? p.checksum : "";
+  if (!checksum) return null;
+  const assessmentId = typeof p.assessmentId === "string" ? p.assessmentId : "";
+  const learnerId = typeof p.learnerId === "string" ? p.learnerId : "";
+  const version = typeof p.version === "string" ? p.version : "";
+  if (checksum !== payloadChecksum(assessmentId, learnerId, version)) {
+    return "QR failed its integrity check (damaged or altered). Reprint this learner's sheet.";
+  }
+  return null;
+}
+
 // Shape-only decode: validates the payload is a well-formed identity QR, WITHOUT
 // checking whether the assessment/learner exist on this device. Identity
 // resolution against local data is a separate step (see scanner/resolve.ts), so
@@ -73,6 +89,8 @@ export function decodeQrPayload(raw: string): QrParseResult {
   if (!assessmentId || !learnerId) {
     return { ok: false, reason: "QR is missing learner identity fields." };
   }
+  const badChecksum = checksumProblem(p);
+  if (badChecksum) return { ok: false, reason: badChecksum };
   const rawVersion = p.version;
   const version: TestVersion = isTestVersion(rawVersion) ? rawVersion : "A";
   return {
@@ -85,6 +103,8 @@ export function decodeQrPayload(raw: string): QrParseResult {
       gradeLevel: typeof p.gradeLevel === "string" ? p.gradeLevel : "",
       version,
       securityToken: typeof p.securityToken === "string" ? p.securityToken : "",
+      n: typeof p.n === "number" && Number.isFinite(p.n) ? p.n : 0,
+      checksum: typeof p.checksum === "string" ? p.checksum : "",
     },
   };
 }
@@ -122,6 +142,9 @@ export function parseQrPayload(raw: string, ctx: QrParseContext): QrParseResult 
     return { ok: false, reason: "Invalid QR: missing learner identity fields." };
   }
 
+  const badChecksum = checksumProblem(p);
+  if (badChecksum) return { ok: false, reason: badChecksum };
+
   if (assessmentId !== ctx.activeAssessmentId) {
     return {
       ok: false,
@@ -148,6 +171,8 @@ export function parseQrPayload(raw: string, ctx: QrParseContext): QrParseResult 
     gradeLevel: typeof p.gradeLevel === "string" ? p.gradeLevel : "",
     version,
     securityToken: typeof p.securityToken === "string" ? p.securityToken : "",
+    n: typeof p.n === "number" && Number.isFinite(p.n) ? p.n : 0,
+    checksum: typeof p.checksum === "string" ? p.checksum : "",
   };
   return { ok: true, payload };
 }

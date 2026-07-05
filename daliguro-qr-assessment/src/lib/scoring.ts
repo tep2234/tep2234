@@ -31,18 +31,19 @@ export function clamp(value: number, min: number, max: number): number {
   return value;
 }
 
+// SmartScan mastery bands: 80/60/40 cutoffs.
 export function masteryBand(percentage: number): MasteryStatus {
-  if (percentage >= 85) return "Mastered";
-  if (percentage >= 75) return "Nearly Mastered";
-  if (percentage >= 60) return "Needs Improvement";
-  return "Critical Intervention";
+  if (percentage >= 80) return "Mastered";
+  if (percentage >= 60) return "Near Mastery";
+  if (percentage >= 40) return "Needs Reinforcement";
+  return "Critical Support";
 }
 
 const MASTERY_COLORS: Record<MasteryStatus, string> = {
   Mastered: "#16a34a",
-  "Nearly Mastered": "#0891b2",
-  "Needs Improvement": "#d97706",
-  "Critical Intervention": "#dc2626",
+  "Near Mastery": "#0891b2",
+  "Needs Reinforcement": "#d97706",
+  "Critical Support": "#dc2626",
 };
 
 export function masteryColor(status: MasteryStatus): string {

@@ -37,8 +37,10 @@ function buildItems(assessmentId: string): Item[] {
       correctAnswer: "",
       acceptedAnswers: [],
       points: 1,
-      competency: i < 5 ? "Competency 1" : "Competency 2",
+      competency: i < 5 ? "Identifies rational equations" : "Solves rational equations",
+      topic: i < 5 ? "Rational Equations — Basics" : "Rational Equations — Application",
       difficulty: i % 3 === 0 ? "Easy" : i % 3 === 1 ? "Average" : "Difficult",
+      cognitiveLevel: i < 5 ? "Remembering" : "Applying",
       choices: 4,
     });
   }

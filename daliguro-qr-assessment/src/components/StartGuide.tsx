@@ -9,8 +9,8 @@ const STEPS: [string, string][] = [
   ["Create assessment", "Add a title, subject, section, and test versions."],
   ["Add items & answer key", "Encode each question, then set the correct answers per version."],
   ["Add learners", "Type them in, or import a class list as CSV."],
-  ["Generate QR sheets", "Print one identity QR per learner. The QR holds no answers."],
-  ["Scan QR & check", "Scan to pull up the learner, then mark answers and save the score."],
+  ["Generate SmartScan sheets", "Print one QR-coded bubble sheet per learner. The QR holds no answers."],
+  ["SmartScan & review", "Scan the filled sheets — scores auto-check; you only review doubtful marks."],
 ];
 
 export function StartGuide({

@@ -1,7 +1,7 @@
 {
-  "name": "DALIguro QR Assessment",
-  "short_name": "DALIguro QR",
-  "description": "Offline-first QR assessment scanner and checker for DepEd teachers.",
+  "name": "DALIguro SmartScan Assessment",
+  "short_name": "SmartScan",
+  "description": "Offline-first assessment engine for DepEd teachers: scan QR answer sheets, auto-check with confidence scoring, review doubtful marks, and generate item analysis and remediation reports.",
   "start_url": "./",
   "scope": "./",
   "display": "standalone",

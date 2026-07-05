@@ -1,16 +1,17 @@
-// Phase 12 — Scan Answer Sheet (QR + OMR).
-// Three INDEPENDENT stages, never conflated:
-//   1. Image  — got a frame? found a QR? markers aligned? lighting ok?
-//   2. Identity — decode QR, then resolve assessment + learner against LOCAL
-//      data (a decoded QR is NEVER shown as "rejected"; it resolves to an
-//      explicit state with a recovery action).
-//   3. Read   — only once identity is resolved, read the bubbles + score.
-// Results are self-contained (scored under the QR's OWN assessment, from local
-// data) — never under whatever assessment happens to be active.
+// SmartScan capture pipeline (QR + OMR). Three INDEPENDENT stages:
+//   1. Image  — frame quality: QR found, markers aligned, lighting, blur.
+//   2. Identity — decode QR (checksum-verified), resolve assessment + learner
+//      against LOCAL data, cross-check the sheet's shaded VERSION bubble and
+//      printed item count. A decoded QR is NEVER shown as "rejected".
+//   3. Read   — only once identity is resolved, read the bubbles + score,
+//      with a per-scan trust score and a compressed evidence snapshot.
+// Live mode auto-captures after ~1s of stable good frames (QR + aligned +
+// lit); a cooldown stops the same sheet from firing repeatedly, so the
+// teacher can batch-scan a pile of papers without touching the screen.
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import jsQR from "jsqr";
-import type { Assessment, Learner, QrAssessmentState, TestVersion } from "../../lib/types";
+import type { QrAssessmentState } from "../../lib/types";
 import {
   classifyMediaError,
   isSecureLike,
@@ -18,11 +19,13 @@ import {
   INSECURE_MESSAGE,
   SECURE_CONTEXT_CHECKLIST,
 } from "../../lib/camera";
-import { buildTemplate, omrItemsOf } from "../../lib/scanner/omr-template";
-import { findCornerMarkers, readSheet, toGray, type SheetReading } from "../../lib/scanner/omr-detect";
-import { buildReview, type ReviewSummary } from "../../lib/scanner/omr-score";
+import { findCornerMarkers, toGray } from "../../lib/scanner/omr-detect";
 import { resolveScanIdentity, type ScanResolution } from "../../lib/scanner/resolve";
+import { processStillImage, type ScanResult } from "../../lib/scanner/still-pipeline";
 import { Button } from "../ui";
+import { Chip, Recovery } from "./ScanRecovery";
+
+export type { ScanResult } from "../../lib/scanner/still-pipeline";
 
 interface BarcodeDetectorLike {
   detect: (s: CanvasImageSource) => Promise<{ rawValue: string }[]>;
@@ -31,31 +34,12 @@ interface BarcodeDetectorCtor {
   new (o?: { formats: string[] }): BarcodeDetectorLike;
 }
 
-export interface ScanResult {
-  assessment: Assessment;
-  learner: Learner;
-  version: TestVersion;
-  summary: ReviewSummary;
-  reading: SheetReading;
-  source: "qr" | "manual";
-}
-
 type Phase = "idle" | "checking" | "requesting" | "live" | "error";
 
-type StillOutcome =
-  | { kind: "ready"; result: ScanResult }
-  | { kind: "image"; message: string }
-  | { kind: "identity"; resolution: ScanResolution };
-
 const LIVE_W = 900;
-
-function omrContext(state: QrAssessmentState, assessmentId: string) {
-  const items = omrItemsOf(state.items.filter((i) => i.assessmentId === assessmentId));
-  const template = buildTemplate(Math.max(1, items.length));
-  const validByItem: Record<number, number> = {};
-  items.forEach((it, i) => (validByItem[i + 1] = Math.max(2, Math.min(it.choices, 4))));
-  return { items, template, validByItem };
-}
+const HOLD_MS = 1100; // stable-good time before auto-capture
+const COOLDOWN_MS = 3500; // pause after a capture before the next auto fire
+const SAME_SHEET_MS = 8000; // extra wait before re-capturing the SAME learner
 
 function quickBrightness(data: Uint8ClampedArray | number[]): number {
   let sum = 0;
@@ -90,6 +74,12 @@ export function AnswerSheetScanner({
   const mountedRef = useRef(true);
   const sessionRef = useRef(0);
   const lastImageRef = useRef<ImageData | null>(null);
+  const lastEvidenceRef = useRef<string | null>(null);
+  // Auto-capture pacing.
+  const goodSinceRef = useRef<number | null>(null);
+  const cooldownUntilRef = useRef(0);
+  const lastAcceptedRef = useRef<{ learnerId: string; at: number } | null>(null);
+  const capturingRef = useRef(false);
 
   const [phase, setPhase] = useState<Phase>("idle");
   const [camMessage, setCamMessage] = useState("");
@@ -101,6 +91,7 @@ export function AnswerSheetScanner({
   const [liveQr, setLiveQr] = useState<ScanResolution | null>(null);
   const [aligned, setAligned] = useState(false);
   const [brightness, setBrightness] = useState(255);
+  const [holding, setHolding] = useState(false);
   const [usingFallback, setUsingFallback] = useState(false);
 
   const release = useCallback(() => {
@@ -118,70 +109,21 @@ export function AnswerSheetScanner({
     release();
     setLiveQr(null);
     setAligned(false);
+    setHolding(false);
     setPhase("idle");
   }, [release]);
 
   // ---------- core pipeline (used by photo AND live capture) ----------
-  const processStill = useCallback(
-    (img: ImageData, manualId?: string): StillOutcome => {
-      const qr = jsQR(img.data, img.width, img.height, { inversionAttempts: "attemptBoth" });
-      if (!qr || !qr.data) {
-        return { kind: "image", message: "No QR code found. Make sure the QR is fully visible, focused, and glare-free." };
-      }
-      const res = resolveScanIdentity(qr.data, state, activeId);
-
-      // Decide the learner: from the QR, or a deliberate manual override.
-      let learner: Learner | null = null;
-      let assessment: Assessment | null = null;
-      let version: TestVersion = "A";
-      if (res.status === "READY" || res.status === "ASSESSMENT_NOT_ACTIVE") {
-        learner = res.learner;
-        assessment = res.assessment;
-        version = res.version;
-      } else if (res.status === "LEARNER_NOT_FOUND" && manualId) {
-        const picked = state.learners.find((l) => l.id === manualId);
-        if (picked) {
-          learner = picked;
-          assessment = res.assessment;
-          version = res.payload.version;
-        }
-      }
-      if (!learner || !assessment) {
-        return { kind: "identity", resolution: res };
-      }
-
-      // Read the bubbles using the RESOLVED assessment's own template/key.
-      const ctx = omrContext(state, assessment.id);
-      if (ctx.items.length === 0) {
-        return { kind: "image", message: "This assessment has no A–D items for OMR." };
-      }
-      const gray = toGray(img);
-      const reading = readSheet(gray, ctx.template, ctx.validByItem);
-      if (!reading.aligned) {
-        return { kind: "image", message: "Found the QR, but not the 4 corner markers. Capture the WHOLE sheet, flat, all corners visible, no glare." };
-      }
-      if (reading.brightness < 70) {
-        return { kind: "image", message: "Found the QR, but the photo is too dark — use brighter light and retake." };
-      }
-      const vk = (state.answerKeys[assessment.id] ?? {})[version] ?? {};
-      const summary = buildReview(ctx.items, vk, reading.items);
-      // Align app context to the QR's assessment so Results/Analysis match.
-      if (res.status === "ASSESSMENT_NOT_ACTIVE" && manualId === undefined) {
-        onSetActive(assessment.id);
-      }
-      return {
-        kind: "ready",
-        result: { assessment, learner, version, summary, reading, source: manualId ? "manual" : "qr" },
-      };
-    },
-    [state, activeId, onSetActive],
-  );
-
-  const route = useCallback(
-    (out: StillOutcome) => {
+  // Runs the pure still-image pipeline, then routes its outcome into UI state.
+  const runStill = useCallback(
+    (img: ImageData, manualId?: string) => {
+      const out = processStillImage(img, state, activeId, manualId, lastEvidenceRef.current);
+      cooldownUntilRef.current = Date.now() + COOLDOWN_MS;
       if (out.kind === "ready") {
         setImageMsg("");
         setRecovery(null);
+        lastAcceptedRef.current = { learnerId: out.result.learner.id, at: Date.now() };
+        if (out.switchToAssessment) onSetActive(out.switchToAssessment);
         onResult(out.result);
       } else if (out.kind === "image") {
         setImageMsg(out.message);
@@ -192,7 +134,7 @@ export function AnswerSheetScanner({
         setManualLearnerId("");
       }
     },
-    [onResult],
+    [state, activeId, onSetActive, onResult],
   );
 
   const grabImageData = useCallback(
@@ -207,6 +149,17 @@ export function AnswerSheetScanner({
       const c = canvas.getContext("2d", { willReadFrequently: true });
       if (!c) return null;
       c.drawImage(src, 0, 0, w, h);
+      // Compressed evidence snapshot (~800px wide JPEG) for the archive.
+      try {
+        const ev = document.createElement("canvas");
+        const es = Math.min(1, 800 / w);
+        ev.width = Math.round(w * es);
+        ev.height = Math.round(h * es);
+        ev.getContext("2d")?.drawImage(canvas, 0, 0, ev.width, ev.height);
+        lastEvidenceRef.current = ev.toDataURL("image/jpeg", 0.6);
+      } catch {
+        lastEvidenceRef.current = null;
+      }
       return c.getImageData(0, 0, w, h);
     },
     [],
@@ -214,12 +167,17 @@ export function AnswerSheetScanner({
 
   const capture = useCallback(() => {
     const v = videoRef.current;
-    if (!v || v.readyState < 2) return;
-    const img = grabImageData(v, v.videoWidth, v.videoHeight);
-    if (!img) return;
-    lastImageRef.current = img;
-    route(processStill(img));
-  }, [grabImageData, processStill, route]);
+    if (!v || v.readyState < 2 || capturingRef.current) return;
+    capturingRef.current = true;
+    try {
+      const img = grabImageData(v, v.videoWidth, v.videoHeight);
+      if (!img) return;
+      lastImageRef.current = img;
+      runStill(img);
+    } finally {
+      capturingRef.current = false;
+    }
+  }, [grabImageData, runStill]);
 
   const onPhoto = useCallback(
     (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -236,12 +194,12 @@ export function AnswerSheetScanner({
           return;
         }
         lastImageRef.current = data;
-        route(processStill(data));
+        runStill(data);
       };
       im.onerror = () => setImageMsg("Could not open that photo. Try another.");
       im.src = URL.createObjectURL(file);
     },
-    [grabImageData, processStill, route],
+    [grabImageData, runStill],
   );
 
   const confirmManual = useCallback(() => {
@@ -250,10 +208,10 @@ export function AnswerSheetScanner({
     const picked = state.learners.find((l) => l.id === manualLearnerId);
     if (!picked) return;
     if (!window.confirm(`The QR learner was NOT found. Assign this scan to ${picked.fullName} instead?`)) return;
-    route(processStill(img, manualLearnerId));
-  }, [manualLearnerId, processStill, route, state.learners]);
+    runStill(img, manualLearnerId);
+  }, [manualLearnerId, runStill, state.learners]);
 
-  // ---------- live preview loop (chips only) ----------
+  // ---------- live preview loop (status chips + auto-capture) ----------
   const liveGray = useCallback(() => {
     const v = videoRef.current;
     const canvas = liveCanvasRef.current;
@@ -290,13 +248,40 @@ export function AnswerSheetScanner({
         const g = jsQR(frame.data, frame.width, frame.height, { inversionAttempts: "dontInvert" });
         raw = g ? g.data : null;
       }
-      setLiveQr(raw ? resolveScanIdentity(raw, state, activeId) : null);
+      const res = raw ? resolveScanIdentity(raw, state, activeId) : null;
+      setLiveQr(res);
       const gray = toGray(frame);
-      setAligned(findCornerMarkers(gray) !== null);
-      setBrightness(Math.round(quickBrightness(frame.data)));
+      const isAligned = findCornerMarkers(gray) !== null;
+      setAligned(isAligned);
+      const bright = Math.round(quickBrightness(frame.data));
+      setBrightness(bright);
+
+      // Auto-capture: all signals good and stable for HOLD_MS, past cooldown.
+      const qrOk = res?.status === "READY" || res?.status === "ASSESSMENT_NOT_ACTIVE";
+      const now = Date.now();
+      const sameSheet =
+        qrOk &&
+        lastAcceptedRef.current !== null &&
+        (res.status === "READY" || res.status === "ASSESSMENT_NOT_ACTIVE") &&
+        res.learner.id === lastAcceptedRef.current.learnerId &&
+        now - lastAcceptedRef.current.at < SAME_SHEET_MS;
+      const good = qrOk && isAligned && bright >= 70 && now >= cooldownUntilRef.current && !sameSheet;
+      if (good) {
+        if (goodSinceRef.current === null) goodSinceRef.current = now;
+        const held = now - goodSinceRef.current;
+        setHolding(true);
+        if (held >= HOLD_MS) {
+          goodSinceRef.current = null;
+          setHolding(false);
+          capture();
+        }
+      } else {
+        goodSinceRef.current = null;
+        setHolding(false);
+      }
     }
     rafRef.current = requestAnimationFrame(() => loopRef.current());
-  }, [activeId, liveGray, state]);
+  }, [activeId, capture, liveGray, state]);
 
   useEffect(() => {
     loopRef.current = () => void loop();
@@ -390,7 +375,7 @@ export function AnswerSheetScanner({
   return (
     <div className="mt-4 rounded-xl border border-slate-200 bg-white p-4">
       <div className="flex flex-wrap items-center gap-2">
-        <span className="text-sm font-bold text-indigo-800">🗒️ Scan Answer Sheet</span>
+        <span className="text-sm font-bold text-indigo-800">🗒️ SmartScan</span>
         {usingFallback && live ? (
           <span className="rounded-full bg-slate-100 px-2 py-0.5 text-xs text-slate-500">jsQR fallback</span>
         ) : null}
@@ -398,12 +383,12 @@ export function AnswerSheetScanner({
           <Button onClick={() => fileInputRef.current?.click()}>📷 Scan with camera</Button>
           {live ? (
             <>
-              <Button variant="small" onClick={capture}>📸 Capture frame</Button>
+              <Button variant="small" onClick={capture}>📸 Capture now</Button>
               <Button variant="smallDanger" onClick={stop}>Stop</Button>
             </>
           ) : (
             <Button variant="small" onClick={() => void start()} disabled={phase === "checking" || phase === "requesting"}>
-              {phase === "error" ? "Retry live camera" : "Use live camera"}
+              {phase === "error" ? "Retry live camera" : "Live camera (auto-capture)"}
             </Button>
           )}
         </div>
@@ -411,8 +396,9 @@ export function AnswerSheetScanner({
       </div>
 
       <p className="mt-2 text-xs text-slate-500">
-        <b>Recommended:</b> tap <b>📷 Scan with camera</b> and photograph the
-        WHOLE sheet — all four black corners + QR visible, flat and well-lit.
+        <b>📷 Scan with camera</b> photographs one sheet. <b>Live camera</b> auto-captures
+        each sheet after ~1 second of steady framing — all four black corners + QR visible,
+        flat and well-lit — so you can go through a pile paper after paper.
       </p>
 
       {/* Live chips: QR decode + identity + image quality are independent. */}
@@ -421,6 +407,11 @@ export function AnswerSheetScanner({
           <Chip ok={liveQrOk} okText={liveLearnerName ? "Learner: " + liveLearnerName : "QR ready"} badText={liveQr ? "QR: data not loaded" : "QR: searching…"} />
           <Chip ok={aligned} okText="Sheet aligned ✓" badText="Align all 4 corners…" />
           <Chip ok={!dark} okText="Lighting OK" badText="Too dark" />
+          {holding ? (
+            <span className="animate-pulse rounded-full bg-indigo-100 px-2.5 py-1 text-indigo-800">
+              Hold steady — capturing…
+            </span>
+          ) : null}
         </div>
       ) : null}
 
@@ -429,10 +420,10 @@ export function AnswerSheetScanner({
         {!live ? (
           <div className="absolute inset-0 flex items-center justify-center px-4 text-center text-sm text-slate-300">
             {phase === "error"
-              ? "⚠ Live camera unavailable — use 📷 Take / upload photo."
+              ? "⚠ Live camera unavailable — use 📷 Scan with camera."
               : phase === "requesting"
                 ? "Waiting for permission… choose Allow."
-                : "Use 📷 Take / upload photo (recommended), or start the live camera."}
+                : "Use 📷 Scan with camera, or start the live camera for hands-free batch scanning."}
           </div>
         ) : null}
       </div>
@@ -468,110 +459,10 @@ export function AnswerSheetScanner({
             onSetActive(id);
             const img = lastImageRef.current;
             setRecovery(null);
-            if (img) route(processStill(img));
+            if (img) runStill(img);
           }}
           onDismiss={() => setRecovery(null)}
         />
-      ) : null}
-    </div>
-  );
-}
-
-function Chip({ ok, okText, badText }: { ok: boolean; okText: string; badText: string }) {
-  return (
-    <span className={"rounded-full px-2.5 py-1 " + (ok ? "bg-emerald-100 text-emerald-800" : "bg-slate-100 text-slate-500")}>
-      {ok ? okText : badText}
-    </span>
-  );
-}
-
-// Recovery card shown when the QR decoded but identity didn't resolve. It never
-// says "rejected": the QR was read; the data just isn't loaded/active here.
-function Recovery({
-  resolution,
-  state,
-  manualLearnerId,
-  onManualLearnerId,
-  onConfirmManual,
-  onSwitchActive,
-  onDismiss,
-}: {
-  resolution: ScanResolution;
-  state: QrAssessmentState;
-  manualLearnerId: string;
-  onManualLearnerId: (id: string) => void;
-  onConfirmManual: () => void;
-  onSwitchActive: (id: string) => void;
-  onDismiss: () => void;
-}) {
-  const r = resolution;
-  const [showTech, setShowTech] = useState(false);
-
-  let title = "QR read successfully — can't continue yet";
-  let body = "";
-  if (r.status === "QR_PAYLOAD_INVALID") {
-    title = "This isn't a DALIguro answer-sheet QR";
-    body = r.reason;
-  } else if (r.status === "ASSESSMENT_NOT_FOUND") {
-    title = "QR read — this assessment isn't on this device";
-    body =
-      "The sheet's assessment isn't loaded in this browser. On this device, import the same backup (Setup → Import/restore) or tap ⚡ Load demo if this is the demo, then scan again. Opening the same web link does NOT copy data between devices.";
-  } else if (r.status === "LEARNER_NOT_FOUND") {
-    title = "QR read — learner not loaded on this device";
-    body =
-      "The assessment is here, but the learner on the sheet isn't (the sheet may be from a different data set). Reprint sheets from this device's data, import the matching backup, or pick the learner manually below.";
-  } else if (r.status === "ASSESSMENT_NOT_ACTIVE") {
-    title = "QR read — switch to its assessment";
-    body = "This sheet is for an assessment that's loaded but not active.";
-  }
-
-  return (
-    <div className="mt-2 rounded-lg border border-indigo-300 bg-indigo-50 p-3 text-sm text-indigo-900">
-      <div className="font-extrabold">✓ {title}</div>
-      <p className="mt-1 text-xs">{body}</p>
-
-      <div className="mt-3 flex flex-wrap gap-2">
-        {r.status === "ASSESSMENT_NOT_ACTIVE" ? (
-          <Button variant="small" onClick={() => onSwitchActive(r.assessment.id)}>
-            Switch to “{r.assessment.title}” &amp; read
-          </Button>
-        ) : null}
-        <Button variant="ghost" onClick={onDismiss}>Scan another</Button>
-      </div>
-
-      {r.status === "LEARNER_NOT_FOUND" ? (
-        <div className="mt-3 rounded-lg border border-slate-200 bg-white p-2">
-          <div className="text-xs font-bold text-slate-600">Manual fallback (use with care):</div>
-          <div className="mt-1 flex flex-wrap items-center gap-2">
-            <select
-              value={manualLearnerId}
-              onChange={(e) => onManualLearnerId(e.target.value)}
-              className="rounded-lg border border-slate-200 bg-white px-2 py-1 text-sm"
-            >
-              <option value="">— pick learner —</option>
-              {state.learners.map((l) => (
-                <option key={l.id} value={l.id}>
-                  {l.fullName}
-                  {l.section ? " (" + l.section + ")" : ""}
-                </option>
-              ))}
-            </select>
-            <Button variant="small" onClick={onConfirmManual}>Use this learner</Button>
-          </div>
-        </div>
-      ) : null}
-
-      <button className="mt-2 text-xs font-bold text-indigo-700" onClick={() => setShowTech((s) => !s)}>
-        {showTech ? "Hide" : "Show"} technical details
-      </button>
-      {showTech && r.status !== "QR_PAYLOAD_INVALID" ? (
-        <div className="mt-1 rounded bg-white/70 p-2 font-mono text-[11px] text-slate-600">
-          <div>scanned assessmentId: {r.payload.assessmentId}</div>
-          <div>scanned learnerId: {r.payload.learnerId}</div>
-          <div>scanned version: {r.payload.version}</div>
-          <div>assessments loaded: {state.assessments.length}</div>
-          <div>learners loaded: {state.learners.length}</div>
-        </div>
       ) : null}
     </div>
   );

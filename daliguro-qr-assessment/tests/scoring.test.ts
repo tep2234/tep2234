@@ -19,7 +19,9 @@ function item(overrides: Partial<Item> = {}): Item {
     acceptedAnswers: [],
     points: 1,
     competency: "",
+    topic: "",
     difficulty: "Average",
+    cognitiveLevel: "",
     choices: 4,
     ...overrides,
   };
@@ -35,15 +37,15 @@ describe("clamp", () => {
 });
 
 describe("masteryBand", () => {
-  it("applies the boundary bands exactly", () => {
+  it("applies the SmartScan 80/60/40 boundary bands exactly", () => {
     expect(masteryBand(100)).toBe("Mastered");
-    expect(masteryBand(85)).toBe("Mastered");
-    expect(masteryBand(84.9)).toBe("Nearly Mastered");
-    expect(masteryBand(75)).toBe("Nearly Mastered");
-    expect(masteryBand(74.9)).toBe("Needs Improvement");
-    expect(masteryBand(60)).toBe("Needs Improvement");
-    expect(masteryBand(59.9)).toBe("Critical Intervention");
-    expect(masteryBand(0)).toBe("Critical Intervention");
+    expect(masteryBand(80)).toBe("Mastered");
+    expect(masteryBand(79.9)).toBe("Near Mastery");
+    expect(masteryBand(60)).toBe("Near Mastery");
+    expect(masteryBand(59.9)).toBe("Needs Reinforcement");
+    expect(masteryBand(40)).toBe("Needs Reinforcement");
+    expect(masteryBand(39.9)).toBe("Critical Support");
+    expect(masteryBand(0)).toBe("Critical Support");
   });
 });
 
@@ -150,7 +152,7 @@ describe("computeScores", () => {
     expect(summary.correctCount).toBe(1);
     expect(summary.incorrectCount).toBe(1);
     expect(summary.blankCount).toBe(0);
-    expect(summary.masteryStatus).toBe("Needs Improvement");
+    expect(summary.masteryStatus).toBe("Near Mastery");
     // item scores are returned sorted by itemNumber
     expect(summary.itemScores.map((s) => s.itemId)).toEqual(["i1", "i2", "i3"]);
   });
@@ -159,6 +161,6 @@ describe("computeScores", () => {
     const items: Item[] = [];
     const summary = computeScores(items, {}, emptyInput());
     expect(summary.percentage).toBe(0);
-    expect(summary.masteryStatus).toBe("Critical Intervention");
+    expect(summary.masteryStatus).toBe("Critical Support");
   });
 });

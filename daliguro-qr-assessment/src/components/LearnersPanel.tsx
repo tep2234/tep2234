@@ -136,6 +136,16 @@ export default function LearnersPanel(props: PanelProps) {
   }
 
   function remove(id: string) {
+    const learner = state.learners.find((l) => l.id === id);
+    const resultCount = state.results.filter((r) => r.learnerId === id).length;
+    const warning =
+      "Delete " +
+      (learner ? learner.fullName : "this learner") +
+      "?" +
+      (resultCount > 0
+        ? `\n\n${resultCount} saved result(s) reference this learner and will show "(unknown learner)".`
+        : "");
+    if (!window.confirm(warning)) return;
     setState((prev) => ({
       ...prev,
       learners: prev.learners.filter((l) => l.id !== id),

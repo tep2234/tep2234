@@ -44,16 +44,38 @@ export const OBJECTIVE_ITEM_TYPES: ItemType[] = [
 export const DIFFICULTIES = ["Easy", "Average", "Difficult"] as const;
 export type Difficulty = (typeof DIFFICULTIES)[number];
 
+// Bloom's levels used to tag items for cognitive-level analysis.
+export const COGNITIVE_LEVELS = [
+  "Remembering",
+  "Understanding",
+  "Applying",
+  "Analyzing",
+  "Evaluating",
+  "Creating",
+] as const;
+export type CognitiveLevel = (typeof COGNITIVE_LEVELS)[number];
+
 export const SEX_VALUES = ["M", "F"] as const;
 export type Sex = (typeof SEX_VALUES)[number];
 
+// SmartScan mastery bands: ≥80 / 60–79 / 40–59 / <40.
 export const MASTERY_STATUSES = [
   "Mastered",
-  "Nearly Mastered",
-  "Needs Improvement",
-  "Critical Intervention",
+  "Near Mastery",
+  "Needs Reinforcement",
+  "Critical Support",
 ] as const;
 export type MasteryStatus = (typeof MASTERY_STATUSES)[number];
+
+// Lifecycle of a result: auto-accepted scan → needs review → teacher reviewed
+// → finalized (locked; edits require a reason and are audit-logged).
+export const REVIEW_STATUSES = [
+  "auto",
+  "needs_review",
+  "reviewed",
+  "finalized",
+] as const;
+export type ReviewStatus = (typeof REVIEW_STATUSES)[number];
 
 // ---- Core entities -----------------------------------------
 
@@ -84,7 +106,11 @@ export interface Item {
   acceptedAnswers: string[];
   points: number;
   competency: string;
+  // Topic/lesson label for grouping in analysis ("" = untagged).
+  topic: string;
   difficulty: Difficulty;
+  // Bloom's cognitive level ("" = untagged).
+  cognitiveLevel: CognitiveLevel | "";
   // Number of choices for Multiple Choice / Matching (drives the option set).
   choices: number;
 }
@@ -121,6 +147,25 @@ export interface ItemScore {
   remarks: string;
 }
 
+// How a bubble read was classified by the OMR detector.
+export type ScanItemStatus = "selected" | "blank" | "unclear" | "multiple";
+
+// Raw per-item detection snapshot kept on scanned results so the Review tab
+// can re-examine doubtful marks without the original image.
+export interface ScanItemMeta {
+  itemNumber: number;
+  detected: string | null; // raw detected letter, before teacher corrections
+  status: ScanItemStatus;
+  confidence: number; // 0..1
+}
+
+// One entry per state change / manual edit, for score audit trails.
+export interface AuditEntry {
+  at: number;
+  action: string;
+  reason?: string;
+}
+
 export interface Result {
   id: string;
   assessmentId: string;
@@ -133,6 +178,15 @@ export interface Result {
   percentage: number;
   masteryStatus: MasteryStatus;
   reviewed: boolean;
+  // How this result was produced.
+  source: "scan" | "manual";
+  // Overall scan trust score (0..1); null for manual checking.
+  scanConfidence: number | null;
+  reviewStatus: ReviewStatus;
+  finalizedAt: number | null;
+  // Raw detection snapshot (scanned results only).
+  scanItems: ScanItemMeta[] | null;
+  auditLog: AuditEntry[];
   // createdAt doubles as checkedAt; updatedAt changes on every re-save.
   createdAt: number;
   updatedAt: number;
@@ -157,6 +211,10 @@ export interface QrPayload {
   gradeLevel: string;
   version: TestVersion;
   securityToken: string;
+  // Number of OMR items the sheet was printed with (mismatch = stale sheet).
+  n: number;
+  // Integrity checksum over assessmentId|learnerId|version ("" on old QRs).
+  checksum: string;
 }
 
 // ---- Persisted application state ---------------------------

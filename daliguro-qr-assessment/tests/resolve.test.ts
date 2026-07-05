@@ -27,7 +27,7 @@ function stateWith(a: Assessment[], l: Learner[]): QrAssessmentState {
   return { ...emptyState(), assessments: a, learners: l };
 }
 function qrFor(assessmentId: string, learnerId: string, version: "A" | "B" = "A") {
-  return qrText(buildQrPayload(assessmentId, { ...learner(learnerId) }, version));
+  return qrText(buildQrPayload(assessmentId, { ...learner(learnerId) }, version, 10));
 }
 
 describe("resolveScanIdentity", () => {

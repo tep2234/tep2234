@@ -11,6 +11,7 @@ import type {
   TestVersion,
 } from "../lib/types";
 import { buildQrPayload } from "../lib/qr";
+import { omrItemsOf } from "../lib/scanner/omr-template";
 import { ActiveGate } from "./ActiveGate";
 import { AnswerSheet } from "./AnswerSheet";
 import { Button, Empty } from "./ui";
@@ -225,7 +226,7 @@ function SheetGenerator({
           {showPayload && chosen.length > 0 ? (
             <pre className="mt-2 overflow-auto rounded-lg bg-slate-900 p-3 text-[11px] text-emerald-300">
               {JSON.stringify(
-                buildQrPayload(active.id, chosen[0], activeVersion),
+                buildQrPayload(active.id, chosen[0], activeVersion, omrItemsOf(items).length),
                 null,
                 2,
               )}

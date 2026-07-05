@@ -16,6 +16,7 @@ import {
   TEST_VERSIONS,
 } from "../lib/types";
 import { uid } from "../lib/ids";
+import { deleteEvidence } from "../lib/offline-store";
 import { buildDemoBundle, withDemoBundle } from "../lib/demo";
 import { StartGuide } from "./StartGuide";
 import { BackupTools } from "./BackupTools";
@@ -96,6 +97,11 @@ export default function SetupPanel(props: PanelProps) {
       "Delete this assessment and its items, keys, and results?",
     );
     if (!ok) return;
+    // Also drop archived scan evidence for the results being removed.
+    const evidenceIds = state.results
+      .filter((r) => r.assessmentId === id)
+      .map((r) => r.id);
+    void deleteEvidence(evidenceIds);
     setState((prev) => cascadeDelete(prev, id));
     if (activeId === id) setActiveId(null);
   }

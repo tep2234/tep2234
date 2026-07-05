@@ -26,13 +26,30 @@ function ctx(overrides: Partial<QrParseContext> = {}): QrParseContext {
 
 describe("parseQrPayload", () => {
   it("accepts a valid identity QR and selects its version", () => {
-    const text = qrText(buildQrPayload("A1", learner(), "B"));
+    const text = qrText(buildQrPayload("A1", learner(), "B", 10));
     const res = parseQrPayload(text, ctx());
     expect(res.ok).toBe(true);
     if (res.ok) {
       expect(res.payload.learnerId).toBe("L1");
       expect(res.payload.version).toBe("B");
+      expect(res.payload.n).toBe(10);
     }
+  });
+
+  it("rejects a QR whose checksum no longer matches its identity (tampered)", () => {
+    const good = buildQrPayload("A1", learner(), "A", 10);
+    const tampered = JSON.stringify({ ...good, learnerId: "L2" });
+    const res = parseQrPayload(tampered, ctx({ hasLearner: () => true }));
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.reason).toMatch(/integrity/i);
+  });
+
+  it("still accepts an old QR that carries no checksum", () => {
+    const res = parseQrPayload(
+      JSON.stringify({ assessmentId: "A1", learnerId: "L1", version: "A" }),
+      ctx(),
+    );
+    expect(res.ok).toBe(true);
   });
 
   it("rejects non-JSON text", () => {
@@ -45,14 +62,14 @@ describe("parseQrPayload", () => {
   });
 
   it("rejects a QR for a different assessment", () => {
-    const text = qrText(buildQrPayload("OTHER", learner(), "A"));
+    const text = qrText(buildQrPayload("OTHER", learner(), "A", 10));
     const res = parseQrPayload(text, ctx());
     expect(res.ok).toBe(false);
     if (!res.ok) expect(res.reason).toMatch(/different assessment/i);
   });
 
   it("rejects a QR whose learner is unknown on this device", () => {
-    const text = qrText(buildQrPayload("A1", learner({ id: "GHOST" }), "A"));
+    const text = qrText(buildQrPayload("A1", learner({ id: "GHOST" }), "A", 10));
     const res = parseQrPayload(text, ctx());
     expect(res.ok).toBe(false);
     if (!res.ok) expect(res.reason).toMatch(/not found/i);

@@ -24,7 +24,9 @@ function item(overrides: Partial<Item> = {}): Item {
     acceptedAnswers: [],
     points: 1,
     competency: "",
+    topic: "",
     difficulty: "Average",
+    cognitiveLevel: "",
     choices: 4,
     ...overrides,
   };
@@ -57,8 +59,14 @@ function result(overrides: Partial<Result> = {}): Result {
     rawScore: 0,
     totalScore: 0,
     percentage: 0,
-    masteryStatus: "Critical Intervention",
+    masteryStatus: "Critical Support",
     reviewed: false,
+    source: "manual",
+    scanConfidence: null,
+    reviewStatus: "reviewed",
+    finalizedAt: null,
+    scanItems: null,
+    auditLog: [],
     createdAt: 0,
     updatedAt: 0,
     ...overrides,
@@ -78,14 +86,14 @@ function learner(overrides: Partial<Learner> = {}): Learner {
 }
 
 describe("difficultyLabel", () => {
-  it("applies boundaries", () => {
+  it("applies the SmartScan 80/60/40 boundaries", () => {
     expect(difficultyLabel(100)).toBe("Easy");
-    expect(difficultyLabel(85)).toBe("Easy");
-    expect(difficultyLabel(84.9)).toBe("Moderate");
-    expect(difficultyLabel(70)).toBe("Moderate");
-    expect(difficultyLabel(69.9)).toBe("Difficult");
-    expect(difficultyLabel(50)).toBe("Difficult");
-    expect(difficultyLabel(49.9)).toBe("Very Difficult");
+    expect(difficultyLabel(80)).toBe("Easy");
+    expect(difficultyLabel(79.9)).toBe("Moderate");
+    expect(difficultyLabel(60)).toBe("Moderate");
+    expect(difficultyLabel(59.9)).toBe("Difficult");
+    expect(difficultyLabel(40)).toBe("Difficult");
+    expect(difficultyLabel(39.9)).toBe("Very Difficult");
   });
 });
 
@@ -229,13 +237,13 @@ describe("remediationGroups", () => {
     const results = [
       result({
         learnerId: "L1",
-        masteryStatus: "Critical Intervention",
-        percentage: 40,
+        masteryStatus: "Critical Support",
+        percentage: 35,
         itemScores: [score({ itemId: "i1", points: 10, awarded: 4 })],
       }),
     ];
     const groups = remediationGroups(items, results, learners);
-    const critical = groups.find((g) => g.status === "Critical Intervention")!;
+    const critical = groups.find((g) => g.status === "Critical Support")!;
     expect(critical.action).toBe("Focused reteaching and individual support");
     expect(critical.learners).toHaveLength(1);
     expect(critical.learners[0].name).toBe("Ana");
@@ -247,7 +255,7 @@ describe("remediationGroups", () => {
 
   it("falls back to a placeholder name for an unknown learner id", () => {
     const groups = remediationGroups([], [result({ learnerId: "ghost" })], []);
-    const bucket = groups.find((g) => g.status === "Critical Intervention")!;
+    const bucket = groups.find((g) => g.status === "Critical Support")!;
     expect(bucket.learners[0].name).toBe("(unknown learner)");
   });
 });
@@ -257,12 +265,12 @@ describe("masteryDistribution", () => {
     const dist = masteryDistribution([
       result({ masteryStatus: "Mastered" }),
       result({ masteryStatus: "Mastered" }),
-      result({ masteryStatus: "Needs Improvement" }),
+      result({ masteryStatus: "Needs Reinforcement" }),
     ]);
     expect(dist.Mastered).toBe(2);
-    expect(dist["Needs Improvement"]).toBe(1);
-    expect(dist["Nearly Mastered"]).toBe(0);
-    expect(dist["Critical Intervention"]).toBe(0);
+    expect(dist["Needs Reinforcement"]).toBe(1);
+    expect(dist["Near Mastery"]).toBe(0);
+    expect(dist["Critical Support"]).toBe(0);
   });
 });
 

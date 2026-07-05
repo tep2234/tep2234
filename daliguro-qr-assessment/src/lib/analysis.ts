@@ -31,10 +31,11 @@ function isScoreCorrect(score: ItemScore): boolean {
 
 export type DifficultyLabel = "Easy" | "Moderate" | "Difficult" | "Very Difficult";
 
+// SmartScan difficulty cutoffs: 80/60/40 percent correct.
 export function difficultyLabel(percentCorrect: number): DifficultyLabel {
-  if (percentCorrect >= 85) return "Easy";
-  if (percentCorrect >= 70) return "Moderate";
-  if (percentCorrect >= 50) return "Difficult";
+  if (percentCorrect >= 80) return "Easy";
+  if (percentCorrect >= 60) return "Moderate";
+  if (percentCorrect >= 40) return "Difficult";
   return "Very Difficult";
 }
 
@@ -193,10 +194,10 @@ export function competencyMastery(
 // ---- Remediation groups ------------------------------------
 
 const ACTIONS: Record<MasteryStatus, string> = {
-  Mastered: "Enrichment task",
-  "Nearly Mastered": "Short reinforcement",
-  "Needs Improvement": "Guided remediation",
-  "Critical Intervention": "Focused reteaching and individual support",
+  Mastered: "Enrichment challenge or peer-tutoring role",
+  "Near Mastery": "Short review and targeted practice",
+  "Needs Reinforcement": "Guided practice with worked examples",
+  "Critical Support": "Focused reteaching and individual support",
 };
 
 export interface RemediationLearner {
@@ -234,9 +235,9 @@ function weakCompetenciesFor(result: Result, itemsById: Map<string, Item>): stri
 
 const GROUP_ORDER: MasteryStatus[] = [
   "Mastered",
-  "Nearly Mastered",
-  "Needs Improvement",
-  "Critical Intervention",
+  "Near Mastery",
+  "Needs Reinforcement",
+  "Critical Support",
 ];
 
 export function remediationGroups(
@@ -249,9 +250,9 @@ export function remediationGroups(
 
   const groups: Record<MasteryStatus, RemediationLearner[]> = {
     Mastered: [],
-    "Nearly Mastered": [],
-    "Needs Improvement": [],
-    "Critical Intervention": [],
+    "Near Mastery": [],
+    "Needs Reinforcement": [],
+    "Critical Support": [],
   };
 
   results.forEach((r) => {
@@ -279,9 +280,9 @@ export type MasteryDistribution = Record<MasteryStatus, number>;
 export function masteryDistribution(results: Result[]): MasteryDistribution {
   const dist: MasteryDistribution = {
     Mastered: 0,
-    "Nearly Mastered": 0,
-    "Needs Improvement": 0,
-    "Critical Intervention": 0,
+    "Near Mastery": 0,
+    "Needs Reinforcement": 0,
+    "Critical Support": 0,
   };
   results.forEach((r) => {
     dist[r.masteryStatus] += 1;

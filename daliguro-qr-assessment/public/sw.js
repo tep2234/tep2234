@@ -5,7 +5,7 @@
 //  - Same-origin GET assets (hashed JS/CSS, icons): cache-first, then network.
 // Bump CACHE_VERSION on each release to retire old caches.
 
-const CACHE_VERSION = "daliguro-qr-v1";
+const CACHE_VERSION = "daliguro-qr-v2";
 const SHELL = [
   "./",
   "./index.html",

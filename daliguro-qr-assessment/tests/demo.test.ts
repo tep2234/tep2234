@@ -22,7 +22,7 @@ describe("buildDemoBundle", () => {
 
   it("never leaks any answer key into a generated demo QR", () => {
     const b = buildDemoBundle();
-    const text = qrText(buildQrPayload(b.assessment.id, b.learners[0], "A"));
+    const text = qrText(buildQrPayload(b.assessment.id, b.learners[0], "A", b.items.length));
     expect(text.includes("answerKey")).toBe(false);
     expect(text.includes("correctAnswer")).toBe(false);
     expect(text.includes("score")).toBe(false);

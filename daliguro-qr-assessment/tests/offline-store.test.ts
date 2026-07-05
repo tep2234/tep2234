@@ -79,14 +79,48 @@ describe("exportBackup / importBackup", () => {
       rawScore: 5,
       totalScore: 10,
       percentage: 50,
-      masteryStatus: "Critical Intervention",
+      masteryStatus: "Needs Reinforcement",
       reviewed: false,
+      source: "manual",
+      scanConfidence: null,
+      reviewStatus: "reviewed",
+      finalizedAt: null,
+      scanItems: null,
+      auditLog: [],
       createdAt: 1,
       updatedAt: 1,
     });
     const json = exportBackup(state);
     const restored = importBackup(json);
     expect(restored).toEqual(state);
+  });
+
+  it("migrates a pre-SmartScan result: recomputes mastery and fills lifecycle fields", () => {
+    const legacy = {
+      results: [
+        {
+          id: "r1",
+          assessmentId: "a1",
+          learnerId: "L1",
+          version: "A",
+          answers: [],
+          itemScores: [],
+          rawScore: 7,
+          totalScore: 10,
+          percentage: 70,
+          masteryStatus: "Needs Improvement", // old band name
+          reviewed: true,
+          createdAt: 1,
+          updatedAt: 1,
+        },
+      ],
+    };
+    const restored = importBackup(JSON.stringify(legacy));
+    expect(restored.results[0].masteryStatus).toBe("Near Mastery");
+    expect(restored.results[0].reviewStatus).toBe("reviewed");
+    expect(restored.results[0].source).toBe("manual");
+    expect(restored.results[0].scanConfidence).toBeNull();
+    expect(restored.results[0].auditLog).toEqual([]);
   });
 
   it("normalizes a backup missing fields rather than throwing", () => {

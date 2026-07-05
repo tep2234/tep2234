@@ -15,20 +15,32 @@ import {
 import { buildReview } from "../src/lib/scanner/omr-score";
 import type { Item } from "../src/lib/types";
 
-// ---- template ----------------------------------------------------------
+// ---- template (v2: fixed 4×20 grid, 5 choices, version bubbles) ---------
 describe("omr-template", () => {
-  it("chooses the smallest fitting supported size", () => {
-    expect(chooseSheetSize(8)).toBe(10);
-    expect(chooseSheetSize(10)).toBe(10);
-    expect(chooseSheetSize(11)).toBe(20);
-    expect(chooseSheetSize(45)).toBe(50);
-    expect(chooseSheetSize(999)).toBe(50);
+  it("chooses the smallest fitting usage bucket", () => {
+    expect(chooseSheetSize(8)).toBe(20);
+    expect(chooseSheetSize(20)).toBe(20);
+    expect(chooseSheetSize(21)).toBe(40);
+    expect(chooseSheetSize(45)).toBe(60);
+    expect(chooseSheetSize(999)).toBe(80);
   });
-  it("lays out 4 bubbles per item and the right column count", () => {
-    expect(buildTemplate(10).columns).toBe(1);
-    expect(buildTemplate(50).columns).toBe(5);
-    expect(buildTemplate(10).bubbles).toHaveLength(40);
-    expect(buildTemplate(20).bubbles).toHaveLength(80);
+  it("lays out 5 bubbles per item on a fixed 4-column grid", () => {
+    expect(buildTemplate(10).columns).toBe(4);
+    expect(buildTemplate(80).columns).toBe(4);
+    expect(buildTemplate(10).bubbles).toHaveLength(50);
+    expect(buildTemplate(80).bubbles).toHaveLength(400);
+  });
+  it("bubble positions are independent of the active item count", () => {
+    const small = buildTemplate(10);
+    const full = buildTemplate(80);
+    const b10 = small.bubbles.find((b) => b.item === 10 && b.choiceIndex === 4)!;
+    const b10full = full.bubbles.find((b) => b.item === 10 && b.choiceIndex === 4)!;
+    expect(b10.cx).toBe(b10full.cx);
+    expect(b10.cy).toBe(b10full.cy);
+  });
+  it("exposes 4 shade-one version bubbles", () => {
+    const t = buildTemplate(10);
+    expect(t.versionBubbles.map((v) => v.version)).toEqual(["A", "B", "C", "D"]);
   });
 });
 
@@ -90,7 +102,7 @@ function shade(g: GrayImage, t: ReturnType<typeof buildTemplate>, item: number, 
 }
 
 describe("readSheet (synthetic, already aligned)", () => {
-  it("detects markers and reads shaded answers", () => {
+  it("detects markers, reads shaded answers, and reads the version bubble", () => {
     const t = buildTemplate(10);
     const g = blankSheet();
     MARKER_RECTS.forEach((m) => fillRect(g, m.x, m.y, m.w, m.h, 0));
@@ -99,14 +111,26 @@ describe("readSheet (synthetic, already aligned)", () => {
     // item 3 left blank
     shade(g, t, 4, 0); // 4 -> A + B  => multiple
     shade(g, t, 4, 1);
+    // shade version B
+    const vb = t.versionBubbles.find((v) => v.version === "B")!;
+    fillDisc(g, vb.cx, vb.cy, vb.r * 0.8, 0);
 
     const res = readSheet(g, t);
     expect(res.aligned).toBe(true);
     expect(res.markersFound).toBe(4);
+    expect(res.version.detected).toBe("B");
     expect(res.items[0]).toMatchObject({ detected: "A", status: "selected" });
     expect(res.items[1]).toMatchObject({ detected: "C", status: "selected" });
     expect(res.items[2].status).toBe("blank");
     expect(res.items[3].status).toBe("multiple");
+  });
+
+  it("reports no version when the version row is left blank", () => {
+    const t = buildTemplate(10);
+    const g = blankSheet();
+    MARKER_RECTS.forEach((m) => fillRect(g, m.x, m.y, m.w, m.h, 0));
+    const res = readSheet(g, t);
+    expect(res.version.detected).toBeNull();
   });
 
   it("reports not aligned when markers are missing", () => {
@@ -170,7 +194,9 @@ function mcItem(n: number, id: string): Item {
     acceptedAnswers: [],
     points: 1,
     competency: "",
+    topic: "",
     difficulty: "Average",
+    cognitiveLevel: "",
     choices: 4,
   };
 }

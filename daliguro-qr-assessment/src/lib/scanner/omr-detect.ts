@@ -24,7 +24,13 @@ export interface ItemReading {
   detected: Choice | null;
   status: ItemStatus;
   confidence: number; // 0..1
-  fill: number[]; // darkness ratio 0..1 per choice A..D
+  fill: number[]; // darkness ratio 0..1 per choice A..E
+}
+
+// The shade-one VERSION row, read as a second identity layer.
+export interface VersionReading {
+  detected: string | null; // "A".."D" or null when nothing is clearly shaded
+  fill: number[];
 }
 
 export interface SheetReading {
@@ -33,6 +39,7 @@ export interface SheetReading {
   corners: Point[] | null;
   brightness: number; // 0..255 mean
   sharpness: number; // higher = sharper
+  version: VersionReading;
   items: ItemReading[];
 }
 
@@ -65,7 +72,7 @@ function meanGray(g: GrayImage): number {
 }
 
 // Crude sharpness: mean absolute horizontal gradient (higher = sharper).
-function sharpnessOf(g: GrayImage): number {
+export function sharpnessOf(g: GrayImage): number {
   const { data, width, height } = g;
   let sum = 0;
   let n = 0;
@@ -329,8 +336,24 @@ function clamp01(v: number): number {
   return v < 0 ? 0 : v > 1 ? 1 : v;
 }
 
+// Read the shade-one VERSION bubbles using an existing homography.
+function readVersionMarks(g: GrayImage, h: number[], template: OmrTemplate): VersionReading {
+  const fill = template.versionBubbles.map((b) =>
+    bubbleAdaptive(g, h, b.cx, b.cy, b.r),
+  );
+  const order = fill.map((v, i) => ({ v, i })).sort((a, b) => b.v - a.v);
+  const top = order[0];
+  const second = order[1] ?? { v: 0, i: -1 };
+  if (!top || top.v < MARK_HI || top.v - second.v < MARGIN) {
+    return { detected: null, fill };
+  }
+  return { detected: template.versionBubbles[top.i].version, fill };
+}
+
+const NO_FILL = () => new Array<number>(CHOICES.length).fill(0);
+
 // Read a whole sheet. `validChoicesByItem` limits which choices count per item
-// (e.g. a 3-option MC ignores D).
+// (e.g. a 4-option MC ignores E).
 export function readSheet(
   g: GrayImage,
   template: OmrTemplate,
@@ -346,6 +369,7 @@ export function readSheet(
       corners: null,
       brightness,
       sharpness,
+      version: { detected: null, fill: [] },
       items: [],
     };
   }
@@ -354,15 +378,17 @@ export function readSheet(
   // Gather darkness per item/choice.
   const fillByItem = new Map<number, number[]>();
   for (const b of template.bubbles) {
-    if (!fillByItem.has(b.item)) fillByItem.set(b.item, [0, 0, 0, 0]);
+    if (!fillByItem.has(b.item)) fillByItem.set(b.item, NO_FILL());
     fillByItem.get(b.item)![b.choiceIndex] = bubbleAdaptive(g, h, b.cx, b.cy, b.r);
   }
 
   const items: ItemReading[] = [];
   for (let n = 1; n <= template.items; n += 1) {
-    const fill = fillByItem.get(n) ?? [0, 0, 0, 0];
-    items.push(classifyItem(n, fill, validChoicesByItem[n] ?? 4));
+    const fill = fillByItem.get(n) ?? NO_FILL();
+    items.push(classifyItem(n, fill, validChoicesByItem[n] ?? CHOICES.length));
   }
 
-  return { aligned: true, markersFound: 4, corners, brightness, sharpness, items };
+  const version = readVersionMarks(g, h, template);
+
+  return { aligned: true, markersFound: 4, corners, brightness, sharpness, version, items };
 }

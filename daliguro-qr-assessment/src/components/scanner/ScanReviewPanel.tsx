@@ -174,7 +174,7 @@ function ChoiceButtons({
   row: ReviewRow;
   onCorrect: (value: string) => void;
 }) {
-  const valid = Math.max(2, Math.min(row.item.choices, 4));
+  const valid = Math.max(2, Math.min(row.item.choices, 5));
   return (
     <div className="flex flex-wrap gap-1">
       {CHOICES.slice(0, valid).map((c) => {

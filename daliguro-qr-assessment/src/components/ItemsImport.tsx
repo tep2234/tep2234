@@ -40,7 +40,9 @@ export function ItemsImport({
       ...answerCols,
       "points",
       "competency",
+      "topic",
       "difficulty",
+      "cognitiveLevel",
     ];
     const example = [
       "1",
@@ -53,7 +55,9 @@ export function ItemsImport({
       ...versions.map((v) => (v === "A" ? "B" : "D")),
       "1",
       "Recognizing opportunity",
+      "Entrepreneurial Mindset",
       "Average",
+      "Understanding",
     ];
     downloadCsv(toCsv(headers, [example]), "daliguro_items_template.csv");
   }

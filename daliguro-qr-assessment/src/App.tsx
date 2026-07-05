@@ -6,17 +6,23 @@ import ItemsPanel from "./components/ItemsPanel";
 import LearnersPanel from "./components/LearnersPanel";
 import SheetsPanel from "./components/SheetsPanel";
 import CheckPanel from "./components/CheckPanel";
+import ReviewPanel from "./components/ReviewPanel";
 import ResultsPanel from "./components/ResultsPanel";
 import AnalysisPanel from "./components/AnalysisPanel";
+import RemediationPanel from "./components/RemediationPanel";
+import ReportsPanel from "./components/ReportsPanel";
 
 type TabId =
   | "setup"
   | "items"
   | "learners"
   | "sheets"
-  | "check"
+  | "smartscan"
+  | "review"
   | "results"
-  | "analysis";
+  | "analysis"
+  | "remediation"
+  | "reports";
 
 interface TabDef {
   id: TabId;
@@ -29,9 +35,12 @@ const TABS: TabDef[] = [
   { id: "items", label: "Items", icon: "🔢" },
   { id: "learners", label: "Learners", icon: "👥" },
   { id: "sheets", label: "QR Sheets", icon: "🔳" },
-  { id: "check", label: "Check", icon: "✓" },
+  { id: "smartscan", label: "SmartScan", icon: "📷" },
+  { id: "review", label: "Review", icon: "🔍" },
   { id: "results", label: "Results", icon: "🎯" },
   { id: "analysis", label: "Analysis", icon: "📊" },
+  { id: "remediation", label: "Remediation", icon: "🧭" },
+  { id: "reports", label: "Reports", icon: "📄" },
 ];
 
 export default function App() {
@@ -42,29 +51,30 @@ export default function App() {
   if (!loaded) {
     return (
       <div className="flex min-h-screen items-center justify-center text-slate-500">
-        Loading DALIguro QR…
+        Loading DALIguro SmartScan…
       </div>
     );
   }
 
   const active = state.assessments.find((a) => a.id === activeId) ?? null;
   const panelProps: PanelProps = { state, setState, activeId, setActiveId };
+  const pendingReview = state.results.filter((r) => r.reviewStatus === "needs_review").length;
 
   return (
     <div className="min-h-screen">
       {/* Header */}
-      <header className="flex flex-wrap items-center gap-3 bg-indigo-700 px-5 py-3 text-white">
+      <header className="no-print flex flex-wrap items-center gap-3 bg-indigo-700 px-5 py-3 text-white">
         <div className="text-xl font-extrabold tracking-wide">
           DALI<span className="text-amber-400">guro</span>
         </div>
-        <div className="text-sm opacity-90">QR Assessment — Standalone</div>
+        <div className="text-sm opacity-90">SmartScan Assessment Engine</div>
         <span className="ml-auto rounded-full border border-emerald-400 bg-emerald-500/20 px-3 py-1 text-xs font-bold">
           ● OFFLINE-FIRST · saved on this device
         </span>
       </header>
 
       {/* Tab navigation */}
-      <nav className="sticky top-0 z-10 flex gap-1 overflow-x-auto border-b border-slate-200 bg-white px-3 py-2">
+      <nav className="no-print sticky top-0 z-10 flex gap-1 overflow-x-auto border-b border-slate-200 bg-white px-3 py-2">
         {TABS.map((t) => {
           const isActiveTab = t.id === tab;
           const cls = isActiveTab
@@ -75,12 +85,17 @@ export default function App() {
               key={t.id}
               onClick={() => setTab(t.id)}
               className={
-                "flex items-center gap-1.5 whitespace-nowrap rounded-lg px-3.5 py-2 text-sm font-bold " +
+                "relative flex items-center gap-1.5 whitespace-nowrap rounded-lg px-3.5 py-2 text-sm font-bold " +
                 cls
               }
             >
               <span className="text-base">{t.icon}</span>
               {t.label}
+              {t.id === "review" && pendingReview > 0 ? (
+                <span className="ml-1 rounded-full bg-amber-400 px-1.5 text-xs font-extrabold text-amber-950">
+                  {pendingReview}
+                </span>
+              ) : null}
             </button>
           );
         })}
@@ -89,7 +104,7 @@ export default function App() {
       {/* Tab content */}
       <main className="mx-auto max-w-5xl p-4">
         {active && tab !== "setup" ? (
-          <div className="mb-3 flex items-center justify-between rounded-lg border border-indigo-200 bg-indigo-50 px-3 py-2 text-sm">
+          <div className="no-print mb-3 flex items-center justify-between rounded-lg border border-indigo-200 bg-indigo-50 px-3 py-2 text-sm">
             <span>
               Active assessment: <b>{active.title}</b> · {active.subject} ·{" "}
               {active.section}
@@ -114,7 +129,10 @@ function renderTab(tab: TabId, panelProps: PanelProps) {
   if (tab === "items") return <ItemsPanel {...panelProps} />;
   if (tab === "learners") return <LearnersPanel {...panelProps} />;
   if (tab === "sheets") return <SheetsPanel {...panelProps} />;
-  if (tab === "check") return <CheckPanel {...panelProps} />;
+  if (tab === "smartscan") return <CheckPanel {...panelProps} />;
+  if (tab === "review") return <ReviewPanel {...panelProps} />;
   if (tab === "results") return <ResultsPanel {...panelProps} />;
-  return <AnalysisPanel {...panelProps} />;
+  if (tab === "analysis") return <AnalysisPanel {...panelProps} />;
+  if (tab === "remediation") return <RemediationPanel {...panelProps} />;
+  return <ReportsPanel {...panelProps} />;
 }

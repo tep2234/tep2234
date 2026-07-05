@@ -27,7 +27,7 @@ function learner(overrides: Partial<Learner> = {}): Learner {
 
 describe("buildQrPayload", () => {
   it("contains only the identity whitelist fields", () => {
-    const payload = buildQrPayload("a1", learner(), "A");
+    const payload = buildQrPayload("a1", learner(), "A", 20);
     expect(Object.keys(payload).sort()).toEqual(
       [
         "assessmentId",
@@ -37,12 +37,14 @@ describe("buildQrPayload", () => {
         "gradeLevel",
         "version",
         "securityToken",
+        "n",
+        "checksum",
       ].sort(),
     );
   });
 
   it("never includes any answer-key-shaped field, even by accident", () => {
-    const payload = buildQrPayload("a1", learner(), "B");
+    const payload = buildQrPayload("a1", learner(), "B", 20);
     const json = qrText(payload);
     ANSWER_KEY_FIELDS.forEach((field) => {
       expect(json.includes(`"${field}"`)).toBe(false);
@@ -51,7 +53,7 @@ describe("buildQrPayload", () => {
 
   it("carries the learner's actual identity values through", () => {
     const l = learner({ id: "L42", lrn: "999", section: "Bonifacio", gradeLevel: "Grade 9" });
-    const payload = buildQrPayload("assess-1", l, "C");
+    const payload = buildQrPayload("assess-1", l, "C", 35);
     expect(payload).toMatchObject({
       assessmentId: "assess-1",
       learnerId: "L42",
@@ -59,11 +61,19 @@ describe("buildQrPayload", () => {
       section: "Bonifacio",
       gradeLevel: "Grade 9",
       version: "C",
+      n: 35,
     });
   });
 
+  it("carries a deterministic checksum over the identity triple", () => {
+    const a = buildQrPayload("a1", learner(), "A", 10);
+    const b = buildQrPayload("a1", learner(), "A", 10);
+    expect(a.checksum).toBe(b.checksum);
+    expect(a.checksum).not.toBe(buildQrPayload("a1", learner(), "B", 10).checksum);
+  });
+
   it("round-trips through JSON exactly as a plain identity object", () => {
-    const payload = buildQrPayload("a1", learner(), "A");
+    const payload = buildQrPayload("a1", learner(), "A", 20);
     const parsed = JSON.parse(qrText(payload));
     expect(parsed).toEqual(payload);
   });

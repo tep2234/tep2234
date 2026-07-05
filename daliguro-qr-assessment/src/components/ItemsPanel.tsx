@@ -4,6 +4,7 @@
 import type { PanelProps } from "./panel-types";
 import type {
   Assessment,
+  CognitiveLevel,
   Difficulty,
   Item,
   ItemType,
@@ -11,7 +12,7 @@ import type {
   TestVersion,
   VersionKey,
 } from "../lib/types";
-import { DIFFICULTIES, ITEM_TYPES } from "../lib/types";
+import { COGNITIVE_LEVELS, DIFFICULTIES, ITEM_TYPES } from "../lib/types";
 import { isObjective, usesAcceptedAnswers } from "../lib/items";
 import { buildItemsImport, parseItemsCsv } from "../lib/items-csv";
 import { uid } from "../lib/ids";
@@ -63,7 +64,9 @@ function ItemsEditor({
       acceptedAnswers: [],
       points: 1,
       competency: "",
+      topic: "",
       difficulty: "Average",
+      cognitiveLevel: "",
       choices: 4,
     };
     setState((prev) => ({ ...prev, items: prev.items.concat(item) }));
@@ -300,6 +303,14 @@ function ItemCard({
             className="min-w-40"
           />
         </Field>
+        <Field label="Topic">
+          <TextInput
+            value={item.topic}
+            onChange={(e) => onChange({ topic: e.target.value })}
+            placeholder="e.g. Rational Equations"
+            className="min-w-36"
+          />
+        </Field>
         <Field label="Difficulty">
           <Select
             value={item.difficulty}
@@ -311,6 +322,22 @@ function ItemCard({
             {DIFFICULTIES.map((d) => (
               <option key={d} value={d}>
                 {d}
+              </option>
+            ))}
+          </Select>
+        </Field>
+        <Field label="Cognitive Level">
+          <Select
+            value={item.cognitiveLevel}
+            onChange={(e) =>
+              onChange({ cognitiveLevel: e.target.value as CognitiveLevel | "" })
+            }
+            className="max-w-36"
+          >
+            <option value="">—</option>
+            {COGNITIVE_LEVELS.map((c) => (
+              <option key={c} value={c}>
+                {c}
               </option>
             ))}
           </Select>
