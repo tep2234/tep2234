@@ -13,12 +13,36 @@ body {
 
 /* Print rules for OMR answer sheets: print ONLY the sheets, never the app
    chrome (header/nav/controls), so stray UI doesn't land on the paper or
-   confuse the scanner's corner-marker detection. */
+   confuse the scanner's corner-marker detection.
+
+   A4 fit contract: one answer sheet MUST print on exactly one A4 page at 100%
+   scale. The sheet SVG is aspect-locked to the A4 ratio (1000:1414 ≈ 1:1.414),
+   so we constrain its printed WIDTH to the safe content area (194mm); its
+   height then resolves to ~274mm, inside the 281mm safe height (A4 297mm minus
+   two 8mm margins). The trailing `page-break-after` is cleared on the LAST
+   sheet — a forced break after the final sheet is the classic cause of an
+   accidental blank second page in Safari. */
+@page {
+  size: A4 portrait;
+  margin: 8mm;
+}
+
 @media print {
+  html,
   body {
-    background: #ffffff;
+    margin: 0 !important;
+    padding: 0 !important;
+    background: #ffffff !important;
   }
-  /* Hide everything, then reveal only the printable sheet area. */
+  /* Print solid blacks (corner markers, QR, bubble outlines) so the scanner
+     can find them — some browsers otherwise wash out fills to save ink. */
+  body,
+  .print-area,
+  .sheet {
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+  /* Hide everything, then reveal only the printable sheet/report area. */
   body * {
     visibility: hidden;
   }
@@ -31,14 +55,35 @@ body {
     left: 0;
     top: 0;
     width: 100%;
+    margin: 0 !important;
+    padding: 0 !important;
   }
   .no-print {
     display: none !important;
   }
+  /* One answer sheet == one A4 page. */
   .sheet {
-    page-break-after: always;
+    width: 194mm !important;
+    max-width: 194mm !important;
+    margin: 0 auto !important;
+    padding: 0 !important;
+    overflow: hidden;
     box-shadow: none !important;
     border: none !important;
-    max-width: 100% !important;
+    page-break-after: always;
+    break-after: page;
+    page-break-inside: avoid;
+    break-inside: avoid;
+  }
+  /* No forced break after the final sheet -> no accidental blank page. */
+  .sheet:last-child {
+    page-break-after: auto;
+    break-after: auto;
+  }
+  .sheet > svg {
+    display: block;
+    width: 100%;
+    height: auto;
+    max-height: 281mm;
   }
 }
