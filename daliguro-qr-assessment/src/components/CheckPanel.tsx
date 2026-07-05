@@ -25,6 +25,7 @@ import type { ReviewSummary } from "../lib/scanner/omr-score";
 import { upsertScanResult } from "../lib/scanner/scan-save";
 import { AnswerSheetScanner, type ScanResult } from "./scanner/AnswerSheetScanner";
 import { ScanReviewPanel } from "./scanner/ScanReviewPanel";
+import { UsePhoneScannerPanel } from "./smartscan/UsePhoneScannerPanel";
 import { CheckForm } from "./ManualCheck";
 import { Button, Empty } from "./ui";
 
@@ -357,6 +358,7 @@ function CheckEditor({
           </>
         ) : (
           <>
+            <UsePhoneScannerPanel assessmentId={active.id} />
             <AnswerSheetScanner
               state={state}
               activeId={active.id}
