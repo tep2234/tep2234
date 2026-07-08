@@ -57,6 +57,25 @@ export function depedMasteryLabel(pct: number): DepEdMastery {
   return DEPED_LABEL[masteryBand(pct)];
 }
 
+// Light background tints for the color-coded mastery roster (print-safe pastels).
+export const DEPED_TINT: Record<DepEdMastery, string> = {
+  Mastered: "#dcfce7",
+  "Nearly Mastered": "#cffafe",
+  "Least Mastered": "#fef3c7",
+  "Not Mastered": "#fee2e2",
+};
+
+// DepEd Mean Percentage Score mastery target.
+export const MPS_TARGET = 75;
+
+// One-line interpretation of an MPS value against the 75% mastery target.
+export function mpsInterpretation(mps: number): string {
+  if (mps >= 90) return "Outstanding — the class has mastered the competencies.";
+  if (mps >= MPS_TARGET) return `Proficient — meets the DepEd ${MPS_TARGET}% mastery target.`;
+  if (mps >= 50) return `Approaching — below the ${MPS_TARGET}% target; targeted remediation needed.`;
+  return "Needs intensive reteaching before moving to the next competency.";
+}
+
 // ---- Frequency-of-error bands ------------------------------
 
 export type ErrorBand = "No Error" | "Minimal Error" | "Moderate Error" | "High Error" | "Critical Error";

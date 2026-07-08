@@ -24,7 +24,6 @@ function item(overrides: Partial<Item> = {}): Item {
     acceptedAnswers: [],
     points: 1,
     competency: "",
-    topic: "",
     difficulty: "Average",
     cognitiveLevel: "",
     choices: 4,

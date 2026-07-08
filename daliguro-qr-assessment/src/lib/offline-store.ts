@@ -106,7 +106,6 @@ function lsSave(state: QrAssessmentState): void {
 function normalizeItem(item: Item): Item {
   return {
     ...item,
-    topic: typeof item.topic === "string" ? item.topic : "",
     cognitiveLevel: item.cognitiveLevel ?? "",
   };
 }
@@ -122,6 +121,12 @@ function normalizeResult(result: Result): Result {
     source: result.source === "scan" ? "scan" : "manual",
     scanConfidence:
       typeof result.scanConfidence === "number" ? result.scanConfidence : null,
+    scanQuality:
+      typeof result.scanQuality === "number"
+        ? result.scanQuality
+        : typeof result.scanConfidence === "number"
+          ? Math.round(result.scanConfidence * 100)
+          : null,
     // Pre-SmartScan results were checked by the teacher → "reviewed".
     reviewStatus: isReviewStatus(result.reviewStatus) ? result.reviewStatus : "reviewed",
     finalizedAt: typeof result.finalizedAt === "number" ? result.finalizedAt : null,

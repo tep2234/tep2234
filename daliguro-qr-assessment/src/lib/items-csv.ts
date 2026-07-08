@@ -7,7 +7,7 @@
 //   itemNo | no | number | #            -> item number (optional; else row order)
 //   type | itemType                     -> item type (default "Multiple Choice")
 //   question | stem                     -> question text (required)
-//   optionA..optionH | "A".."H"         -> choice texts (count drives `choices`)
+//   optionA..optionH | choiceA..choiceH | "A".."H" -> choice texts (count drives `choices`)
 //   points | pts                        -> points (default 1)
 //   competency | comp                   -> competency code/label
 //   difficulty | diff                   -> Easy | Average | Difficult
@@ -34,11 +34,11 @@ export interface ParsedItem {
   choices: number;
   points: number;
   competency: string;
-  topic: string;
   difficulty: Difficulty;
   cognitiveLevel: CognitiveLevel | "";
   correctAnswer: string;
   acceptedAnswers: string[];
+  explanation: string;
   // Objective answer letter per version, e.g. { A: "B", B: "D" }.
   answers: Partial<Record<TestVersion, string>>;
 }
@@ -79,12 +79,41 @@ function splitCsvLine(line: string): string[] {
   return out.map((s) => s.trim());
 }
 
-const norm = (h: string) => h.toLowerCase().replace(/[\s_]+/g, "");
+// Normalise a header/value: lowercase and drop everything but letters+digits.
+// This makes matching robust to spaces, underscores, and punctuation teachers
+// commonly leave in: "No.", "Item No.", "Question Text", "T/F", "MCQ" all fold
+// to a clean token ("no", "itemno", "questiontext", "tf", "mcq").
+export const norm = (h: string) => h.toLowerCase().replace(/[^a-z0-9]/g, "");
+
+// Common teacher shorthands → canonical DALIguro item type. Keys are norm()ed.
+const TYPE_SYNONYMS: Record<string, ItemType> = {
+  mc: "Multiple Choice",
+  mcq: "Multiple Choice",
+  choice: "Multiple Choice",
+  multichoice: "Multiple Choice",
+  tf: "True or False",
+  truefalse: "True or False",
+  id: "Identification",
+  identify: "Identification",
+  matching: "Matching Type",
+  shortresponse: "Short Answer",
+  constructedresponse: "Essay",
+  fillblank: "Fill in the Blank",
+  problem: "Problem Solving",
+};
+
+// Resolve a raw type string to a canonical ItemType, or "" when unrecognised
+// (callers decide the fallback / inference). Shared with the Word/paste parser.
+export function resolveItemType(raw: string): ItemType | "" {
+  const n = norm(raw);
+  if (!n) return "";
+  const exact = ITEM_TYPES.find((t) => norm(t) === n);
+  if (exact) return exact;
+  return TYPE_SYNONYMS[n] ?? "";
+}
 
 function matchType(raw: string): ItemType {
-  const n = norm(raw);
-  const found = ITEM_TYPES.find((t) => norm(t) === n);
-  return found ?? "Multiple Choice";
+  return resolveItemType(raw) || "Multiple Choice";
 }
 
 function matchDifficulty(raw: string): Difficulty {
@@ -104,9 +133,9 @@ interface ColumnMap {
   question: number;
   points: number;
   competency: number;
-  topic: number;
   difficulty: number;
   cognitiveLevel: number;
+  explanation: number;
   correctAnswer: number;
   acceptedAnswers: number;
   options: number[]; // index by option position (0=A,1=B,…)
@@ -120,9 +149,9 @@ function buildColumnMap(header: string[]): ColumnMap {
     question: -1,
     points: -1,
     competency: -1,
-    topic: -1,
     difficulty: -1,
     cognitiveLevel: -1,
+    explanation: -1,
     correctAnswer: -1,
     acceptedAnswers: -1,
     options: [],
@@ -133,16 +162,24 @@ function buildColumnMap(header: string[]): ColumnMap {
 
   header.forEach((raw, idx) => {
     const h = norm(raw);
-    if (["itemno", "no", "number", "itemnumber", "#"].includes(h)) map.itemNo = idx;
-    else if (["type", "itemtype"].includes(h)) map.type = idx;
-    else if (["question", "stem"].includes(h)) map.question = idx;
-    else if (["points", "point", "pts"].includes(h)) map.points = idx;
-    else if (["competency", "comp", "competencycode"].includes(h)) map.competency = idx;
-    else if (["topic", "lesson"].includes(h)) map.topic = idx;
+    // A bare "#" header folds to "" under norm(); catch it explicitly.
+    if (raw.trim() === "#" || ["itemno", "no", "number", "itemnumber", "item"].includes(h))
+      map.itemNo = idx;
+    else if (["type", "itemtype", "testtype", "questiontype", "kind"].includes(h)) map.type = idx;
+    else if (["question", "questions", "questiontext", "stem"].includes(h)) map.question = idx;
+    else if (["points", "point", "pts", "score", "mark"].includes(h)) map.points = idx;
+    else if (
+      ["competency", "comp", "competencycode", "melc", "learningcompetency", "objective"].includes(h)
+    )
+      map.competency = idx;
     else if (["difficulty", "diff"].includes(h)) map.difficulty = idx;
     else if (["cognitivelevel", "cognitive", "bloom", "bloomslevel"].includes(h))
       map.cognitiveLevel = idx;
-    else if (["correctanswer", "answer", "key"].includes(h)) map.correctAnswer = idx;
+    else if (["explanation", "rationale", "answerexplanation"].includes(h)) map.explanation = idx;
+    else if (
+      ["correctanswer", "answer", "key", "answerkey", "correct", "correctresponse"].includes(h)
+    )
+      map.correctAnswer = idx;
     else if (["acceptedanswers", "accepted", "alternates"].includes(h))
       map.acceptedAnswers = idx;
     else {
@@ -152,8 +189,8 @@ function buildColumnMap(header: string[]): ColumnMap {
         versionByLetter[ver[1].toUpperCase() as TestVersion] = idx;
         return;
       }
-      // Option columns: optionA | "A" (single letter)
-      const opt = h.match(/^(?:option)?([a-h])$/);
+      // Option columns: optionA | choiceA | "A" (single letter)
+      const opt = h.match(/^(?:(?:option|choice))?([a-h])$/);
       if (opt) optionByLetter[opt[1].toUpperCase()] = idx;
     }
   });
@@ -250,12 +287,12 @@ export function parseItemsCsv(text: string): ParseResult {
       choices,
       points,
       competency: at(col.competency),
-      topic: at(col.topic),
       difficulty: col.difficulty >= 0 ? matchDifficulty(at(col.difficulty)) : "Average",
       cognitiveLevel:
         col.cognitiveLevel >= 0 ? matchCognitiveLevel(at(col.cognitiveLevel)) : "",
       correctAnswer: at(col.correctAnswer),
       acceptedAnswers,
+      explanation: at(col.explanation),
       answers,
     });
   }
@@ -287,7 +324,6 @@ export function buildItemsImport(
       acceptedAnswers: p.acceptedAnswers,
       points: p.points,
       competency: p.competency,
-      topic: p.topic,
       difficulty: p.difficulty,
       cognitiveLevel: p.cognitiveLevel,
       choices: p.choices,

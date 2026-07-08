@@ -64,7 +64,6 @@ function ItemsEditor({
       acceptedAnswers: [],
       points: 1,
       competency: "",
-      topic: "",
       difficulty: "Average",
       cognitiveLevel: "",
       choices: 4,
@@ -165,6 +164,7 @@ function ItemsEditor({
       <TestImport
         versions={active.versions}
         hasItems={items.length > 0}
+        defaultOpen={items.length === 0}
         onSave={saveImport}
       />
 
@@ -270,14 +270,6 @@ function ItemCard({
             onChange={(e) => onChange({ competency: e.target.value })}
             placeholder="e.g. M11GM-Ia-1"
             className="min-w-40"
-          />
-        </Field>
-        <Field label="Topic">
-          <TextInput
-            value={item.topic}
-            onChange={(e) => onChange({ topic: e.target.value })}
-            placeholder="e.g. Rational Equations"
-            className="min-w-36"
           />
         </Field>
         <Field label="Difficulty">

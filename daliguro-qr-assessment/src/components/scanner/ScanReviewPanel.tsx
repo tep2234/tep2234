@@ -6,7 +6,7 @@ import type { Item, Learner, TestVersion, VersionKey } from "../../lib/types";
 import { masteryColor } from "../../lib/scoring";
 import { CHOICES } from "../../lib/scanner/omr-template";
 import type { ItemStatus } from "../../lib/scanner/omr-detect";
-import { buildReview, type ReviewRow } from "../../lib/scanner/omr-score";
+import { REVIEW_CONFIDENCE, buildReview, type ReviewRow } from "../../lib/scanner/omr-score";
 import { Button } from "../ui";
 
 const STATUS_TONE: Record<ItemStatus, string> = {
@@ -111,12 +111,17 @@ export function ScanReviewPanel({
               ✗✗ {summary.multipleCount} multiple
             </span>
           )}
+          {summary.lowConfidenceCount > 0 && (
+            <span className="rounded-full bg-orange-100 px-2.5 py-1 text-orange-800">
+              ◷ {summary.lowConfidenceCount} low confidence
+            </span>
+          )}
         </div>
 
         {summary.needsReview && (
           <div className="mt-3 rounded-lg border border-amber-300 bg-amber-50 p-2 text-sm text-amber-800">
-            ⚠ Some items are unclear or have multiple marks. Set the correct answer below (or
-            leave blank) before saving.
+            ⚠ Some items are unclear, low-confidence, or have multiple marks. Confirm the suggested
+            answer, choose another letter, or leave blank before saving.
           </div>
         )}
         {alreadySaved && (
@@ -145,7 +150,7 @@ export function ScanReviewPanel({
         <table className="w-full text-sm">
           <thead>
             <tr className="bg-slate-50 text-left text-xs text-slate-500">
-              {["#", "Detected", "Key", "Status", "Conf.", "Set answer"].map((h) => (
+              {["#", "Answer", "Key", "Status", "Conf.", "Bubble read", "Set answer"].map((h) => (
                 <th key={h} className="px-3 py-2 font-bold">
                   {h}
                 </th>
@@ -175,20 +180,25 @@ function ChoiceButtons({
   onCorrect: (value: string) => void;
 }) {
   const valid = Math.max(2, Math.min(row.item.choices, 5));
+  const effective = row.detected ?? row.suggested;
   return (
     <div className="flex flex-wrap gap-1">
       {CHOICES.slice(0, valid).map((c) => {
-        const on = row.detected === c;
+        const on = effective === c;
+        const suggestedOnly = row.detected == null && row.suggested === c;
         return (
           <button
             key={c}
             onClick={() => onCorrect(c)}
             className={
               "h-8 w-8 rounded border text-xs font-bold " +
-              (on
+              (on && !suggestedOnly
                 ? "border-indigo-700 bg-indigo-700 text-white"
+                : suggestedOnly
+                  ? "border-amber-500 bg-amber-100 text-amber-900"
                 : "border-slate-200 bg-white text-slate-600")
             }
+            title={suggestedOnly ? "Scanner suggestion. Tap to confirm." : undefined}
           >
             {c}
           </button>
@@ -198,7 +208,7 @@ function ChoiceButtons({
         onClick={() => onCorrect("")}
         className={
           "h-8 rounded border px-2 text-xs font-bold " +
-          (row.detected === null
+          (row.detected === null && row.suggested === null
             ? "border-slate-400 bg-slate-200 text-slate-700"
             : "border-slate-200 bg-white text-slate-500")
         }
@@ -211,8 +221,7 @@ function ChoiceButtons({
 
 function MobileCard({ row, onCorrect }: { row: ReviewRow; onCorrect: (value: string) => void }) {
   const pct = Math.round(row.confidence * 100);
-  const cardBg =
-    row.status === "unclear" || row.status === "multiple" ? "border-amber-200 bg-amber-50" : "border-slate-200 bg-white";
+  const cardBg = row.needsReview ? "border-amber-200 bg-amber-50" : "border-slate-200 bg-white";
 
   return (
     <div className={"rounded-xl border p-3 " + cardBg}>
@@ -227,13 +236,18 @@ function MobileCard({ row, onCorrect }: { row: ReviewRow; onCorrect: (value: str
                 "text-base font-extrabold " +
                 (row.isCorrect
                   ? "text-emerald-700"
-                  : row.detected
+                  : row.detected || row.suggested
                     ? "text-red-700"
                     : "text-slate-400")
               }
             >
-              {row.detected ?? "—"}
+              {row.detected ?? row.suggested ?? "—"}
             </span>
+            {!row.resolved && row.suggested && row.detected === null ? (
+              <span className="ml-2 rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-black text-amber-900">
+                suggested
+              </span>
+            ) : null}
             {row.correctAnswer && (
               <span className="ml-2 text-xs text-slate-500">key: {row.correctAnswer}</span>
             )}
@@ -252,14 +266,14 @@ function MobileCard({ row, onCorrect }: { row: ReviewRow; onCorrect: (value: str
       <div className="mt-2">
         <ChoiceButtons row={row} onCorrect={onCorrect} />
       </div>
+      <BubbleStrength row={row} />
     </div>
   );
 }
 
 function TableRow({ row, onCorrect }: { row: ReviewRow; onCorrect: (value: string) => void }) {
   const pct = Math.round(row.confidence * 100);
-  const rowBg =
-    row.status === "multiple" || row.status === "unclear" ? "bg-amber-50" : "";
+  const rowBg = row.needsReview ? "bg-amber-50" : "";
   return (
     <tr className={"border-t border-slate-100 " + rowBg}>
       <td className="px-3 py-2 font-bold">{row.item.itemNumber}</td>
@@ -268,13 +282,18 @@ function TableRow({ row, onCorrect }: { row: ReviewRow; onCorrect: (value: strin
           className={
             row.isCorrect
               ? "font-bold text-emerald-700"
-              : row.detected
+              : row.detected || row.suggested
                 ? "font-bold text-red-700"
                 : "text-slate-400"
           }
         >
-          {row.detected ?? "—"}
+          {row.detected ?? row.suggested ?? "—"}
         </span>
+        {!row.resolved && row.suggested && row.detected === null ? (
+          <span className="ml-2 rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-black text-amber-900">
+            suggested
+          </span>
+        ) : null}
       </td>
       <td className="px-3 py-2 font-semibold text-slate-600">{row.correctAnswer || "—"}</td>
       <td className="px-3 py-2">
@@ -286,10 +305,40 @@ function TableRow({ row, onCorrect }: { row: ReviewRow; onCorrect: (value: strin
         <span className={"rounded px-2 py-0.5 text-xs font-bold " + confidenceBadge(row.confidence)}>
           {pct}%
         </span>
+        {row.status === "selected" && row.confidence < REVIEW_CONFIDENCE ? (
+          <div className="mt-1 text-[10px] font-bold text-orange-700">confirm</div>
+        ) : null}
+      </td>
+      <td className="px-3 py-2">
+        <BubbleStrength row={row} compact />
       </td>
       <td className="px-3 py-2">
         <ChoiceButtons row={row} onCorrect={onCorrect} />
       </td>
     </tr>
+  );
+}
+
+function BubbleStrength({ row, compact = false }: { row: ReviewRow; compact?: boolean }) {
+  const valid = Math.max(2, Math.min(row.item.choices, 5));
+  return (
+    <div className={compact ? "grid min-w-32 gap-1" : "mt-3 grid gap-1"}>
+      {CHOICES.slice(0, valid).map((c, idx) => {
+        const value = Math.max(0, Math.min(1, row.fill[idx] ?? 0));
+        const active = row.suggested === c || row.detected === c;
+        return (
+          <div key={c} className="grid grid-cols-[1rem,1fr,2.5rem] items-center gap-1 text-[10px] font-bold text-slate-500">
+            <span className={active ? "text-indigo-700" : ""}>{c}</span>
+            <span className="h-1.5 overflow-hidden rounded-full bg-slate-200">
+              <span
+                className={(active ? "bg-indigo-600" : "bg-slate-400") + " block h-full rounded-full"}
+                style={{ width: `${Math.round(value * 100)}%` }}
+              />
+            </span>
+            <span className="text-right">{Math.round(value * 100)}%</span>
+          </div>
+        );
+      })}
+    </div>
   );
 }

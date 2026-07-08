@@ -60,9 +60,32 @@ describe("classifyItem", () => {
     expect(r.status).toBe("multiple");
     expect(r.detected).toBeNull();
   });
-  it("unclear: faint single mark", () => {
-    // 0.18 = between MARK_LO (0.12) and MARK_HI (0.25) → faint/ambiguous in adaptive world
-    expect(classifyItem(1, [0.18, 0.1, 0.1, 0.1], 4).status).toBe("unclear");
+  it("selected: dark marks read confidently", () => {
+    const r = classifyItem(1, [0.05, 0.88, 0.04, 0.04], 4);
+    expect(r.status).toBe("selected");
+    expect(r.detected).toBe("B");
+    expect(r.confidence).toBeGreaterThan(0.9);
+  });
+  it("selected: faint but very clearly-separated single mark is accepted", () => {
+    // 0.22 = still below the strong-shade threshold but isolated enough from
+    // the runner-up to trust.
+    const r = classifyItem(1, [0.22, 0.08, 0.08, 0.08], 4);
+    expect(r.status).toBe("selected");
+    expect(r.detected).toBe("A");
+  });
+  it("unclear: faint mark with a close runner-up stays for review", () => {
+    // top 0.18, runner-up 0.14 (gap < MARGIN) → genuinely ambiguous.
+    expect(classifyItem(1, [0.18, 0.14, 0.1, 0.1], 4).status).toBe("unclear");
+  });
+  it("unclear: faint separated mark is retained as a suggestion instead of auto-scored", () => {
+    const r = classifyItem(1, [0.18, 0.08, 0.08, 0.08], 4);
+    expect(r.status).toBe("unclear");
+    expect(r.detected).toBe("A");
+  });
+  it("unclear: erased or smudged marks do not become trusted answers", () => {
+    const r = classifyItem(1, [0.15, 0.13, 0.11, 0.1], 4);
+    expect(r.status).toBe("unclear");
+    expect(r.detected).toBe("A");
   });
   it("unclear: two marks too close to separate", () => {
     expect(classifyItem(1, [0.5, 0.46, 0.1, 0.1], 4).status).toBe("multiple");
@@ -83,6 +106,29 @@ function blankSheet(): GrayImage {
 function fillRect(g: GrayImage, x: number, y: number, w: number, h: number, v: number) {
   for (let yy = Math.floor(y); yy < y + h; yy += 1) {
     for (let xx = Math.floor(x); xx < x + w; xx += 1) {
+      (g.data as Uint8ClampedArray)[yy * g.width + xx] = v;
+    }
+  }
+}
+function fillMappedRect(
+  g: GrayImage,
+  map: (x: number, y: number) => { x: number; y: number },
+  x: number,
+  y: number,
+  w: number,
+  h: number,
+  v: number,
+) {
+  const p0 = map(x, y);
+  const p1 = map(x + w, y + h);
+  const left = Math.floor(Math.min(p0.x, p1.x));
+  const right = Math.ceil(Math.max(p0.x, p1.x));
+  const top = Math.floor(Math.min(p0.y, p1.y));
+  const bottom = Math.ceil(Math.max(p0.y, p1.y));
+  for (let yy = top; yy < bottom; yy += 1) {
+    if (yy < 0 || yy >= g.height) continue;
+    for (let xx = left; xx < right; xx += 1) {
+      if (xx < 0 || xx >= g.width) continue;
       (g.data as Uint8ClampedArray)[yy * g.width + xx] = v;
     }
   }
@@ -180,6 +226,47 @@ describe("readSheet (synthetic, already aligned)", () => {
     expect(res.items[6]).toMatchObject({ detected: "D", status: "selected" });
     expect(res.items[0].status).toBe("blank");
   });
+
+  it("ignores dark table texture and reads target-style corner markers", () => {
+    const t = buildTemplate(10);
+    const W = 1200;
+    const H = 1700;
+    const g: GrayImage = { data: new Uint8ClampedArray(W * H).fill(238), width: W, height: H };
+
+    // Dark table / cloth dots outside the sheet. The marker finder must not
+    // choose these as page corners.
+    for (let y = 20; y < H; y += 58) {
+      for (let x = 18; x < W; x += 67) fillDisc(g, x, y, 5, 25);
+    }
+
+    const s = 0.82;
+    const ox = 190;
+    const oy = 110;
+    const map = (x: number, y: number) => ({ x: ox + x * s, y: oy + y * s });
+
+    // White sheet body.
+    fillMappedRect(g, map, 0, 0, SHEET_W, SHEET_H, 255);
+
+    // Target/ring-style markers like the printed sheet.
+    t.markerRects.forEach((m) => {
+      fillMappedRect(g, map, m.x, m.y, m.w, m.h, 0);
+      fillMappedRect(g, map, m.x + 14, m.y + 14, m.w - 28, m.h - 28, 255);
+      fillMappedRect(g, map, m.x + 24, m.y + 24, m.w - 48, m.h - 48, 0);
+    });
+
+    const shadeAt = (item: number, ci: number) => {
+      const b = t.bubbles.find((x) => x.item === item && x.choiceIndex === ci)!;
+      const p = map(b.cx, b.cy);
+      fillDisc(g, p.x, p.y, b.r * s * 0.85, 0);
+    };
+    shadeAt(1, 2);
+    shadeAt(10, 2);
+
+    const res = readSheet(g, t);
+    expect(res.aligned).toBe(true);
+    expect(res.items[0]).toMatchObject({ detected: "C", status: "selected" });
+    expect(res.items[9]).toMatchObject({ detected: "C", status: "selected" });
+  });
 });
 
 // ---- review + scoring --------------------------------------------------
@@ -194,7 +281,6 @@ function mcItem(n: number, id: string): Item {
     acceptedAnswers: [],
     points: 1,
     competency: "",
-    topic: "",
     difficulty: "Average",
     cognitiveLevel: "",
     choices: 4,
@@ -223,6 +309,19 @@ describe("buildReview", () => {
     const r = buildReview(items, key, readings, { 4: "D" });
     expect(r.rawScore).toBe(3); // item 4 corrected to D (correct)
     expect(r.needsReview).toBe(false);
+  });
+
+  it("keeps low-confidence selected answers in review until confirmed", () => {
+    const r = buildReview(items, key, [
+      { item: 1, detected: "A", status: "selected", confidence: 0.55, fill: [0.2, 0.06, 0.05, 0.05] },
+      { item: 2, detected: "C", status: "selected", confidence: 0.9, fill: [0, 0, 0.7, 0] },
+      { item: 3, detected: null, status: "blank", confidence: 0.9, fill: [0, 0, 0, 0] },
+      { item: 4, detected: "D", status: "selected", confidence: 0.9, fill: [0, 0, 0, 0.7] },
+    ]);
+    expect(r.rows[0].detected).toBe("A");
+    expect(r.rows[0].needsReview).toBe(true);
+    expect(r.lowConfidenceCount).toBe(1);
+    expect(r.needsReview).toBe(true);
   });
 
   it("a correction to blank keeps the item unscored", () => {

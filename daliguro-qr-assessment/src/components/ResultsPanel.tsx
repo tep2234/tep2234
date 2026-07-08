@@ -201,14 +201,19 @@ function ResultsView({
       </div>
 
       {/* Lifecycle + summary cards */}
-      <div className="mt-4 grid grid-cols-2 gap-3 sm:grid-cols-4 lg:grid-cols-7">
-        <Stat label="Learners" value={String(state.learners.length)} />
+      <div className="mt-4 grid grid-cols-2 gap-3 sm:grid-cols-3 xl:grid-cols-6">
+        <Stat label="Total Learners" value={String(state.learners.length)} />
+        <Stat label="Scanned" value={String(allResults.filter((r) => r.source === "scan").length)} />
         <Stat label="Checked" value={String(stats.count)} />
-        <Stat label="Pending review" value={String(pending)} tone={pending > 0 ? "warn" : undefined} />
+        <Stat label="Needs Review" value={String(pending)} tone={pending > 0 ? "warn" : undefined} />
+        <Stat label="Passing Rate" value={stats.passingRate + "%"} />
+        <Stat label="Average Score" value={stats.average + "%"} />
+      </div>
+
+      <div className="mt-3 grid grid-cols-2 gap-3 sm:grid-cols-3">
         <Stat label="Finalized" value={String(finalized)} />
-        <Stat label="Class Avg" value={stats.average + "%"} />
-        <Stat label="Passing rate" value={stats.passingRate + "%"} />
         <Stat label="High / Low" value={stats.highest + " / " + stats.lowest} />
+        <Stat label="Ready to Finalize" value={String(readyToFinalize)} />
       </div>
 
       {/* Filters */}
@@ -413,7 +418,7 @@ function Stat({ label, value, tone }: { label: string; value: string; tone?: "wa
   return (
     <div
       className={
-        "rounded-xl border p-3 text-center " +
+        "rounded-2xl border p-3 text-center shadow-sm " +
         (tone === "warn" ? "border-amber-300 bg-amber-50" : "border-slate-200 bg-white")
       }
     >

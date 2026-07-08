@@ -51,7 +51,6 @@ function mcItem(n: number): Item {
     acceptedAnswers: [],
     points: 1,
     competency: "",
-    topic: "",
     difficulty: "Average",
     cognitiveLevel: "",
     choices: 4,

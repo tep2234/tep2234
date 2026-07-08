@@ -59,11 +59,17 @@ function cascadeDelete(
 }
 
 export default function SetupPanel(props: PanelProps) {
-  const { state, setState, activeId, setActiveId } = props;
+  const { state, setState, activeId, setActiveId, navigate } = props;
   const [editing, setEditing] = useState<Assessment | null>(null);
 
   function startNew() {
     setEditing(newAssessment());
+  }
+
+  // Send the teacher straight to the question importer for an assessment.
+  function goImport(id: string) {
+    setActiveId(id);
+    navigate?.("items");
   }
 
   // Load (or refresh) the shared demo. Fixed IDs => same on every device, so a
@@ -75,11 +81,13 @@ export default function SetupPanel(props: PanelProps) {
     window.alert("Demo assessment loaded and set active. It has the same IDs on every device, so its printed sheets scan anywhere.");
   }
 
-  function save(draft: Assessment) {
+  // Validate + persist a draft and make it the active assessment. Returns the
+  // saved id, or null when validation failed (so callers can chain navigation).
+  function persist(draft: Assessment): string | null {
     const title = draft.title.trim();
     if (!title) {
       window.alert("Please add an assessment title.");
-      return;
+      return null;
     }
     const cleaned: Assessment = { ...draft, title, updatedAt: Date.now() };
     setState((prev) => {
@@ -89,7 +97,19 @@ export default function SetupPanel(props: PanelProps) {
         : prev.assessments.concat(cleaned);
       return { ...prev, assessments };
     });
+    setActiveId(cleaned.id); // work on what you just saved (fixes the Items gate)
     setEditing(null);
+    return cleaned.id;
+  }
+
+  function save(draft: Assessment) {
+    persist(draft);
+  }
+
+  // Save, then jump straight to the question importer on the Items tab.
+  function saveAndImport(draft: Assessment) {
+    const id = persist(draft);
+    if (id) navigate?.("items");
   }
 
   function remove(id: string) {
@@ -112,6 +132,7 @@ export default function SetupPanel(props: PanelProps) {
         draft={editing}
         onCancel={() => setEditing(null)}
         onSave={save}
+        onSaveAndImport={saveAndImport}
       />
     );
   }
@@ -147,6 +168,7 @@ export default function SetupPanel(props: PanelProps) {
               isActive={activeId === a.id}
               onEdit={() => setEditing(a)}
               onSetActive={() => setActiveId(a.id)}
+              onImport={() => goImport(a.id)}
               onDelete={() => remove(a.id)}
             />
           ))}
@@ -164,6 +186,7 @@ function AssessmentCard({
   isActive,
   onEdit,
   onSetActive,
+  onImport,
   onDelete,
 }: {
   assessment: Assessment;
@@ -171,6 +194,7 @@ function AssessmentCard({
   isActive: boolean;
   onEdit: () => void;
   onSetActive: () => void;
+  onImport: () => void;
   onDelete: () => void;
 }) {
   const border = isActive ? "border-indigo-600 border-2" : "border-slate-200";
@@ -199,6 +223,9 @@ function AssessmentCard({
           >
             {isActive ? "✓ Active" : "Set Active"}
           </Button>
+          <Button variant="small" onClick={onImport}>
+            ⬆ Import questions
+          </Button>
           <Button variant="smallDanger" onClick={onDelete}>
             Delete
           </Button>
@@ -211,10 +238,12 @@ function AssessmentCard({
 function AssessmentEditor({
   draft,
   onSave,
+  onSaveAndImport,
   onCancel,
 }: {
   draft: Assessment;
   onSave: (a: Assessment) => void;
+  onSaveAndImport: (a: Assessment) => void;
   onCancel: () => void;
 }) {
   const [form, setForm] = useState<Assessment>(draft);
@@ -244,11 +273,12 @@ function AssessmentEditor({
         <h1 className="text-2xl font-extrabold">
           {isNew ? "New Assessment" : "Edit Assessment"}
         </h1>
-        <div className="flex gap-2">
+        <div className="flex flex-wrap gap-2">
           <Button variant="ghost" onClick={onCancel}>
             Cancel
           </Button>
-          <Button onClick={() => onSave(form)}>Save</Button>
+          <Button variant="small" onClick={() => onSave(form)}>Save</Button>
+          <Button onClick={() => onSaveAndImport(form)}>💾 Save &amp; Import Questions</Button>
         </div>
       </div>
 

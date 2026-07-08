@@ -48,6 +48,7 @@ export interface SheetReading {
 const MARK_HI = 0.25; // clearly shaded (inner 25%+ darker than surrounding paper)
 const MARK_LO = 0.12; // clearly empty (below = no mark; paper noise is 5–10%)
 const MARGIN = 0.08; // gap needed between top choice and runner-up
+const STRONG_MARGIN = 0.13; // clean separation needed for faint marks
 
 // --- grayscale ---------------------------------------------------------
 export function toGray(img: RgbaImage): GrayImage {
@@ -126,18 +127,98 @@ export function otsuThreshold(g: GrayImage): number {
   return Math.round((lo + hi) / 2);
 }
 
+interface MarkerCandidate {
+  x: number;
+  y: number;
+  area: number;
+  size: number;
+}
+
+function dist(a: Point, b: Point): number {
+  return Math.hypot(a.x - b.x, a.y - b.y);
+}
+
+function quadArea(q: Point[]): number {
+  let area = 0;
+  for (let i = 0; i < q.length; i += 1) {
+    const a = q[i];
+    const b = q[(i + 1) % q.length];
+    area += a.x * b.y - b.x * a.y;
+  }
+  return Math.abs(area) / 2;
+}
+
+function orderQuad(points: MarkerCandidate[]): MarkerCandidate[] | null {
+  const tl = points.reduce((a, b) => (b.x + b.y < a.x + a.y ? b : a));
+  const br = points.reduce((a, b) => (b.x + b.y > a.x + a.y ? b : a));
+  const tr = points.reduce((a, b) => (b.x - b.y > a.x - a.y ? b : a));
+  const bl = points.reduce((a, b) => (b.x - b.y < a.x - a.y ? b : a));
+  const ordered = [tl, tr, br, bl];
+  const uniq = new Set(ordered.map((c) => Math.round(c.x) + "," + Math.round(c.y)));
+  return uniq.size === 4 ? ordered : null;
+}
+
+function bestMarkerQuad(blobs: MarkerCandidate[], w: number, h: number): MarkerCandidate[] | null {
+  if (blobs.length < 4) return null;
+  const candidates = blobs
+    .slice()
+    .sort((a, b) => b.area - a.area)
+    .slice(0, 28);
+  let best: { quad: MarkerCandidate[]; score: number } | null = null;
+  const minSpan = Math.min(w, h) * 0.35;
+  const minPageArea = w * h * 0.08;
+
+  for (let a = 0; a < candidates.length - 3; a += 1) {
+    for (let b = a + 1; b < candidates.length - 2; b += 1) {
+      for (let c = b + 1; c < candidates.length - 1; c += 1) {
+        for (let d = c + 1; d < candidates.length; d += 1) {
+          const quad = orderQuad([candidates[a], candidates[b], candidates[c], candidates[d]]);
+          if (!quad) continue;
+          const [tl, tr, br, bl] = quad;
+          const topW = dist(tl, tr);
+          const bottomW = dist(bl, br);
+          const leftH = dist(tl, bl);
+          const rightH = dist(tr, br);
+          const pageArea = quadArea(quad);
+          if (topW < minSpan || bottomW < minSpan || leftH < minSpan || rightH < minSpan) continue;
+          if (pageArea < minPageArea) continue;
+          const areas = quad.map((p) => p.area);
+          const areaRatio = Math.max(...areas) / Math.max(1, Math.min(...areas));
+          if (areaRatio > 10) continue;
+          const avgW = (topW + bottomW) / 2;
+          const avgH = (leftH + rightH) / 2;
+          const aspect = avgH / Math.max(avgW, 1);
+          if (aspect < 0.95 || aspect > 2.2) continue;
+          const parallelBalance =
+            Math.abs(topW - bottomW) / Math.max(topW, bottomW) +
+            Math.abs(leftH - rightH) / Math.max(leftH, rightH);
+          const sizeBalance = areaRatio - 1;
+          const score = pageArea - parallelBalance * pageArea * 0.18 - sizeBalance * pageArea * 0.04;
+          if (!best || score > best.score) best = { quad, score };
+        }
+      }
+    }
+  }
+  return best?.quad ?? null;
+}
+
 // Find the 4 corner markers ANYWHERE in the frame (the sheet need not fill it).
-// Markers are the solid, square-ish, similarly-sized dark blobs; we keep all
-// such blobs then take the 4 corner-most by (x±y) extremes.
+// The phone photo can include table texture, skew, shadows, and Safari's camera
+// crop. We first collect square marker-like dark components, then choose the
+// most A4-page-like set of four instead of blindly using image extremes.
 export function findCornerMarkers(g: GrayImage): Point[] | null {
   const { width: w, height: h, data } = g;
   const n = w * h;
-  const thr = otsuThreshold(g);
+  const mean = meanGray(g);
+  const thr = Math.min(otsuThreshold(g), mean - 18);
   const visited = new Uint8Array(n);
-  const minArea = n * 0.0003;
-  const maxArea = n * 0.05;
+  const minDim = Math.min(w, h);
+  const minSide = Math.max(10, minDim * 0.025);
+  const maxSide = Math.max(minSide + 1, minDim * 0.14);
+  const minArea = minSide * minSide * 0.28;
+  const maxArea = maxSide * maxSide * 1.35;
   const stack: number[] = [];
-  const blobs: { x: number; y: number; area: number }[] = [];
+  const blobs: MarkerCandidate[] = [];
 
   for (let start = 0; start < n; start += 1) {
     if (visited[start] || data[start] >= thr) continue;
@@ -184,26 +265,19 @@ export function findCornerMarkers(g: GrayImage): Point[] | null {
         stack.push(idx + w);
       }
     }
-    if (overflow || count < minArea) continue;
+    if (overflow || count < minArea || count > maxArea) continue;
     const bw = maxx - minx + 1;
     const bh = maxy - miny + 1;
     const fill = count / (bw * bh);
     const aspect = bw / bh;
-    if (fill < 0.55 || aspect < 0.5 || aspect > 2.0) continue;
-    blobs.push({ x: sx / count, y: sy / count, area: count });
+    const side = Math.max(bw, bh);
+    if (side < minSide || side > maxSide) continue;
+    if (fill < 0.28 || aspect < 0.55 || aspect > 1.8) continue;
+    blobs.push({ x: sx / count, y: sy / count, area: count, size: side });
   }
 
-  if (blobs.length < 4) return null;
-  const tl = blobs.reduce((a, b) => (b.x + b.y < a.x + a.y ? b : a));
-  const br = blobs.reduce((a, b) => (b.x + b.y > a.x + a.y ? b : a));
-  const tr = blobs.reduce((a, b) => (b.x - b.y > a.x - a.y ? b : a));
-  const bl = blobs.reduce((a, b) => (b.x - b.y < a.x - a.y ? b : a));
-  const corners = [tl, tr, br, bl];
-  const uniq = new Set(corners.map((c) => Math.round(c.x) + "," + Math.round(c.y)));
-  if (uniq.size < 4) return null;
-  const areas = corners.map((c) => c.area);
-  if (Math.max(...areas) / Math.min(...areas) > 6) return null; // markers ~equal size
-  return corners.map((c) => ({ x: c.x, y: c.y }));
+  const corners = bestMarkerQuad(blobs, w, h);
+  return corners ? corners.map((c) => ({ x: c.x, y: c.y })) : null;
 }
 
 // --- homography (maps `from` quad -> `to` quad) -------------------------
@@ -328,7 +402,18 @@ export function classifyItem(
     const confidence = clamp01((MARK_LO - top.v) / MARK_LO + 0.35);
     return { item, detected: null, status: "blank", confidence, fill };
   }
-  // faint mark between empty and shaded — flag for teacher review.
+  // Faint mark between empty and shaded. It may be a light pencil answer, but
+  // in real phone photos faint print, shadows, and paper texture can imitate a
+  // weak fill. Keep the best guess, but route it through review unless it is
+  // unusually isolated from the runner-up.
+  if (top.v - second.v >= STRONG_MARGIN && top.v >= MARK_LO + 0.08) {
+    const confidence = clamp01(0.54 + (top.v - second.v));
+    return { item, detected: CHOICES[top.i], status: "selected", confidence, fill };
+  }
+  if (top.v - second.v >= MARGIN) {
+    const confidence = clamp01(0.36 + (top.v - second.v));
+    return { item, detected: CHOICES[top.i], status: "unclear", confidence, fill };
+  }
   return { item, detected: CHOICES[top.i], status: "unclear", confidence: 0.32, fill };
 }
 

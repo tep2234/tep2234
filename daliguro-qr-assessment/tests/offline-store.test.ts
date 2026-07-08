@@ -83,6 +83,7 @@ describe("exportBackup / importBackup", () => {
       reviewed: false,
       source: "manual",
       scanConfidence: null,
+      scanQuality: null,
       reviewStatus: "reviewed",
       finalizedAt: null,
       scanItems: null,

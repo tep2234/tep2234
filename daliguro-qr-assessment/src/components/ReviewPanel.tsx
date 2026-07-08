@@ -14,6 +14,7 @@ import { computeScores, emptyInput } from "../lib/scoring";
 import { getEvidence } from "../lib/offline-store";
 import { omrItemsOf } from "../lib/scanner/omr-template";
 import type { ItemReading } from "../lib/scanner/omr-detect";
+import { REVIEW_CONFIDENCE } from "../lib/scanner/omr-score";
 import { ActiveGate } from "./ActiveGate";
 import { ScanReviewPanel } from "./scanner/ScanReviewPanel";
 import { Button, Empty } from "./ui";
@@ -39,13 +40,13 @@ function readingsOf(result: Result): ItemReading[] {
     detected: (s.detected as ItemReading["detected"]) ?? null,
     status: s.status,
     confidence: s.confidence,
-    fill: [],
+    fill: s.fill ?? [],
   }));
 }
 
 function doubtfulCount(result: Result): number {
   return (result.scanItems ?? []).filter(
-    (s) => s.status === "unclear" || s.status === "multiple",
+    (s) => s.status === "unclear" || s.status === "multiple" || (s.status === "selected" && s.confidence < REVIEW_CONFIDENCE),
   ).length;
 }
 
@@ -156,11 +157,12 @@ function ReviewQueue({
         <div>
           <h1 className="text-2xl font-extrabold">Review Queue</h1>
           <p className="mt-1 text-slate-500">
-            {active.title} · only doubtful scans land here — everything else saved automatically.
+            {active.title} · these scans were <b>saved</b>, but some answers need confirmation because the camera
+            read a light, multiple, or unclear mark. Confirm the flagged rows — nothing was missed.
           </p>
         </div>
         <span className="rounded-full bg-amber-100 px-3 py-1 text-sm font-bold text-amber-800">
-          {pending.length} pending
+          {pending.length} need review
         </span>
       </div>
 

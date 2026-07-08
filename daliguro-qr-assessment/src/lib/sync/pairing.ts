@@ -8,6 +8,7 @@
 // can be unit-tested without a backend and the app stays offline when unused.
 
 import type { Result } from "../types";
+import { REVIEW_CONFIDENCE } from "../scanner/omr-score";
 
 export const SESSION_TTL_MS = 15 * 60 * 1000; // unpaired sessions expire in 15 min
 export const MOBILE_PATH = "/smartscan/mobile"; // /smartscan/mobile/:sessionId?t=token
@@ -59,15 +60,45 @@ export function secondsLeft(expiresAtMs: number, now = Date.now()): number {
   return Math.max(0, Math.ceil((expiresAtMs - now) / 1000));
 }
 
-// The URL encoded into the pairing QR shown on the PC.
-export function buildPairingUrl(origin: string, sessionId: string, token: string): string {
+// The URL encoded into the pairing QR shown on the PC. The assessment id is
+// carried in the URL so the phone knows which assessment it's scanning WITHOUT
+// reading the (RLS-protected) session row — i.e. without signing in. The phone
+// broadcasts scans to the authenticated PC, which persists + scores them.
+export function buildPairingUrl(origin: string, sessionId: string, token: string, assessmentId?: string): string {
   const base = origin.replace(/\/+$/, "");
-  return `${base}${MOBILE_PATH}/${encodeURIComponent(sessionId)}?t=${encodeURIComponent(token)}`;
+  const a = assessmentId ? `&a=${encodeURIComponent(assessmentId)}` : "";
+  return `${base}${MOBILE_PATH}/${encodeURIComponent(sessionId)}?t=${encodeURIComponent(token)}${a}`;
+}
+
+export function originHost(origin: string): string {
+  try {
+    return new URL(origin).hostname.toLowerCase();
+  } catch {
+    return "";
+  }
+}
+
+export function isLoopbackOrigin(origin: string): boolean {
+  const host = originHost(origin);
+  return host === "localhost" || host === "127.0.0.1" || host === "::1" || host === "[::1]" || host.endsWith(".localhost");
+}
+
+export function normalizePairingOrigin(input: string): string {
+  const trimmed = input.trim().replace(/\/+$/, "");
+  if (!trimmed) return "";
+  const withProtocol = /^https?:\/\//i.test(trimmed) ? trimmed : `http://${trimmed}`;
+  try {
+    const url = new URL(withProtocol);
+    return `${url.protocol}//${url.host}`;
+  } catch {
+    return "";
+  }
 }
 
 export interface ParsedPairing {
   sessionId: string;
   token: string;
+  assessmentId?: string;
 }
 
 // Reverse of buildPairingUrl — the phone reads the scanned/opened URL.
@@ -81,7 +112,81 @@ export function parsePairingUrl(url: string): ParsedPairing | null {
   const m = u.pathname.match(new RegExp(`${MOBILE_PATH}/([^/]+)/?$`));
   const token = u.searchParams.get("t") ?? "";
   if (!m || !token) return null;
-  return { sessionId: decodeURIComponent(m[1]), token };
+  const assessmentId = u.searchParams.get("a") ?? undefined;
+  return { sessionId: decodeURIComponent(m[1]), token, assessmentId };
+}
+
+// One raw detected item the phone reads off a sheet.
+export interface ScanDetection {
+  item: number;
+  answer: string;
+  status: string;
+  confidence: number;
+  fill?: number[];
+}
+
+// What the phone broadcasts to the PC over the live channel for each scan. The
+// token proves the sender scanned the PC's QR (the PC verifies it). No teacher
+// credentials ever leave the PC.
+export interface ScanBroadcast {
+  token: string;
+  learnerId: string;
+  version: string;
+  answerMap: Record<string, string>;
+  detected: ScanDetection[];
+  confidence: number;
+  deviceName?: string;
+}
+
+// What the PC broadcasts BACK to the phone after scoring a scan against the
+// answer key, so the phone can show the real score immediately (it has no key).
+export interface ScoreBroadcast {
+  token: string;
+  learnerId: string;
+  raw: number;
+  total: number;
+  pct: number;
+  correct: number;
+  wrong: number;
+  blank: number;
+  mastery: string;
+}
+
+// The scored result the PC computes for a scan (sent back to the phone, minus
+// the token which the sender adds).
+export type ScoredSummary = Omit<ScoreBroadcast, "token">;
+
+// Build the DB row the authenticated PC upserts from a phone's scan broadcast.
+// Mirrors the phone's old direct-write payload; final scoring happens on the PC.
+export function checkedRowFromScan(
+  b: ScanBroadcast,
+  ctx: { assessmentId: string; teacherUserId: string; schoolId?: string | null; sessionId?: string | null },
+): CheckedResultRow {
+  const low = b.detected
+    .filter((d) => d.status === "unclear" || d.status === "multiple" || (d.status === "selected" && d.confidence < REVIEW_CONFIDENCE))
+    .map((d) => d.item);
+  const conf = Number.isFinite(b.confidence) ? b.confidence : 0;
+  return {
+    assessment_id: ctx.assessmentId,
+    teacher_user_id: ctx.teacherUserId,
+    school_id: ctx.schoolId ?? null,
+    learner_id: b.learnerId,
+    learner_name: null,
+    section_name: null,
+    subject_name: null,
+    score: 0,
+    total_items: b.detected.length,
+    percentage: 0,
+    answer_map: b.answerMap,
+    item_results: b.detected,
+    qr_payload: { version: b.version },
+    scan_session_id: ctx.sessionId ?? null,
+    scan_source: "phone_camera",
+    scan_confidence: Math.round(conf * 100) / 100,
+    low_confidence_items: low,
+    corrected_by_teacher: true,
+    checked_at: new Date().toISOString(),
+  };
 }
 
 // Row payload for smartscan_checked_results (what the phone upserts). Kept in
@@ -127,7 +232,7 @@ export function checkedResultRow(result: Result, ctx: RowContext): CheckedResult
     answerMap[a.itemId] = a.response;
   });
   const lowConf = (result.scanItems ?? [])
-    .filter((s) => s.status === "unclear" || s.status === "multiple")
+    .filter((s) => s.status === "unclear" || s.status === "multiple" || (s.status === "selected" && s.confidence < REVIEW_CONFIDENCE))
     .map((s) => s.itemNumber);
   return {
     assessment_id: result.assessmentId,

@@ -4,11 +4,15 @@ import {
   assessmentMatches,
   buildPairingUrl,
   checkedResultRow,
+  checkedRowFromScan,
   expiresAt,
   generatePairingToken,
   hashToken,
+  isLoopbackOrigin,
   isExpired,
+  normalizePairingOrigin,
   parsePairingUrl,
+  type ScanBroadcast,
   secondsLeft,
   SESSION_TTL_MS,
   verifyPairingToken,
@@ -61,6 +65,70 @@ describe("pairing URL build/parse", () => {
     expect(parsePairingUrl("not a url")).toBeNull();
     expect(parsePairingUrl("https://app.example.com/other?t=x")).toBeNull();
   });
+
+  it("round-trips the assessment id when present (phone needs no DB read)", () => {
+    const url = buildPairingUrl("https://app.example.com", "sess_1", "tok_1", "A_demo");
+    expect(url).toBe("https://app.example.com/smartscan/mobile/sess_1?t=tok_1&a=A_demo");
+    expect(parsePairingUrl(url)).toEqual({ sessionId: "sess_1", token: "tok_1", assessmentId: "A_demo" });
+  });
+
+  it("detects loopback origins that a phone cannot open", () => {
+    expect(isLoopbackOrigin("http://127.0.0.1:5173")).toBe(true);
+    expect(isLoopbackOrigin("http://localhost:5173")).toBe(true);
+    expect(isLoopbackOrigin("http://192.168.1.22:5173")).toBe(false);
+    expect(isLoopbackOrigin("https://demo.trycloudflare.com")).toBe(false);
+  });
+
+  it("normalizes teacher-entered phone pairing origins", () => {
+    expect(normalizePairingOrigin("192.168.1.22:5173/")).toBe("http://192.168.1.22:5173");
+    expect(normalizePairingOrigin("https://demo.trycloudflare.com/path")).toBe("https://demo.trycloudflare.com");
+    expect(normalizePairingOrigin("")).toBe("");
+  });
+});
+
+describe("checkedRowFromScan (phone broadcast → PC DB row)", () => {
+  const scan: ScanBroadcast = {
+    token: "tok",
+    learnerId: "L1",
+    version: "A",
+    answerMap: { "1": "B", "2": "" },
+    detected: [
+      { item: 1, answer: "B", status: "selected", confidence: 0.95 },
+      { item: 2, answer: "", status: "unclear", confidence: 0.4 },
+    ],
+    confidence: 0.675,
+    deviceName: "iPhone",
+  };
+
+  it("maps a broadcast to the authenticated-PC row, flagging doubtful items", () => {
+    const row = checkedRowFromScan(scan, { assessmentId: "A1", teacherUserId: "u1", sessionId: "sess_1" });
+    expect(row.assessment_id).toBe("A1");
+    expect(row.teacher_user_id).toBe("u1");
+    expect(row.learner_id).toBe("L1");
+    expect(row.total_items).toBe(2);
+    expect(row.answer_map).toEqual({ "1": "B", "2": "" });
+    expect(row.qr_payload).toEqual({ version: "A" });
+    expect(row.scan_confidence).toBe(0.68); // rounded to 2dp
+    expect(row.low_confidence_items).toEqual([2]); // item 2 was unclear
+    expect(row.scan_session_id).toBe("sess_1");
+    expect(row.scan_source).toBe("phone_camera");
+  });
+
+  it("flags low-confidence selected answers from the phone as review items", () => {
+    const row = checkedRowFromScan(
+      {
+        ...scan,
+        answerMap: { "1": "B", "2": "C" },
+        detected: [
+          { item: 1, answer: "B", status: "selected", confidence: 0.95 },
+          { item: 2, answer: "C", status: "selected", confidence: 0.55 },
+        ],
+        confidence: 0.75,
+      },
+      { assessmentId: "A1", teacherUserId: "u1", sessionId: "sess_1" },
+    );
+    expect(row.low_confidence_items).toEqual([2]);
+  });
 });
 
 describe("assessmentMatches (wrong-sheet guard)", () => {
@@ -91,6 +159,7 @@ describe("checkedResultRow mapping", () => {
     reviewed: true,
     source: "scan",
     scanConfidence: 0.82,
+    scanQuality: 82,
     reviewStatus: "reviewed",
     finalizedAt: null,
     scanItems: [
@@ -123,5 +192,19 @@ describe("checkedResultRow mapping", () => {
     expect(row.scan_session_id).toBe("sess_1");
     expect(row.scan_source).toBe("phone_camera");
     expect(row.checked_at).toBe(new Date(200).toISOString());
+  });
+
+  it("maps low-confidence selected local scan items to the sync review list", () => {
+    const row = checkedResultRow(
+      {
+        ...result,
+        scanItems: [
+          { itemNumber: 1, detected: "B", status: "selected", confidence: 0.95 },
+          { itemNumber: 2, detected: "C", status: "selected", confidence: 0.55 },
+        ],
+      },
+      { teacherUserId: "u_1" },
+    );
+    expect(row.low_confidence_items).toEqual([2]);
   });
 });

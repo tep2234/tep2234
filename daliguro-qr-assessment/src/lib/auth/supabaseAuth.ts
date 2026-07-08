@@ -12,6 +12,23 @@ export interface MagicLinkResult {
   error?: string;
 }
 
+// Turn a Supabase auth error into a clear, actionable message. The common
+// failure in the field is the email rate limit (HTTP 429): the request looks
+// like it "sent" but no email goes out, so surface that explicitly.
+function friendlyAuthError(status: number | undefined, message: string): string {
+  const m = message.toLowerCase();
+  if (status === 429 || m.includes("rate limit") || m.includes("too many")) {
+    return "Too many email requests. Wait ~15–30 minutes, then send just one link. Tip: you only need to sign in once — it stays signed in on this browser.";
+  }
+  if (m.includes("not confirmed") || m.includes("not authorized")) {
+    return "This email isn't confirmed yet. Open the confirmation link in your inbox first, then sign in.";
+  }
+  if (m.includes("signups not allowed") || m.includes("disabled")) {
+    return "New sign-ups are disabled for this project. Use an email that already has an account.";
+  }
+  return message || "Could not send the link. Check your connection and try again.";
+}
+
 // Send a magic sign-in link to the teacher's email. `redirectTo` is where the
 // link returns (the PC dashboard origin).
 export async function sendMagicLink(email: string, redirectTo: string): Promise<MagicLinkResult> {
@@ -23,7 +40,7 @@ export async function sendMagicLink(email: string, redirectTo: string): Promise<
     email: clean,
     options: { emailRedirectTo: redirectTo },
   });
-  return error ? { ok: false, error: error.message } : { ok: true };
+  return error ? { ok: false, error: friendlyAuthError(error.status, error.message) } : { ok: true };
 }
 
 export async function signOut(): Promise<void> {

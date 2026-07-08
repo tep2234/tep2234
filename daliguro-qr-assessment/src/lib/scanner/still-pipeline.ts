@@ -4,12 +4,13 @@
 // explicit outcome the UI can route. Extracted from the scanner component so
 // it stays under test and the component stays small.
 
-import jsQR from "jsqr";
 import type { Assessment, Learner, QrAssessmentState, TestVersion } from "../types";
 import { buildTemplate, omrItemsOf } from "./omr-template";
 import { readSheet, toGray, type SheetReading } from "./omr-detect";
 import { buildReview, type ReviewSummary } from "./omr-score";
 import { resolveScanIdentity, type ScanResolution } from "./resolve";
+import { readQrSmart } from "./qr-detect";
+import { scanQuality, type ScanQuality } from "./scan-quality";
 
 export interface ScanResult {
   assessment: Assessment;
@@ -20,6 +21,7 @@ export interface ScanResult {
   source: "qr" | "manual";
   // Overall trust score for the scan (mean per-item confidence, 0..1).
   confidence: number;
+  quality: ScanQuality;
   // Compressed JPEG snapshot of the scanned frame (evidence archive).
   evidence: string | null;
 }
@@ -46,6 +48,26 @@ function meanConfidence(reading: SheetReading): number {
   return Math.round((sum / reading.items.length) * 100) / 100;
 }
 
+function tiltAngle(reading: SheetReading): number {
+  const corners = reading.corners;
+  if (!corners || corners.length < 2) return 45;
+  const [tl, tr] = corners;
+  return Math.abs(Math.atan2(tr.y - tl.y, tr.x - tl.x) * 180 / Math.PI);
+}
+
+function meanBubbleDarkness(reading: SheetReading): number {
+  const maxes = reading.items.map((item) => Math.max(...item.fill, 0));
+  return maxes.length ? maxes.reduce((sum, value) => sum + value, 0) / maxes.length : 0;
+}
+
+function shadowLevel(reading: SheetReading): number {
+  const values = reading.items.flatMap((item) => item.fill).filter((n) => Number.isFinite(n));
+  if (values.length === 0) return 100;
+  const mean = values.reduce((sum, n) => sum + n, 0) / values.length;
+  const variance = values.reduce((sum, n) => sum + (n - mean) * (n - mean), 0) / values.length;
+  return Math.round(Math.max(0, Math.min(100, Math.sqrt(variance) * 180)));
+}
+
 export function processStillImage(
   img: ImageData,
   state: QrAssessmentState,
@@ -53,8 +75,8 @@ export function processStillImage(
   manualId: string | undefined,
   evidence: string | null,
 ): StillOutcome {
-  const qr = jsQR(img.data, img.width, img.height, { inversionAttempts: "attemptBoth" });
-  if (!qr || !qr.data) {
+  const qr = readQrSmart(img, true);
+  if (!qr) {
     return {
       kind: "image",
       message: "No QR code found. Make sure the QR is fully visible, focused, and glare-free.",
@@ -126,6 +148,17 @@ export function processStillImage(
   }
   const vk = (state.answerKeys[assessment.id] ?? {})[version] ?? {};
   const summary = buildReview(ctx.items, vk, reading.items);
+  const confidence = meanConfidence(reading);
+  const quality = scanQuality({
+    confidence,
+    brightness: reading.brightness,
+    sharpness: reading.sharpness,
+    aligned: reading.aligned,
+    doubtfulItems: summary.unclearCount + summary.multipleCount + summary.lowConfidenceCount,
+    shadowLevel: shadowLevel(reading),
+    tiltAngle: tiltAngle(reading),
+    bubbleDarkness: meanBubbleDarkness(reading),
+  });
   return {
     kind: "ready",
     result: {
@@ -135,7 +168,8 @@ export function processStillImage(
       summary,
       reading,
       source: manualId ? "manual" : "qr",
-      confidence: meanConfidence(reading),
+      confidence,
+      quality,
       evidence,
     },
     // Align app context to the QR's assessment so Results/Analysis match.

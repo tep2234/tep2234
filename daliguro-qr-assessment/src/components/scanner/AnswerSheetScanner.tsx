@@ -10,7 +10,6 @@
 // teacher can batch-scan a pile of papers without touching the screen.
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import jsQR from "jsqr";
 import type { QrAssessmentState } from "../../lib/types";
 import {
   classifyMediaError,
@@ -20,6 +19,7 @@ import {
   SECURE_CONTEXT_CHECKLIST,
 } from "../../lib/camera";
 import { findCornerMarkers, toGray } from "../../lib/scanner/omr-detect";
+import { readQrSmart } from "../../lib/scanner/qr-detect";
 import { resolveScanIdentity, type ScanResolution } from "../../lib/scanner/resolve";
 import { processStillImage, type ScanResult } from "../../lib/scanner/still-pipeline";
 import { Button } from "../ui";
@@ -245,8 +245,7 @@ export function AnswerSheetScanner({
         }
       }
       if (!raw) {
-        const g = jsQR(frame.data, frame.width, frame.height, { inversionAttempts: "dontInvert" });
-        raw = g ? g.data : null;
+        raw = readQrSmart(frame, false)?.data ?? null;
       }
       const res = raw ? resolveScanIdentity(raw, state, activeId) : null;
       setLiveQr(res);

@@ -107,8 +107,6 @@ export interface Item {
   acceptedAnswers: string[];
   points: number;
   competency: string;
-  // Topic/lesson label for grouping in analysis ("" = untagged).
-  topic: string;
   difficulty: Difficulty;
   // Bloom's cognitive level ("" = untagged).
   cognitiveLevel: CognitiveLevel | "";
@@ -160,6 +158,7 @@ export interface ScanItemMeta {
   detected: string | null; // raw detected letter, before teacher corrections
   status: ScanItemStatus;
   confidence: number; // 0..1
+  fill?: number[]; // darkness/read strength per choice, A..E
 }
 
 // One entry per state change / manual edit, for score audit trails.
@@ -185,6 +184,8 @@ export interface Result {
   source: "scan" | "manual";
   // Overall scan trust score (0..1); null for manual checking.
   scanConfidence: number | null;
+  // Camera capture quality (0..100); null/undefined for old/manual results.
+  scanQuality?: number | null;
   reviewStatus: ReviewStatus;
   finalizedAt: number | null;
   // Raw detection snapshot (scanned results only).

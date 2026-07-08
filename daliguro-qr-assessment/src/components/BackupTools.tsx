@@ -95,7 +95,7 @@ export function BackupTools({
           ⬇ Export backup (JSON)
         </Button>
         <Button variant="small" onClick={() => fileRef.current?.click()}>
-          ⬆ Import / restore
+          ⬆ Restore backup (.json)
         </Button>
         <input
           ref={fileRef}

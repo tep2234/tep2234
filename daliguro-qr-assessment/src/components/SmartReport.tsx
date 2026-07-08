@@ -11,8 +11,11 @@ import { downloadCsv, safeFilename, toCsv } from "../lib/export";
 import {
   DEPED_COLOR,
   DEPED_MASTERY_ORDER,
+  DEPED_TINT,
   ERROR_BAND_ORDER,
   emptyReportMeta,
+  mpsInterpretation,
+  MPS_TARGET,
   reportCompetencies,
   reportItems,
   reportLearners,
@@ -90,6 +93,44 @@ export function SmartReport({
   }
 
   const stats = classStats(results);
+  const mps = summary.average; // Mean Percentage Score (DepEd)
+  const mastered = summary.masteryCounts.Mastered;
+  const masteredPct = summary.takers > 0 ? Math.round((mastered / summary.takers) * 100) : 0;
+  // Roster, best → worst, so mastered learners lead (highlighted).
+  const roster = useMemo(() => [...learnerRows].sort((a, b) => b.percentage - a.percentage), [learnerRows]);
+
+  // One Excel-ready CSV: MPS summary + color-coded roster + item analysis,
+  // stacked as labeled sections. Excel opens .csv directly.
+  function exportExcel() {
+    const sections = [
+      toCsv(["DALIguro — Item Analysis & Mastery Report"], []),
+      toCsv(["Assessment", active.title], []),
+      toCsv(["Subject", active.subject], []),
+      toCsv(["Grade & Section", active.gradeLevel + " - " + active.section], []),
+      toCsv(["Summary Metric", "Value"], [
+        ["MPS (Mean Percentage Score)", mps + "%"],
+        ["Interpretation", mpsInterpretation(mps)],
+        ["DepEd Mastery Target", MPS_TARGET + "%"],
+        ["Passing Rate", summary.passingRate + "%"],
+        ["Highest / Lowest", stats.highest + "% / " + stats.lowest + "%"],
+        ["No. of Items", String(summary.numItems)],
+        ["Learners / Takers", summary.totalLearners + " / " + summary.takers],
+        ["Mastered", `${mastered} (${masteredPct}%)`],
+        ["Nearly Mastered", String(summary.masteryCounts["Nearly Mastered"])],
+        ["Least Mastered", String(summary.masteryCounts["Least Mastered"])],
+        ["Not Mastered", String(summary.masteryCounts["Not Mastered"])],
+      ]),
+      toCsv(
+        ["Rank", "Learner", "LRN", "Score", "Percent", "Mastery", "Weak Competencies", "Missed Items"],
+        roster.map((l, i) => [i + 1, l.name, l.lrn, l.score, l.percentage + "%", l.mastery, l.weakCompetencies.join("; ") || "—", l.missedItems.join(" ") || "—"]),
+      ),
+      toCsv(
+        ["ItemNo", "Competency", "Correct", "Error", "PercentCorrect", "FreqOfError", "Mastery", "Difficulty", "MostWrong", "RecommendedAction"],
+        itemRows.map((r) => [r.itemNumber, r.competency, r.correct, r.errors, r.percentCorrect + "%", r.freqOfError + "%", r.mastery, r.difficulty, r.mostWrong || "—", r.recommendedAction]),
+      ),
+    ];
+    downloadCsv(sections.join("\n"), safeFilename(active.title) + "_mastery_report.csv");
+  }
 
   return (
     <section>
@@ -104,6 +145,7 @@ export function SmartReport({
           <Button variant="ghost" onClick={() => setShowForm((s) => !s)}>
             {showForm ? "Hide" : "Edit"} report header
           </Button>
+          <Button variant="ghost" onClick={exportExcel}>⬇ Excel report</Button>
           <Button variant="ghost" onClick={exportItemCsv}>⬇ Item CSV</Button>
           <Button onClick={() => window.print()}>🖨 Print report</Button>
         </div>
@@ -157,8 +199,34 @@ export function SmartReport({
           <Meta label="Date Administered" value={meta.dateAdministered || "—"} />
         </div>
 
+        {/* MPS hero — the headline DepEd metric */}
+        <div
+          className="mt-4 rounded-xl border p-3"
+          style={{
+            borderColor: mps >= MPS_TARGET ? "#16a34a" : "#d97706",
+            background: mps >= MPS_TARGET ? "#f0fdf4" : "#fffbeb",
+            printColorAdjust: "exact",
+            WebkitPrintColorAdjust: "exact",
+          }}
+        >
+          <div className="flex flex-wrap items-end justify-between gap-2">
+            <div>
+              <div className="text-[10px] font-bold uppercase tracking-wide text-slate-500">Mean Percentage Score (MPS)</div>
+              <div className="text-4xl font-black leading-none" style={{ color: mps >= MPS_TARGET ? "#15803d" : "#b45309" }}>{mps}%</div>
+            </div>
+            <div className="text-right text-[11px]">
+              <div className="font-bold text-slate-700">DepEd target: {MPS_TARGET}%</div>
+              <div className="text-slate-600">{mastered}/{summary.takers} mastered · {masteredPct}%</div>
+            </div>
+          </div>
+          <div className="mt-2 h-2.5 w-full overflow-hidden rounded bg-slate-200" style={{ printColorAdjust: "exact", WebkitPrintColorAdjust: "exact" }}>
+            <div className="h-full rounded" style={{ width: Math.min(100, mps) + "%", background: mps >= MPS_TARGET ? "#16a34a" : "#d97706", printColorAdjust: "exact", WebkitPrintColorAdjust: "exact" }} />
+          </div>
+          <div className="mt-1.5 text-[11px] font-semibold text-slate-700">{mpsInterpretation(mps)}</div>
+        </div>
+
         {/* Summary cards */}
-        <div className="mt-4 grid grid-cols-2 gap-2 sm:grid-cols-4 lg:grid-cols-6">
+        <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-4 lg:grid-cols-6">
           <Card label="Class Average" value={summary.average + "%"} />
           <Card label="Passing Rate" value={summary.passingRate + "%"} />
           <Card label="Overall Mastery" value={summary.overallMastery + "%"} sub={summary.overallMasteryLabel} />
@@ -202,7 +270,13 @@ export function SmartReport({
             </thead>
             <tbody>
               {itemRows.map((r) => (
-                <tr key={r.itemNumber} className="border-t border-slate-100 align-top">
+                <tr
+                  key={r.itemNumber}
+                  className="border-t border-slate-100 align-top"
+                  style={r.mastery === "Not Mastered" || r.mastery === "Least Mastered"
+                    ? { background: DEPED_TINT[r.mastery], printColorAdjust: "exact", WebkitPrintColorAdjust: "exact" }
+                    : undefined}
+                >
                   <td className="px-2 py-1">{r.competency}</td>
                   <td className="px-2 py-1 font-bold">{r.itemNumber}</td>
                   <td className="px-2 py-1 text-emerald-700">{r.correct}</td>
@@ -241,6 +315,47 @@ export function SmartReport({
                   <td className="px-2 py-1">{c.errorRate}%</td>
                   <td className="px-2 py-1">{c.affectedLearners}</td>
                   <td className="px-2 py-1">{c.recommendedAction}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+
+        {/* Class Mastery Roster — every learner, color-coded by mastery band */}
+        <SectionH>Class Mastery Roster</SectionH>
+        <div className="mb-2 flex flex-wrap gap-1.5 text-[10px]">
+          {DEPED_MASTERY_ORDER.map((m) => (
+            <span
+              key={m}
+              className="inline-flex items-center gap-1 rounded px-2 py-0.5 font-bold"
+              style={{ background: DEPED_TINT[m], color: DEPED_COLOR[m], printColorAdjust: "exact", WebkitPrintColorAdjust: "exact" }}
+            >
+              <span className="inline-block h-2 w-2 rounded-full" style={{ background: DEPED_COLOR[m] }} />
+              {m}: {summary.masteryCounts[m]}
+            </span>
+          ))}
+        </div>
+        <div className="overflow-x-auto">
+          <table className="w-full text-[11px]">
+            <thead>
+              <tr className="bg-slate-50 text-left text-slate-500">
+                {["#", "Learner", "LRN", "Score", "%", "Mastery"].map((h) => (
+                  <th key={h} className="px-2 py-1.5 font-bold">{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {roster.map((l, i) => (
+                <tr
+                  key={l.name + l.lrn}
+                  style={{ background: DEPED_TINT[l.mastery], borderLeft: "4px solid " + DEPED_COLOR[l.mastery], printColorAdjust: "exact", WebkitPrintColorAdjust: "exact" }}
+                >
+                  <td className="px-2 py-1 font-bold">{i + 1}</td>
+                  <td className="px-2 py-1 font-semibold">{l.name}</td>
+                  <td className="px-2 py-1">{l.lrn || "—"}</td>
+                  <td className="px-2 py-1">{l.score}</td>
+                  <td className="px-2 py-1 font-extrabold">{l.percentage}%</td>
+                  <td className="px-2 py-1 font-bold" style={{ color: DEPED_COLOR[l.mastery] }}>{l.mastery}</td>
                 </tr>
               ))}
             </tbody>

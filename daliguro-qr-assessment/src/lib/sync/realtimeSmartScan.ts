@@ -5,11 +5,69 @@
 // change/unmount to avoid leaks and duplicate events. No-ops when unconfigured.
 
 import { getSupabaseClient } from "../supabase/client";
-import type { CheckedResultRow } from "./pairing";
+import type { CheckedResultRow, ScanBroadcast, ScoreBroadcast } from "./pairing";
 import type { SessionRow } from "./smartscanSync";
 
 export type Unsubscribe = () => void;
 const NOOP: Unsubscribe = () => {};
+
+// Live pairing channel (Supabase Realtime *broadcast*). The phone joins with only
+// the anon key (no sign-in) and broadcasts each scan + a "hello"; the signed-in
+// PC listens and does the DB write. Broadcast needs no RLS/auth, which is exactly
+// why it lets the phone stay anonymous. Channel is keyed by the session id.
+export interface ScanChannel {
+  sendScan: (scan: ScanBroadcast) => Promise<boolean>;
+  sendHello: (deviceName: string, token: string) => void;
+  sendAck: (ack: ScanAckBroadcast) => void;
+  sendScore: (score: ScoreBroadcast) => void;
+  close: Unsubscribe;
+}
+
+export interface ScanAckBroadcast {
+  token: string;
+  learnerId: string;
+  status: "pc_received" | "saved";
+}
+
+interface ScanChannelHandlers {
+  onScan?: (scan: ScanBroadcast) => void;
+  onHello?: (msg: { deviceName: string; token: string }) => void;
+  onAck?: (ack: ScanAckBroadcast) => void;
+  onScore?: (score: ScoreBroadcast) => void;
+}
+
+export function joinScanChannel(sessionId: string, handlers: ScanChannelHandlers = {}): ScanChannel {
+  const sb = getSupabaseClient();
+  if (!sb) return { sendScan: async () => false, sendHello: () => {}, sendAck: () => {}, sendScore: () => {}, close: NOOP };
+  const channel = sb.channel(`smartscan-live-${sessionId}`, { config: { broadcast: { self: false } } });
+  if (handlers.onScan) {
+    channel.on("broadcast", { event: "scan" }, ({ payload }) => handlers.onScan?.(payload as ScanBroadcast));
+  }
+  if (handlers.onHello) {
+    channel.on("broadcast", { event: "hello" }, ({ payload }) => handlers.onHello?.(payload as { deviceName: string; token: string }));
+  }
+  if (handlers.onAck) {
+    channel.on("broadcast", { event: "ack" }, ({ payload }) => handlers.onAck?.(payload as ScanAckBroadcast));
+  }
+  if (handlers.onScore) {
+    channel.on("broadcast", { event: "score" }, ({ payload }) => handlers.onScore?.(payload as ScoreBroadcast));
+  }
+  channel.subscribe();
+  return {
+    sendScan: async (scan) => {
+      try {
+        const status = await channel.send({ type: "broadcast", event: "scan", payload: scan });
+        return status === "ok";
+      } catch {
+        return false;
+      }
+    },
+    sendHello: (deviceName, token) => { void channel.send({ type: "broadcast", event: "hello", payload: { deviceName, token } }); },
+    sendAck: (ack) => { void channel.send({ type: "broadcast", event: "ack", payload: ack }); },
+    sendScore: (score) => { void channel.send({ type: "broadcast", event: "score", payload: score }); },
+    close: () => { void sb.removeChannel(channel); },
+  };
+}
 
 // Fires on INSERT or UPDATE of a checked result for this teacher+assessment.
 export function subscribeCheckedResults(

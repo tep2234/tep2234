@@ -5,12 +5,16 @@ import type { Item, MasteryStatus, VersionKey } from "../types";
 import { computeScores, emptyInput } from "../scoring";
 import type { ItemReading, ItemStatus } from "./omr-detect";
 
+export const REVIEW_CONFIDENCE = 0.72;
+
 export interface ReviewRow {
   item: Item;
   itemNumber: number;
   detected: string | null; // effective letter after corrections ("" -> blank)
+  suggested: string | null; // raw scanner suggestion, even when unresolved
   status: ItemStatus;
   resolved: boolean; // teacher corrected this row
+  needsReview: boolean;
   confidence: number;
   fill: number[];
   correctAnswer: string;
@@ -30,6 +34,7 @@ export interface ReviewSummary {
   blankCount: number;
   unclearCount: number;
   multipleCount: number;
+  lowConfidenceCount: number;
   // True while any unclear/multiple row is still unresolved — blocks save.
   needsReview: boolean;
 }
@@ -68,6 +73,7 @@ export function buildReview(
   let blankCount = 0;
   let unclearCount = 0;
   let multipleCount = 0;
+  let lowConfidenceCount = 0;
   let needsReview = false;
 
   const rows: ReviewRow[] = ordered.map((item, idx) => {
@@ -76,6 +82,8 @@ export function buildReview(
     const corrected = corrections[number];
     const resolved = corrected !== undefined;
     const effective = responses[item.id] || null;
+    const confidence = reading?.confidence ?? 1;
+    const suggested = reading?.detected ?? null;
 
     let status: ItemStatus;
     if (resolved) {
@@ -83,7 +91,10 @@ export function buildReview(
     } else {
       status = reading ? reading.status : "blank";
     }
-    if (!resolved && (status === "unclear" || status === "multiple")) {
+    const rowNeedsReview =
+      !resolved &&
+      (status === "unclear" || status === "multiple" || (status === "selected" && confidence < REVIEW_CONFIDENCE));
+    if (rowNeedsReview) {
       needsReview = true;
     }
 
@@ -96,14 +107,17 @@ export function buildReview(
     else blankCount += 1;
     if (status === "unclear") unclearCount += 1;
     if (status === "multiple") multipleCount += 1;
+    if (!resolved && status === "selected" && confidence < REVIEW_CONFIDENCE) lowConfidenceCount += 1;
 
     return {
       item,
       itemNumber: number,
       detected: effective,
+      suggested,
       status,
       resolved,
-      confidence: reading?.confidence ?? 1,
+      needsReview: rowNeedsReview,
+      confidence,
       fill: reading?.fill ?? [0, 0, 0, 0],
       correctAnswer,
       isCorrect,
@@ -123,6 +137,7 @@ export function buildReview(
     blankCount,
     unclearCount,
     multipleCount,
+    lowConfidenceCount,
     needsReview,
   };
 }

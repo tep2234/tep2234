@@ -38,6 +38,8 @@ import {
   SectionTitle,
 } from "./AnalysisTables";
 import { Empty } from "./ui";
+import { difficultySummary, discriminationSummary } from "../lib/report-intel";
+import { trustedResults } from "../lib/result-trust";
 
 export default function AnalysisPanel(props: PanelProps) {
   const { state, activeId, setActiveId } = props;
@@ -61,29 +63,46 @@ function AnalysisView({
   state: QrAssessmentState;
 }) {
   const items: Item[] = state.items.filter((i) => i.assessmentId === active.id);
-  const results: Result[] = state.results.filter(
+  const allResults: Result[] = state.results.filter(
     (r) => r.assessmentId === active.id,
   );
+  const results = trustedResults(allResults);
 
   if (items.length === 0) {
     return (
-      <Wrap title="Analysis Dashboard" subtitle={active.title}>
-        <Empty text="This assessment has no items yet." />
-      </Wrap>
+      <AnalysisEmptyShell
+        active={active}
+        mps={0}
+        passingRate={0}
+        easy={0}
+        moderate={0}
+        difficult={0}
+        lowDisc={0}
+        message="This assessment has no items yet. Add items to unlock item difficulty, discrimination, and competency analysis."
+      />
     );
   }
   if (results.length === 0) {
+    const diff = difficultySummary(items, results);
+    const disc = discriminationSummary(items, results);
     return (
-      <Wrap title="Analysis Dashboard" subtitle={active.title}>
-        <Empty text="No checked results yet. Scan or check answer sheets first." />
-      </Wrap>
+      <AnalysisEmptyShell
+        active={active}
+        mps={0}
+        passingRate={0}
+        easy={diff.easy}
+        moderate={diff.moderate}
+        difficult={diff.difficult}
+        lowDisc={disc.low}
+        message="No checked results yet. Scan or check answer sheets first to generate item analysis."
+      />
     );
   }
 
   const itemRows = analyzeItems(items, results);
   const wrong = commonWrongAnswers(items, results);
   const compRows = competencyMastery(items, results);
-  const components = componentSummary(state.assessments, state.results);
+  const components = componentSummary(state.assessments, trustedResults(state.results));
   const dist = masteryDistribution(results);
   const stats = classStats(results);
 
@@ -117,7 +136,6 @@ function AnalysisView({
       "No",
       "Type",
       "Competency",
-      "Topic",
       "CognitiveLevel",
       "Points",
       "Correct",
@@ -132,7 +150,6 @@ function AnalysisView({
       r.item.itemNumber,
       r.item.type,
       r.competency,
-      r.item.topic,
       r.item.cognitiveLevel,
       r.item.points,
       r.correct,
@@ -298,20 +315,54 @@ function Stat({ label, value, hint }: { label: string; value: string; hint?: str
   );
 }
 
-function Wrap({
-  title,
-  subtitle,
-  children,
+function AnalysisEmptyShell({
+  active,
+  mps,
+  passingRate,
+  easy,
+  moderate,
+  difficult,
+  lowDisc,
+  message,
 }: {
-  title: string;
-  subtitle: string;
-  children: React.ReactNode;
+  active: Assessment;
+  mps: number;
+  passingRate: number;
+  easy: number;
+  moderate: number;
+  difficult: number;
+  lowDisc: number;
+  message: string;
 }) {
   return (
     <section>
-      <h1 className="text-2xl font-extrabold">{title}</h1>
-      <p className="mt-1 text-slate-500">{subtitle}</p>
-      {children}
+      <h1 className="text-2xl font-black text-slate-950">Analysis — {active.title}</h1>
+      <p className="mt-1 text-slate-500">{active.subject} · item analysis and class performance intelligence</p>
+      <div className="mt-4 grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-6">
+        <Stat label="MPS" value={mps + "%"} />
+        <Stat label="Passing Rate" value={passingRate + "%"} />
+        <Stat label="Difficult Items" value={String(difficult)} />
+        <Stat label="Easy Items" value={String(easy)} />
+        <Stat label="Moderate Items" value={String(moderate)} />
+        <Stat label="Low Discrimination" value={String(lowDisc)} />
+      </div>
+      <div className="mt-4 grid gap-4 xl:grid-cols-2">
+        <EmptyPanel title="Item Difficulty Chart" text={message} />
+        <EmptyPanel title="Class Performance Distribution" text="MPS distribution will appear after the first checked learner result." />
+        <EmptyPanel title="Most Missed Items" text="No missed item pattern is available yet." />
+        <EmptyPanel title="Competency Breakdown" text="Competency performance will use your existing item tags once results are checked." />
+      </div>
     </section>
+  );
+}
+
+function EmptyPanel({ title, text }: { title: string; text: string }) {
+  return (
+    <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+      <div className="text-lg font-black text-slate-950">{title}</div>
+      <div className="mt-3 rounded-xl border border-dashed border-slate-300 bg-slate-50 p-5 text-sm text-slate-500">
+        {text}
+      </div>
+    </div>
   );
 }

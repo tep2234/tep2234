@@ -14,10 +14,10 @@ import type {
   TestVersion,
   VersionKey,
 } from "./types";
-import { COGNITIVE_LEVELS, DIFFICULTIES, ITEM_TYPES } from "./types";
+import { COGNITIVE_LEVELS, DIFFICULTIES } from "./types";
 import { isManual, isObjective, LETTERS, usesAcceptedAnswers } from "./items";
 import { uid } from "./ids";
-import { parseItemsCsv, type ParsedItem } from "./items-csv";
+import { parseItemsCsv, resolveItemType, type ParsedItem } from "./items-csv";
 import { MAX_ITEMS } from "./scanner/omr-template";
 
 // ---- Row + status model ------------------------------------
@@ -41,7 +41,6 @@ export interface ImportRow {
   choices: number;
   points: number;
   competency: string;
-  topic: string;
   difficulty: Difficulty;
   cognitiveLevel: CognitiveLevel | "";
   correctAnswer: string;
@@ -63,6 +62,9 @@ export interface ImportSummary {
   review: number;
   manual: number;
   errors: number;
+  scannable: number;
+  manualScoring: number;
+  rejected: number;
   skippedNumbers: number[];
   duplicateNumbers: number[];
   parseErrors: string[];
@@ -75,7 +77,7 @@ export interface ImportContext {
   sheetLimit?: number; // OMR item cap (default MAX_ITEMS)
 }
 
-const norm = (s: string): string => s.toLowerCase().replace(/[\s_]+/g, "");
+const norm = (s: string): string => s.toLowerCase().replace(/[^a-z0-9]/g, "");
 
 // ---- Format sniffing ---------------------------------------
 
@@ -86,7 +88,11 @@ export function looksLikeCsv(text: string): boolean {
   if (!/[,\t]/.test(first)) return false;
   const cells = first.split(/[,\t]/).map((c) => norm(c.trim()));
   return cells.some((c) =>
-    ["question", "stem", "itemtype", "type", "correctanswer", "answer"].includes(c),
+    [
+      "question", "questions", "questiontext", "stem",
+      "itemtype", "type", "questiontype", "testtype",
+      "correctanswer", "answer", "answerkey", "key",
+    ].includes(c),
   );
 }
 
@@ -103,34 +109,94 @@ function matchEnum<T extends string>(raw: string, values: readonly T[]): T | "" 
   return values.find((v) => norm(v) === n) ?? "";
 }
 
-const CHOICE_LINE = /^\s*([A-Ea-e])[.)]\s+(.*\S)\s*$/;
-const NUM_LINE = /^\s*(\d{1,3})[.)]\s+(.*\S)\s*$/;
-const FIELD_LINE = /^\s*([A-Za-z ]+?)\s*[:=]\s*(.+?)\s*$/;
+const CHOICE_LINE = /^\s*(?:\(([A-Ea-e])\)|([A-Ea-e])\s*[.)-])\s+(.*\S)\s*$/;
+const NUM_LINE = /^\s*(?:(?:item|question|q|no)\.?\s*)?(\d{1,3})[.)-]?\s+(.*\S)\s*$/i;
+// Field labels may carry a trailing/inner dot or slash ("Cog.:", "Diff.:",
+// "Cognitive Level:"). norm() strips those to a clean token afterwards.
+const FIELD_LINE = /^\s*([A-Za-z][A-Za-z ./]*?)\s*[:=]\s*(.+?)\s*$/;
 
 function detectType(explicit: string, choiceCount: number, answer: string): ItemType {
-  const t = matchEnum(explicit, ITEM_TYPES);
+  const t = resolveItemType(explicit);
   if (t) return t;
   const a = answer.trim().toLowerCase();
   if (a === "true" || a === "false" || a === "t" || a === "f") return "True or False";
   if (choiceCount >= 2) return "Multiple Choice";
+  if (/\b(sequence|arrange|order|rank)\b/i.test(explicit)) return "Sequencing";
+  if (/\b(explain|discuss|justify|describe|essay)\b/i.test(explicit)) return "Essay";
   if (answer.includes(",")) return "Enumeration";
   if (answer) return "Identification";
   return "Essay";
 }
 
+// A standalone line naming a test section, e.g. "Multiple Choice",
+// "Part II. True or False", "Test A: Identification". Returns the type it
+// implies, or "" when the line is a stem/choice/field or just prose.
+function sectionHeading(line: string): ItemType | "" {
+  const trimmed = line.trim();
+  if (!trimmed || NUM_LINE.test(line) || CHOICE_LINE.test(line)) return "";
+  const cleaned = trimmed
+    .replace(/^(?:part|section|test)\b[^:.]*[:.]?\s*/i, "")
+    .replace(/^[ivxlcdm0-9]+[.):]\s*/i, "")
+    .replace(/[:.]\s*$/, "")
+    .trim();
+  return resolveItemType(cleaned);
+}
+
+// Split options that share one line, e.g. "A. Paris  B. Rome  C. Lima".
+// Only fires when the line starts with an option marker and has 2+ markers,
+// so single-choice-per-line text still falls through to CHOICE_LINE.
+function splitInlineChoices(line: string): string[] | null {
+  const trimmed = line.trim();
+  if (!/^\(?[A-Ea-e][.)]/.test(trimmed)) return null;
+  const marker = /(?:\(([A-Ea-e])\)|([A-Ea-e])[.)])\s+/g;
+  const starts: number[] = [];
+  const ends: number[] = [];
+  let m: RegExpExecArray | null;
+  while ((m = marker.exec(trimmed))) {
+    starts.push(m.index);
+    ends.push(marker.lastIndex);
+  }
+  if (starts.length < 2) return null;
+  const texts: string[] = [];
+  for (let i = 0; i < starts.length; i += 1) {
+    const stop = i + 1 < starts.length ? starts[i + 1] : trimmed.length;
+    const text = trimmed.slice(ends[i], stop).trim();
+    if (text) texts.push(text);
+  }
+  return texts.length >= 2 ? texts : null;
+}
+
+const ANSWER_KEYS = ["answer", "correctanswer", "key", "answerkey", "ans", "correct", "correctresponse"];
+
 export function parseStructuredText(text: string): ParsedItem[] {
   const lines = text.split(/\r?\n/);
-  const blocks: string[][] = [];
+  const blocks: { lines: string[]; section: ItemType | "" }[] = [];
   let cur: string[] = [];
+  let currentSection: ItemType | "" = "";
+  const flush = () => {
+    if (cur.length) blocks.push({ lines: cur, section: currentSection });
+    cur = [];
+  };
   for (const line of lines) {
+    const sec = sectionHeading(line);
+    if (sec) {
+      flush();
+      currentSection = sec;
+      continue;
+    }
+    const startsNew = NUM_LINE.test(line) && cur.length > 0;
+    if (startsNew) {
+      flush();
+      cur = [line];
+      continue;
+    }
     if (line.trim() === "") {
-      if (cur.length) blocks.push(cur);
-      cur = [];
+      flush();
     } else {
       cur.push(line);
     }
   }
-  if (cur.length) blocks.push(cur);
+  flush();
 
   const items: ParsedItem[] = [];
   blocks.forEach((block, bi) => {
@@ -139,28 +205,43 @@ export function parseStructuredText(text: string): ParsedItem[] {
     const choiceTexts: string[] = [];
     const fields: Record<string, string> = {};
     let answer = "";
+    let inferredType = "";
 
-    block.forEach((raw) => {
+    block.lines.forEach((raw) => {
       const num = NUM_LINE.exec(raw);
-      const ch = CHOICE_LINE.exec(raw);
-      const fl = FIELD_LINE.exec(raw);
       if (num && question === "") {
         itemNumber = Number(num[1]);
         question = num[2];
-      } else if (ch) {
-        choiceTexts.push(ch[2]);
-      } else if (fl) {
-        const kf = norm(fl[1]);
-        if (["answer", "correctanswer", "key"].includes(kf)) answer = fl[2].trim();
-        else fields[kf] = fl[2].trim();
-      } else if (question === "") {
-        question = raw.trim();
+        return;
       }
+      const inline = question !== "" ? splitInlineChoices(raw) : null;
+      if (inline) {
+        choiceTexts.push(...inline);
+        return;
+      }
+      const ch = CHOICE_LINE.exec(raw);
+      if (ch) {
+        choiceTexts.push(ch[3]);
+        return;
+      }
+      const fl = FIELD_LINE.exec(raw);
+      if (fl) {
+        const kf = norm(fl[1]);
+        if (ANSWER_KEYS.includes(kf)) answer = fl[2].trim();
+        else if (kf === "rubric") {
+          fields["explanation"] = fl[2].trim();
+          inferredType = inferredType || "Essay";
+        } else fields[kf] = fl[2].trim();
+        return;
+      }
+      if (question === "") question = raw.trim();
+      else question += " " + raw.trim();
     });
 
     if (!question && choiceTexts.length === 0) return; // not an item block
 
-    const explicitType = fields["type"] ?? fields["itemtype"] ?? "";
+    const explicitType =
+      (fields["type"] ?? fields["itemtype"] ?? inferredType) || block.section || question;
     const type = detectType(explicitType, choiceTexts.length, answer);
     const choices = Math.max(2, Math.min(choiceTexts.length || 4, LETTERS.length));
     const answers: Partial<Record<TestVersion, string>> = {};
@@ -180,16 +261,21 @@ export function parseStructuredText(text: string): ParsedItem[] {
       type,
       question,
       choices,
-      points: Number(fields["points"]) > 0 ? Number(fields["points"]) : 1,
-      competency: fields["competency"] ?? fields["comp"] ?? "",
-      topic: fields["topic"] ?? fields["lesson"] ?? "",
-      difficulty: (matchEnum(fields["difficulty"] ?? "", DIFFICULTIES) || "Average") as Difficulty,
+      points:
+        Number(fields["points"] ?? fields["pts"] ?? fields["score"]) > 0
+          ? Number(fields["points"] ?? fields["pts"] ?? fields["score"])
+          : 1,
+      competency:
+        fields["competency"] ?? fields["comp"] ?? fields["melc"] ?? fields["objective"] ?? "",
+      difficulty: (matchEnum(fields["difficulty"] ?? fields["diff"] ?? "", DIFFICULTIES) ||
+        "Average") as Difficulty,
       cognitiveLevel: matchEnum(
-        fields["cognitivelevel"] ?? fields["cognitive"] ?? fields["bloom"] ?? "",
+        fields["cognitivelevel"] ?? fields["cognitive"] ?? fields["cog"] ?? fields["bloom"] ?? "",
         COGNITIVE_LEVELS,
       ),
       correctAnswer: isObjective(type) ? "" : answer,
       acceptedAnswers,
+      explanation: fields["explanation"] ?? fields["rationale"] ?? "",
       answers,
     });
   });
@@ -306,12 +392,11 @@ function assessRow(
     choices: base.choices,
     points: base.points,
     competency: base.competency,
-    topic: base.topic,
     difficulty: base.difficulty,
     cognitiveLevel: base.cognitiveLevel,
     correctAnswer: base.correctAnswer,
     acceptedAnswers: base.acceptedAnswers,
-    explanation: "",
+    explanation: base.explanation ?? "",
     manualCheck,
     answers: base.answers,
     issues,
@@ -344,6 +429,9 @@ export function importTest(text: string, ctx: ImportContext): ImportSummary {
     review: rows.filter((r) => r.status === "review").length,
     manual: rows.filter((r) => r.status === "manual").length,
     errors: rows.filter((r) => r.status === "error").length,
+    scannable: rows.filter((r) => isObjective(r.type) && r.status !== "error").length,
+    manualScoring: rows.filter((r) => !isObjective(r.type) && r.status !== "error").length,
+    rejected: rows.filter((r) => r.status === "error").length,
     skippedNumbers,
     duplicateNumbers,
     parseErrors,
@@ -389,7 +477,6 @@ export function buildImport(
       acceptedAnswers: r.acceptedAnswers,
       points: r.points,
       competency: r.competency,
-      topic: r.topic,
       difficulty: r.difficulty,
       cognitiveLevel: r.cognitiveLevel,
       choices: r.choices,
@@ -408,11 +495,11 @@ export function revalidateRow(row: ImportRow, ctx: ImportContext, otherNumbers: 
     choices: row.choices,
     points: row.points,
     competency: row.competency,
-    topic: row.topic,
     difficulty: row.difficulty,
     cognitiveLevel: row.cognitiveLevel,
     correctAnswer: row.correctAnswer,
     acceptedAnswers: row.acceptedAnswers,
+    explanation: row.explanation,
     answers: row.answers,
   };
   const seen = new Set(otherNumbers);
