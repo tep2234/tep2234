@@ -110,6 +110,9 @@ export default function SmartScanMobilePage() {
   const [params] = useSearchParams();
   const token = params.get("t") ?? "";
   const assessmentId = params.get("a") ?? "";
+  // Field-test override: append &engine=sync to the pairing URL to force the
+  // main-thread fallback pipeline, so testers can verify both paths.
+  const forceSyncEngine = params.get("engine") === "sync";
   const configured = isSupabaseConfigured();
 
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -124,7 +127,8 @@ export default function SmartScanMobilePage() {
   const lastAnalyzeRef = useRef(0);
   const cooldownUntilRef = useRef(0);
   const workerRef = useRef<Worker | null>(null);
-  const workerFailedRef = useRef(false);
+  const workerFailedRef = useRef(forceSyncEngine);
+  const lastEngineRef = useRef<"worker" | "fallback">(forceSyncEngine ? "fallback" : "worker");
   const workerReqIdRef = useRef(0);
   const workerPendingRef = useRef(new Map<number, (a: FrameAnalysis) => void>());
   const submittingRef = useRef(false);
@@ -139,6 +143,7 @@ export default function SmartScanMobilePage() {
   const [syncState, setSyncState] = useState<SyncState>("idle");
   const [torchAvailable, setTorchAvailable] = useState(false);
   const [torchOn, setTorchOn] = useState(false);
+  const [engineInfo, setEngineInfo] = useState<{ engine: "worker" | "fallback"; ms: number } | null>(null);
   const [sentCount, setSentCount] = useState(0);
   const [lastSent, setLastSent] = useState("");
   const [lastScore, setLastScore] = useState<ScoreBroadcast | null>(null);
@@ -226,8 +231,10 @@ export default function SmartScanMobilePage() {
   const analyzeAsync = useCallback(
     (img: ImageData, qrText: string | null, thoroughQr: boolean): Promise<FrameAnalysis> => {
       if (workerFailedRef.current) {
+        lastEngineRef.current = "fallback";
         return Promise.resolve(analyzeFrameData(img, assessmentId, qrText, thoroughQr));
       }
+      lastEngineRef.current = "worker";
       try {
         if (!workerRef.current) {
           const w = new Worker(new URL("../lib/scanner/omr-frame-worker.ts", import.meta.url), { type: "module" });
@@ -271,6 +278,7 @@ export default function SmartScanMobilePage() {
         });
       } catch {
         workerFailedRef.current = true;
+        lastEngineRef.current = "fallback";
         return Promise.resolve(analyzeFrameData(img, assessmentId, qrText, thoroughQr));
       }
     },
@@ -365,7 +373,9 @@ export default function SmartScanMobilePage() {
         const cached = qrCacheRef.current;
         if (cached && now < cached.expires) qrText = cached.text;
       }
+      const t0 = performance.now();
       const analysis = await analyzeAsync(frame, qrText, false);
+      setEngineInfo({ engine: lastEngineRef.current, ms: Math.round(performance.now() - t0) });
       const result = analysis.result;
       // Refresh the sticky cache only on GENUINE decodes: a native hit, or a
       // fresh jsQR decode inside the worker (qrText echoed back when we sent
@@ -587,6 +597,11 @@ export default function SmartScanMobilePage() {
                 <div>
                   <div className="text-sm font-extrabold">Live SmartScan</div>
                   <div className="text-xs text-slate-500">Averages {CONSENSUS_FRAMES} steady reads for a trusted result, then auto-submits clean sheets.</div>
+                  {engineInfo ? (
+                    <div className={"mt-0.5 text-[10px] font-bold " + (engineInfo.engine === "worker" ? "text-emerald-600" : "text-amber-600")}>
+                      Engine: {engineInfo.engine === "worker" ? "worker ✓" : "main-thread fallback"} · {engineInfo.ms}ms/frame
+                    </div>
+                  ) : null}
                 </div>
                 <span className="rounded-full bg-emerald-100 px-2 py-1 text-[11px] font-extrabold text-emerald-700">
                   PC paired
