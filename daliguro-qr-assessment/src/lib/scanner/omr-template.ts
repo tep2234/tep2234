@@ -116,10 +116,10 @@ export const MARKER_HOLE = MARK_HOLE;
 // Fills the QR panel width (v2 payload carries checksum + item count, so the
 // printed code is denser — a bigger printed QR keeps modules readable when the
 // whole sheet is photographed). Renderer + e2e test both derive from this.
-export const QR_ZONE: Rect = { x: 74, y: 140, w: 194, h: 194 };
+export const QR_ZONE: Rect = { x: 77, y: 134, w: 210, h: 210 };
 
 // Header layout boxes (renderer-only; no machine reads inside these).
-export const QR_PANEL: Rect = { x: 64, y: 112, w: 216, h: 236 };
+export const QR_PANEL: Rect = { x: 70, y: 112, w: 224, h: 246 };
 export const INFO_PANEL: Rect = { x: 300, y: 112, w: 400, h: 236 };
 export const META_PANEL: Rect = { x: 716, y: 112, w: 220, h: 236 };
 export const VERSION_PANEL: Rect = { x: 64, y: 366, w: 216, h: 92 };

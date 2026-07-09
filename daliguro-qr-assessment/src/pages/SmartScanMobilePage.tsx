@@ -93,13 +93,9 @@ function readingBubbleDarkness(reading: SheetReading): number {
   return maxes.length ? maxes.reduce((sum, value) => sum + value, 0) / maxes.length : 0;
 }
 
-function analyzeFrame(img: ImageData, assessmentId: string): FrameResult {
+function analyzeDecodedFrame(img: ImageData, assessmentId: string, qrText: string): FrameResult {
   const brightness = quickBrightness(img.data);
-  const qr = readQrSmart(img, true);
-  if (!qr) {
-    return { scan: null, status: "searching", qrVisible: false, markersVisible: false, brightness, aligned: false, message: "Find the sheet QR" };
-  }
-  const decoded = decodeQrPayload(qr.data);
+  const decoded = decodeQrPayload(qrText);
   if (!decoded.ok) {
     return { scan: null, status: "qr_error", qrVisible: true, markersVisible: false, brightness, aligned: false, message: decoded.reason };
   }
@@ -155,6 +151,27 @@ function analyzeFrame(img: ImageData, assessmentId: string): FrameResult {
     aligned: true,
     message: hasDoubt ? "Needs confirmation" : "Hold steady",
   };
+}
+
+function analyzeFrame(img: ImageData, assessmentId: string): FrameResult {
+  const brightness = quickBrightness(img.data);
+  const qr = readQrSmart(img, true);
+  if (!qr) {
+    return { scan: null, status: "searching", qrVisible: false, markersVisible: false, brightness, aligned: false, message: "Find the sheet QR" };
+  }
+  return analyzeDecodedFrame(img, assessmentId, qr.data);
+}
+
+async function readNativeQr(source: CanvasImageSource): Promise<string | null> {
+  const Detector = (window as unknown as { BarcodeDetector?: new (options?: { formats?: string[] }) => { detect: (source: CanvasImageSource) => Promise<Array<{ rawValue?: string }>> } }).BarcodeDetector;
+  if (!Detector) return null;
+  try {
+    const detector = new Detector({ formats: ["qr_code"] });
+    const hits = await detector.detect(source);
+    return hits.find((hit) => typeof hit.rawValue === "string" && hit.rawValue.trim())?.rawValue ?? null;
+  } catch {
+    return null;
+  }
 }
 
 export default function SmartScanMobilePage() {
@@ -379,25 +396,27 @@ export default function SmartScanMobilePage() {
     setError("");
     setLastScore(null);
     const im = new Image();
-    im.onload = () => {
+    im.onload = async () => {
       const canvas = canvasRef.current;
       const ctx = canvas?.getContext("2d", { willReadFrequently: true });
       if (!canvas || !ctx) {
         setBusy(false);
         return;
       }
-      const decodeAt = (maxW: number) => {
+      const decodeAt = async (maxW: number) => {
         const scale = Math.min(1, maxW / im.naturalWidth);
         canvas.width = Math.round(im.naturalWidth * scale);
         canvas.height = Math.round(im.naturalHeight * scale);
         ctx.drawImage(im, 0, 0, canvas.width, canvas.height);
         const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        const nativeQr = await readNativeQr(canvas);
+        if (nativeQr) return analyzeDecodedFrame(img, assessmentId, nativeQr);
         return analyzeFrame(img, assessmentId);
       };
-      let result = decodeAt(3200);
+      let result = await decodeAt(3200);
       for (const maxW of [2600, 2000, 1600, 1100]) {
         if (result.scan || result.status !== "searching") break;
-        result = decodeAt(maxW);
+        result = await decodeAt(maxW);
       }
       URL.revokeObjectURL(im.src);
       setLastFrame(result);
