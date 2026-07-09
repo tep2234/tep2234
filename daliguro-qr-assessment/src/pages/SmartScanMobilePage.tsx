@@ -394,8 +394,11 @@ export default function SmartScanMobilePage() {
         const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
         return analyzeFrame(img, assessmentId);
       };
-      let result = decodeAt(2600);
-      if (!result.scan && result.status === "searching") result = decodeAt(1600);
+      let result = decodeAt(3200);
+      for (const maxW of [2600, 2000, 1600, 1100]) {
+        if (result.scan || result.status !== "searching") break;
+        result = decodeAt(maxW);
+      }
       URL.revokeObjectURL(im.src);
       setLastFrame(result);
       setBusy(false);

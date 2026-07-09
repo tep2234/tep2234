@@ -20,6 +20,10 @@ function emptyForm(): LearnerForm {
   return { lrn: "", fullName: "", sex: "M", gradeLevel: "11", section: "" };
 }
 
+function isBrokenHeaderlessImport(l: Learner): boolean {
+  return l.lrn.trim() === "" && /^\d{6,}$/.test(l.fullName.trim());
+}
+
 // Split a CSV line, tolerating simple quoted fields.
 function splitCsvLine(line: string): string[] {
   const out: string[] = [];
@@ -40,10 +44,12 @@ function splitCsvLine(line: string): string[] {
   return out.map((s) => s.trim());
 }
 
-// Parse CSV text into learners. Header: LRN, Full Name, Sex, Grade Level, Section.
+// Parse CSV text into learners. Accepts either:
+//   LRN, Full Name, Sex, Grade Level, Section
+//   123456789012,Dela Cruz Juan,M,11,STEM-A
 function parseLearnersCsv(text: string): Learner[] {
   const lines = text.split(/\r?\n/).filter((l) => l.trim().length > 0);
-  if (lines.length < 2) return [];
+  if (lines.length === 0) return [];
 
   const header = splitCsvLine(lines[0]).map((h) => h.toLowerCase());
   function indexOfAny(names: string[]): number {
@@ -54,16 +60,21 @@ function parseLearnersCsv(text: string): Learner[] {
     return -1;
   }
 
-  const iLrn = indexOfAny(["lrn"]);
-  const iName = indexOfAny(["full name", "name", "fullname"]);
-  const iSex = indexOfAny(["sex"]);
-  const iGrade = indexOfAny(["grade level", "grade"]);
-  const iSection = indexOfAny(["section"]);
+  const hasHeader =
+    indexOfAny(["lrn"]) >= 0 &&
+    indexOfAny(["full name", "name", "fullname"]) >= 0;
+
+  const iLrn = hasHeader ? indexOfAny(["lrn"]) : 0;
+  const iName = hasHeader ? indexOfAny(["full name", "name", "fullname"]) : 1;
+  const iSex = hasHeader ? indexOfAny(["sex"]) : 2;
+  const iGrade = hasHeader ? indexOfAny(["grade level", "grade"]) : 3;
+  const iSection = hasHeader ? indexOfAny(["section"]) : 4;
+  const firstDataRow = hasHeader ? 1 : 0;
 
   const learners: Learner[] = [];
-  for (let r = 1; r < lines.length; r += 1) {
+  for (let r = firstDataRow; r < lines.length; r += 1) {
     const cols = splitCsvLine(lines[r]);
-    const fullName = iName >= 0 ? cols[iName] ?? "" : cols[0] ?? "";
+    const fullName = iName >= 0 ? cols[iName] ?? "" : "";
     if (!fullName) continue;
     const sexRaw = iSex >= 0 ? (cols[iSex] ?? "M").toUpperCase() : "M";
     learners.push({
@@ -118,12 +129,21 @@ export default function LearnersPanel(props: PanelProps) {
   function importText(text: string) {
     const parsed = parseLearnersCsv(text);
     if (parsed.length === 0) {
-      window.alert("No learners found. Expected header: LRN, Full Name, Sex, Grade Level, Section");
+      window.alert("No learners found. Expected columns: LRN, Full Name, Sex, Grade Level, Section");
       return;
     }
-    setState((prev) => ({ ...prev, learners: prev.learners.concat(parsed) }));
+    const brokenCount = state.learners.filter(isBrokenHeaderlessImport).length;
+    setState((prev) => ({
+      ...prev,
+      learners: prev.learners.filter((l) => !isBrokenHeaderlessImport(l)).concat(parsed),
+    }));
     setCsvText("");
-    window.alert("Imported " + parsed.length + " learner(s).");
+    window.alert(
+      "Imported " +
+        parsed.length +
+        " learner(s)." +
+        (brokenCount > 0 ? "\n\nRemoved " + brokenCount + " incorrectly imported old row(s)." : ""),
+    );
   }
 
   function onFile(e: React.ChangeEvent<HTMLInputElement>) {
@@ -152,6 +172,36 @@ export default function LearnersPanel(props: PanelProps) {
     }));
   }
 
+  function clearAllLearners() {
+    if (state.learners.length === 0) return;
+
+    const learnerIds = new Set(state.learners.map((l) => l.id));
+    const resultCount = state.results.filter((r) => learnerIds.has(r.learnerId)).length;
+    const warning =
+      "Clear all " +
+      state.learners.length +
+      " learner(s)?" +
+      (resultCount > 0
+        ? `\n\n${resultCount} saved result(s) reference these learners and will show "(unknown learner)".`
+        : "");
+
+    if (!window.confirm(warning)) return;
+    setState((prev) => ({ ...prev, learners: [] }));
+    setQuery("");
+  }
+
+  function clearBrokenLearners() {
+    const brokenCount = state.learners.filter(isBrokenHeaderlessImport).length;
+    if (brokenCount === 0) return;
+    if (!window.confirm("Remove " + brokenCount + " incorrectly imported learner row(s)?")) return;
+    setState((prev) => ({
+      ...prev,
+      learners: prev.learners.filter((l) => !isBrokenHeaderlessImport(l)),
+    }));
+    setQuery("");
+  }
+
+  const brokenLearnerCount = state.learners.filter(isBrokenHeaderlessImport).length;
   const visible = state.learners.filter((l) =>
     l.fullName.toLowerCase().includes(query.toLowerCase()),
   );
@@ -162,9 +212,19 @@ export default function LearnersPanel(props: PanelProps) {
         <h1 className="text-2xl font-extrabold">
           Learner Manager ({state.learners.length})
         </h1>
-        <Button variant="ghost" onClick={() => fileRef.current?.click()}>
-          ⬆ Import CSV file
-        </Button>
+        <div className="flex flex-wrap items-center gap-2">
+          <Button
+            variant="danger"
+            onClick={clearAllLearners}
+            disabled={state.learners.length === 0}
+            className="disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            Clear All
+          </Button>
+          <Button variant="ghost" onClick={() => fileRef.current?.click()}>
+            ⬆ Import CSV file
+          </Button>
+        </div>
         <input
           ref={fileRef}
           type="file"
@@ -176,6 +236,17 @@ export default function LearnersPanel(props: PanelProps) {
       <p className="mt-1 text-xs text-slate-500">
         CSV header: LRN, Full Name, Sex, Grade Level, Section
       </p>
+
+      {brokenLearnerCount > 0 ? (
+        <div className="mt-3 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-red-200 bg-red-50 p-3 text-sm text-red-800">
+          <span className="font-semibold">
+            {brokenLearnerCount} old imported row(s) have the LRN saved as the name.
+          </span>
+          <Button variant="smallDanger" onClick={clearBrokenLearners}>
+            Clear bad rows
+          </Button>
+        </div>
+      ) : null}
 
       {/* Manual add */}
       <div className="mt-4 grid grid-cols-2 items-end gap-2 rounded-xl border border-slate-200 bg-white p-4 sm:grid-cols-6">

@@ -1,6 +1,9 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
+import { useLocation, useNavigate } from "react-router-dom";
 import { useQrStore } from "./lib/useQrStore";
 import type { PanelProps } from "./components/panel-types";
+import type { Assessment, Learner, QrAssessmentState } from "./lib/types";
+import { downloadCsv, safeFilename, toCsv } from "./lib/export";
 import SetupPanel from "./components/SetupPanel";
 import ItemsPanel from "./components/ItemsPanel";
 import LearnersPanel from "./components/LearnersPanel";
@@ -80,10 +83,69 @@ const PAGE_META: Record<TabId, { title: string; crumb: string }> = {
   settings: { title: "Assessment Settings", crumb: "System · Settings" },
 };
 
+const TAB_ROUTES: Record<TabId, string> = {
+  overview: "/",
+  setup: "/setup",
+  items: "/items",
+  learners: "/learners",
+  sheets: "/sheets",
+  smartscan: "/smartscan",
+  review: "/review",
+  results: "/results",
+  analysis: "/analysis",
+  "item-analysis": "/item-analysis",
+  remediation: "/remediation",
+  reports: "/reports",
+  classes: "/classes",
+  settings: "/settings",
+};
+
+const ACTIVE_ASSESSMENT_KEY = "daliguro_qr_active_assessment_id";
+
+function loadActiveAssessmentId(): string | null {
+  try {
+    return localStorage.getItem(ACTIVE_ASSESSMENT_KEY);
+  } catch {
+    return null;
+  }
+}
+
+function saveActiveAssessmentId(id: string | null) {
+  try {
+    if (id === null) {
+      localStorage.removeItem(ACTIVE_ASSESSMENT_KEY);
+    } else {
+      localStorage.setItem(ACTIVE_ASSESSMENT_KEY, id);
+    }
+  } catch {
+    // Selection persistence is helpful, not required.
+  }
+}
+
+function tabFromPath(pathname: string): TabId {
+  const normalized = pathname.replace(/\/+$/, "") || "/";
+  const found = (Object.entries(TAB_ROUTES) as [TabId, string][]).find(([, path]) => path === normalized);
+  return found ? found[0] : "overview";
+}
+
+function validTab(value: string): TabId {
+  return TABS.some((t) => t.id === value) ? (value as TabId) : "overview";
+}
+
 export default function App() {
   const { state, setState, loaded } = useQrStore();
-  const [tab, setTab] = useState<TabId>("overview");
-  const [activeId, setActiveId] = useState<string | null>(null);
+  const location = useLocation();
+  const routerNavigate = useNavigate();
+  const [tab, setTab] = useState<TabId>(() => tabFromPath(location.pathname));
+  const [activeId, setActiveId] = useState<string | null>(() => loadActiveAssessmentId());
+
+  useEffect(() => {
+    setTab(tabFromPath(location.pathname));
+  }, [location.pathname]);
+
+  useEffect(() => {
+    saveActiveAssessmentId(activeId);
+  }, [activeId]);
 
   if (!loaded) {
     return (
@@ -93,9 +155,25 @@ export default function App() {
     );
   }
 
-  const effectiveActiveId = activeId ?? state.assessments[0]?.id ?? null;
+  const activeIdExists = activeId ? state.assessments.some((a) => a.id === activeId) : false;
+  const effectiveActiveId =
+    activeId === ""
+      ? null
+      : activeIdExists
+        ? activeId
+        : state.assessments[0]?.id ?? null;
   const active = state.assessments.find((a) => a.id === effectiveActiveId) ?? null;
-  const panelProps: PanelProps = { state, setState, activeId: effectiveActiveId, setActiveId, navigate: (next) => setTab(next as TabId) };
+  function goToTab(next: TabId) {
+    setTab(next);
+    routerNavigate(TAB_ROUTES[next]);
+  }
+  const panelProps: PanelProps = {
+    state,
+    setState,
+    activeId: effectiveActiveId,
+    setActiveId,
+    navigate: (next) => goToTab(validTab(next)),
+  };
   const pendingReview = state.results.filter((r) => r.reviewStatus === "needs_review").length;
   const activeResults = active ? state.results.filter((r) => r.assessmentId === active.id) : [];
   const currentMeta = PAGE_META[tab];
@@ -164,7 +242,7 @@ export default function App() {
                       key={group.label + item.label + i}
                       item={item}
                       active={item.id === tab}
-                      onClick={() => setTab(item.id)}
+                      onClick={() => goToTab(item.id)}
                     />
                   ))}
                 </div>
@@ -187,7 +265,10 @@ export default function App() {
               <div className="font-black text-white">● Offline-first</div>
               Saved securely on this device · {pendingReview} pending review
             </div>
-            <button className="w-full rounded-2xl bg-white/10 p-4 text-left text-xs font-bold text-blue-100 ring-1 ring-white/10 hover:bg-white/15">
+            <button
+              onClick={() => goToTab("overview")}
+              className="w-full rounded-2xl bg-white/10 p-4 text-left text-xs font-bold text-blue-100 ring-1 ring-white/10 hover:bg-white/15"
+            >
               ? Need help? View User Guide
             </button>
           </div>
@@ -211,7 +292,7 @@ export default function App() {
                   tab={t}
                   active={t.id === tab}
                   pendingReview={t.id === "review" ? pendingReview : 0}
-                  onClick={() => setTab(t.id)}
+                  onClick={() => goToTab(t.id)}
                 />
               ))}
             </nav>
@@ -229,10 +310,11 @@ export default function App() {
                     <span className="sr-only">Active Assessment</span>
                     <select
                       value={effectiveActiveId ?? ""}
-                      onChange={(e) => setActiveId(e.target.value || null)}
+                      onChange={(e) => setActiveId(e.target.value || "")}
                       className="h-10 w-full rounded-lg border border-slate-200 bg-white px-3 text-sm font-bold text-slate-700 outline-none focus:border-indigo-500"
                     >
                       {state.assessments.length === 0 ? <option value="">No assessment</option> : null}
+                      {state.assessments.length > 0 ? <option value="">No active assessment</option> : null}
                       {state.assessments.map((a) => (
                         <option key={a.id} value={a.id}>{a.title}</option>
                       ))}
@@ -245,14 +327,14 @@ export default function App() {
                     {active ? active.term + " Term" : "No term"}
                   </div>
                   <button
-                    onClick={() => window.print()}
+                    onClick={() => exportCurrentView(tab, state, active)}
                     className="h-10 rounded-lg bg-gradient-to-r from-indigo-600 to-violet-600 px-4 text-sm font-black text-white shadow-sm"
                   >
                     Export
                   </button>
                   {active ? (
                     <button
-                      onClick={() => setActiveId(null)}
+                      onClick={() => setActiveId("")}
                       className="h-10 rounded-lg border border-slate-200 bg-white px-4 text-sm font-black text-indigo-700"
                     >
                       Clear
@@ -358,4 +440,155 @@ function renderTab(tab: TabId, panelProps: PanelProps) {
   if (tab === "classes") return <LearnersPanel {...panelProps} />;
   if (tab === "settings") return <SetupPanel {...panelProps} />;
   return <ReportsPanel {...panelProps} />;
+}
+
+function exportCurrentView(tab: TabId, state: QrAssessmentState, active: Assessment | null) {
+  if (tab === "setup" || tab === "settings") {
+    exportAssessments(state);
+    return;
+  }
+  if (tab === "items") {
+    if (!active) {
+      window.alert("Select an assessment before exporting items.");
+      return;
+    }
+    exportItems(state, active);
+    return;
+  }
+  if (tab === "learners" || tab === "classes") {
+    exportLearners(state.learners);
+    return;
+  }
+  if (tab === "results" || tab === "smartscan" || tab === "review") {
+    exportResults(state, active);
+    return;
+  }
+
+  window.print();
+}
+
+function exportAssessments(state: QrAssessmentState) {
+  if (state.assessments.length === 0) {
+    window.alert("No assessments to export.");
+    return;
+  }
+  downloadCsv(
+    toCsv(
+      ["Title", "Subject", "Grade Level", "Section", "School Year", "Term", "Component", "Versions", "Teacher"],
+      state.assessments.map((a) => [
+        a.title,
+        a.subject,
+        a.gradeLevel,
+        a.section,
+        a.schoolYear,
+        a.term,
+        a.component,
+        a.versions.join(" / "),
+        a.teacherName,
+      ]),
+    ),
+    "daliguro_assessments.csv",
+  );
+}
+
+function exportItems(state: QrAssessmentState, active: Assessment) {
+  const items = state.items
+    .filter((i) => i.assessmentId === active.id)
+    .sort((a, b) => a.itemNumber - b.itemNumber);
+  if (items.length === 0) {
+    window.alert("No items to export for this assessment.");
+    return;
+  }
+
+  const versionHeaders = active.versions.map((v) => "Key " + v);
+  const assessmentKeys = state.answerKeys[active.id] ?? {};
+  downloadCsv(
+    toCsv(
+      [
+        "Item #",
+        "Type",
+        "Question",
+        "Points",
+        "Competency",
+        "Difficulty",
+        "Cognitive Level",
+        "Choices",
+        ...versionHeaders,
+      ],
+      items.map((item) => [
+        item.itemNumber,
+        item.type,
+        item.question,
+        item.points,
+        item.competency,
+        item.difficulty,
+        item.cognitiveLevel,
+        item.choices,
+        ...active.versions.map((v) => assessmentKeys[v]?.[item.id] ?? ""),
+      ]),
+    ),
+    safeFilename(active.title) + "_items_answer_keys.csv",
+  );
+}
+
+function exportLearners(learners: Learner[]) {
+  if (learners.length === 0) {
+    window.alert("No learners to export.");
+    return;
+  }
+  downloadCsv(
+    toCsv(
+      ["LRN", "Full Name", "Sex", "Grade Level", "Section"],
+      learners.map((l) => [l.lrn, l.fullName, l.sex, l.gradeLevel, l.section]),
+    ),
+    "daliguro_learners.csv",
+  );
+}
+
+function exportResults(state: QrAssessmentState, active: Assessment | null) {
+  const assessmentById = new Map(state.assessments.map((a) => [a.id, a]));
+  const learnerById = new Map(state.learners.map((l) => [l.id, l]));
+  const results = active
+    ? state.results.filter((r) => r.assessmentId === active.id)
+    : state.results;
+
+  if (results.length === 0) {
+    window.alert("No checked results to export.");
+    return;
+  }
+
+  downloadCsv(
+    toCsv(
+      [
+        "Assessment",
+        "LRN",
+        "Learner",
+        "Section",
+        "Version",
+        "Raw Score",
+        "Total Score",
+        "Percentage",
+        "Mastery",
+        "Review Status",
+        "Source",
+      ],
+      results.map((r) => {
+        const learner = learnerById.get(r.learnerId);
+        return [
+          assessmentById.get(r.assessmentId)?.title ?? r.assessmentId,
+          learner?.lrn ?? "",
+          learner?.fullName ?? "(unknown learner)",
+          learner?.section ?? "",
+          r.version,
+          r.rawScore,
+          r.totalScore,
+          r.percentage,
+          r.masteryStatus,
+          r.reviewStatus,
+          r.source,
+        ];
+      }),
+    ),
+    safeFilename(active?.title ?? "daliguro") + "_results.csv",
+  );
 }

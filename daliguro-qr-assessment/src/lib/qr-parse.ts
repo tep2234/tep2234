@@ -43,15 +43,23 @@ function isTestVersion(value: unknown): value is TestVersion {
   return typeof value === "string" && (TEST_VERSIONS as readonly string[]).includes(value);
 }
 
+function qrField(p: Record<string, unknown>, longName: string, shortName: string): unknown {
+  return p[longName] ?? p[shortName];
+}
+
 // Verify the integrity checksum when the QR carries one. Old QRs without a
 // checksum still pass; a QR whose checksum no longer matches its identity
 // triple was damaged or edited and is refused.
 function checksumProblem(p: Record<string, unknown>): string | null {
-  const checksum = typeof p.checksum === "string" ? p.checksum : "";
+  const rawChecksum = qrField(p, "checksum", "c");
+  const checksum = typeof rawChecksum === "string" ? rawChecksum : "";
   if (!checksum) return null;
-  const assessmentId = typeof p.assessmentId === "string" ? p.assessmentId : "";
-  const learnerId = typeof p.learnerId === "string" ? p.learnerId : "";
-  const version = typeof p.version === "string" ? p.version : "";
+  const rawAssessmentId = qrField(p, "assessmentId", "a");
+  const rawLearnerId = qrField(p, "learnerId", "l");
+  const rawVersion = qrField(p, "version", "v");
+  const assessmentId = typeof rawAssessmentId === "string" ? rawAssessmentId : "";
+  const learnerId = typeof rawLearnerId === "string" ? rawLearnerId : "";
+  const version = typeof rawVersion === "string" ? rawVersion : "";
   if (checksum !== payloadChecksum(assessmentId, learnerId, version)) {
     return "QR failed its integrity check (damaged or altered). Reprint this learner's sheet.";
   }
@@ -84,27 +92,30 @@ export function decodeQrPayload(raw: string): QrParseResult {
       };
     }
   }
-  const assessmentId = typeof p.assessmentId === "string" ? p.assessmentId : "";
-  const learnerId = typeof p.learnerId === "string" ? p.learnerId : "";
+  const rawAssessmentId = qrField(p, "assessmentId", "a");
+  const rawLearnerId = qrField(p, "learnerId", "l");
+  const assessmentId = typeof rawAssessmentId === "string" ? rawAssessmentId : "";
+  const learnerId = typeof rawLearnerId === "string" ? rawLearnerId : "";
   if (!assessmentId || !learnerId) {
     return { ok: false, reason: "QR is missing learner identity fields." };
   }
   const badChecksum = checksumProblem(p);
   if (badChecksum) return { ok: false, reason: badChecksum };
-  const rawVersion = p.version;
+  const rawVersion = qrField(p, "version", "v");
   const version: TestVersion = isTestVersion(rawVersion) ? rawVersion : "A";
+  const rawN = qrField(p, "n", "n");
   return {
     ok: true,
     payload: {
       assessmentId,
       learnerId,
-      lrn: typeof p.lrn === "string" ? p.lrn : "",
-      section: typeof p.section === "string" ? p.section : "",
-      gradeLevel: typeof p.gradeLevel === "string" ? p.gradeLevel : "",
+      lrn: typeof qrField(p, "lrn", "r") === "string" ? (qrField(p, "lrn", "r") as string) : "",
+      section: typeof qrField(p, "section", "s") === "string" ? (qrField(p, "section", "s") as string) : "",
+      gradeLevel: typeof qrField(p, "gradeLevel", "g") === "string" ? (qrField(p, "gradeLevel", "g") as string) : "",
       version,
-      securityToken: typeof p.securityToken === "string" ? p.securityToken : "",
-      n: typeof p.n === "number" && Number.isFinite(p.n) ? p.n : 0,
-      checksum: typeof p.checksum === "string" ? p.checksum : "",
+      securityToken: typeof qrField(p, "securityToken", "t") === "string" ? (qrField(p, "securityToken", "t") as string) : "",
+      n: typeof rawN === "number" && Number.isFinite(rawN) ? rawN : 0,
+      checksum: typeof qrField(p, "checksum", "c") === "string" ? (qrField(p, "checksum", "c") as string) : "",
     },
   };
 }
@@ -136,8 +147,10 @@ export function parseQrPayload(raw: string, ctx: QrParseContext): QrParseResult 
     }
   }
 
-  const assessmentId = typeof p.assessmentId === "string" ? p.assessmentId : "";
-  const learnerId = typeof p.learnerId === "string" ? p.learnerId : "";
+  const rawAssessmentId = qrField(p, "assessmentId", "a");
+  const rawLearnerId = qrField(p, "learnerId", "l");
+  const assessmentId = typeof rawAssessmentId === "string" ? rawAssessmentId : "";
+  const learnerId = typeof rawLearnerId === "string" ? rawLearnerId : "";
   if (!assessmentId || !learnerId) {
     return { ok: false, reason: "Invalid QR: missing learner identity fields." };
   }
@@ -157,22 +170,23 @@ export function parseQrPayload(raw: string, ctx: QrParseContext): QrParseResult 
   }
 
   // Version: fall back to the first enabled version if absent/unknown.
-  const rawVersion = p.version;
+  const rawVersion = qrField(p, "version", "v");
   let version: TestVersion = ctx.versions[0] ?? "A";
   if (isTestVersion(rawVersion)) {
     version = ctx.versions.includes(rawVersion) ? rawVersion : version;
   }
+  const rawN = qrField(p, "n", "n");
 
   const payload: QrPayload = {
     assessmentId,
     learnerId,
-    lrn: typeof p.lrn === "string" ? p.lrn : "",
-    section: typeof p.section === "string" ? p.section : "",
-    gradeLevel: typeof p.gradeLevel === "string" ? p.gradeLevel : "",
+    lrn: typeof qrField(p, "lrn", "r") === "string" ? (qrField(p, "lrn", "r") as string) : "",
+    section: typeof qrField(p, "section", "s") === "string" ? (qrField(p, "section", "s") as string) : "",
+    gradeLevel: typeof qrField(p, "gradeLevel", "g") === "string" ? (qrField(p, "gradeLevel", "g") as string) : "",
     version,
-    securityToken: typeof p.securityToken === "string" ? p.securityToken : "",
-    n: typeof p.n === "number" && Number.isFinite(p.n) ? p.n : 0,
-    checksum: typeof p.checksum === "string" ? p.checksum : "",
+    securityToken: typeof qrField(p, "securityToken", "t") === "string" ? (qrField(p, "securityToken", "t") as string) : "",
+    n: typeof rawN === "number" && Number.isFinite(rawN) ? rawN : 0,
+    checksum: typeof qrField(p, "checksum", "c") === "string" ? (qrField(p, "checksum", "c") as string) : "",
   };
   return { ok: true, payload };
 }

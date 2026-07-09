@@ -48,5 +48,15 @@ export function buildQrPayload(
 
 // Serialise the payload to the string encoded in the QR image.
 export function qrText(payload: QrPayload): string {
-  return JSON.stringify(payload);
+  return JSON.stringify({
+    a: payload.assessmentId,
+    l: payload.learnerId,
+    r: payload.lrn,
+    s: payload.section,
+    g: payload.gradeLevel,
+    v: payload.version,
+    t: payload.securityToken,
+    n: payload.n,
+    c: payload.checksum,
+  });
 }

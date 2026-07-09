@@ -167,6 +167,9 @@ export async function loadState(): Promise<QrAssessmentState> {
 }
 
 export async function saveState(state: QrAssessmentState): Promise<void> {
+  // Keep a synchronous mirror so a fast refresh immediately after encoding or
+  // importing data still has a recoverable copy even before IndexedDB finishes.
+  lsSave(state);
   if (hasIndexedDB()) {
     try {
       await idbSet(STATE_KEY, state);
