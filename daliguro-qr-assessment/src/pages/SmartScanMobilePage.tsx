@@ -9,41 +9,27 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useParams, useSearchParams } from "react-router-dom";
 import { classifyMediaError, isSecureLike } from "../lib/camera";
 import { isSupabaseConfigured } from "../lib/supabase/client";
-import { decodeQrPayload } from "../lib/qr-parse";
-import { assessmentMatches, type ScanDetection, type ScoreBroadcast } from "../lib/sync/pairing";
+import { type ScanDetection, type ScoreBroadcast } from "../lib/sync/pairing";
 import { joinScanChannel, type ScanChannel } from "../lib/sync/realtimeSmartScan";
-import { buildTemplate, CHOICES, MAX_ITEMS } from "../lib/scanner/omr-template";
-import { classifyItem, ensureCompleteItems, findCornerMarkers, readSheet, toGray, type SheetReading } from "../lib/scanner/omr-detect";
-import { readQrSmart } from "../lib/scanner/qr-detect";
+import { CHOICES } from "../lib/scanner/omr-template";
+import { classifyItem } from "../lib/scanner/omr-detect";
 import { REVIEW_CONFIDENCE } from "../lib/scanner/omr-score";
-import { scanQuality, type ScanQuality } from "../lib/scanner/scan-quality";
+import {
+  analyzeFrameData,
+  avgConfidence,
+  isDoubtful,
+  scanSignature,
+  AUTO_ACCEPT,
+  type FrameAnalysis,
+  type FrameResult,
+  type MobileScan,
+} from "../lib/scanner/mobile-analyze";
+import type { FrameRequest, FrameResponse } from "../lib/scanner/omr-frame-worker";
 import { Button } from "../components/ui";
 
 type Flow = "ready" | "live" | "review" | "done";
 type SyncState = "idle" | "pending" | "sent" | "pc_received" | "saved" | "scored" | "failed";
 type SignalTone = "good" | "warn" | "bad";
-
-interface MobileScan {
-  learnerId: string;
-  version: string;
-  totalItems: number;
-  detected: ScanDetection[];
-  confidence: number;
-  quality: ScanQuality;
-  hasDoubt: boolean;
-  reviewCount: number;
-  signature: string;
-}
-
-interface FrameResult {
-  scan: MobileScan | null;
-  status: string;
-  qrVisible: boolean;
-  markersVisible: boolean;
-  brightness: number;
-  aligned: boolean;
-  message: string;
-}
 
 // Temporal consensus accumulator: sums each bubble's darkness across aligned
 // frames of the SAME sheet so we classify from an averaged, denoised signal
@@ -56,7 +42,6 @@ interface FillAccum {
   misses: number; // consecutive non-aligned frames tolerated before reset
 }
 
-const AUTO_ACCEPT = 0.8;
 // Number of aligned frames averaged before we trust a reading. A short burst
 // denoises the read while still locking fast (~3 good frames).
 const CONSENSUS_FRAMES = 3;
@@ -73,14 +58,9 @@ const ANALYZE_INTERVAL_MS = 90;
 // is shorter than the post-submit cooldown, so a swapped sheet cannot inherit
 // the previous sheet's identity.
 const QR_STICKY_MS = 1500;
-
-function avgConfidence(data: ScanDetection[]): number {
-  return data.length ? data.reduce((s, d) => s + d.confidence, 0) / data.length : 0;
-}
-
-function isDoubtful(d: ScanDetection): boolean {
-  return d.status === "unclear" || d.status === "multiple" || (d.status === "selected" && d.confidence < REVIEW_CONFIDENCE);
-}
+// If the worker hangs (rare — bad frame, browser bug), fall back to the
+// main-thread pipeline rather than stalling the scan loop forever.
+const WORKER_TIMEOUT_MS = 2000;
 
 // Fold the accumulated per-choice darkness into a single trusted reading by
 // averaging each bubble across frames, then re-running the tested classifier.
@@ -113,123 +93,6 @@ function statusLabel(status: string, confidence: number): { label: string; revie
   return { label: "OK", review: false };
 }
 
-function scanSignature(lId: string, ver: string, data: ScanDetection[]): string {
-  return lId + "|" + ver + "|" + data.map((d) => d.item + ":" + d.answer + ":" + d.status).join(",");
-}
-
-function quickBrightness(data: Uint8ClampedArray | number[]): number {
-  let sum = 0;
-  let n = 0;
-  const step = Math.max(4, Math.floor(data.length / 36000) * 4);
-  for (let i = 0; i < data.length; i += step) {
-    sum += (data[i] + data[i + 1] + data[i + 2]) / 3;
-    n += 1;
-  }
-  return n ? Math.round(sum / n) : 255;
-}
-
-function readingShadowLevel(reading: SheetReading): number {
-  const values = reading.items.flatMap((item) => item.fill).filter((n) => Number.isFinite(n));
-  if (values.length === 0) return 100;
-  const mean = values.reduce((sum, n) => sum + n, 0) / values.length;
-  const variance = values.reduce((sum, n) => sum + (n - mean) * (n - mean), 0) / values.length;
-  return Math.round(Math.max(0, Math.min(100, Math.sqrt(variance) * 180)));
-}
-
-function readingTiltAngle(reading: SheetReading): number {
-  const corners = reading.corners;
-  if (!corners || corners.length < 2) return 45;
-  const [tl, tr] = corners;
-  return Math.abs(Math.atan2(tr.y - tl.y, tr.x - tl.x) * 180 / Math.PI);
-}
-
-function readingBubbleDarkness(reading: SheetReading): number {
-  const maxes = reading.items.map((item) => Math.max(...item.fill, 0));
-  return maxes.length ? maxes.reduce((sum, value) => sum + value, 0) / maxes.length : 0;
-}
-
-function analyzeDecodedFrame(img: ImageData, assessmentId: string, qrText: string): FrameResult {
-  const brightness = quickBrightness(img.data);
-  const decoded = decodeQrPayload(qrText);
-  if (!decoded.ok) {
-    return { scan: null, status: "qr_error", qrVisible: true, markersVisible: false, brightness, aligned: false, message: decoded.reason };
-  }
-  if (assessmentId && !assessmentMatches(assessmentId, decoded.payload.assessmentId)) {
-    return { scan: null, status: "wrong_assessment", qrVisible: true, markersVisible: false, brightness, aligned: false, message: "Wrong assessment sheet — this QR is for a different assessment." };
-  }
-  // Item-count guard: block sheets whose declared item count is invalid or
-  // exceeds the printable grid, rather than reading a partial sheet.
-  const totalItems = Math.round(decoded.payload.n || 0);
-  if (!Number.isFinite(totalItems) || totalItems < 1 || totalItems > MAX_ITEMS) {
-    return { scan: null, status: "bad_item_count", qrVisible: true, markersVisible: false, brightness, aligned: false, message: `Unsupported item count (${decoded.payload.n}). Sheets must have 1–${MAX_ITEMS} items.` };
-  }
-  const gray = toGray(img);
-  // Marker search is the most expensive step — run it ONCE and share the
-  // result with readSheet instead of paying for it twice per frame.
-  const corners = findCornerMarkers(gray);
-  const markersVisible = corners !== null;
-  const template = buildTemplate(totalItems);
-  const reading: SheetReading = readSheet(gray, template, {}, corners);
-  if (!reading.aligned) {
-    return { scan: null, status: "markers", qrVisible: true, markersVisible, brightness, aligned: false, message: "Show all 4 corner targets" };
-  }
-  // Identity layer 2: the printed shade-one VERSION row must agree with the
-  // QR payload. A clear mismatch means a wrong or duplicated sheet — block it.
-  if (reading.version.detected && decoded.payload.version && reading.version.detected !== decoded.payload.version) {
-    return { scan: null, status: "wrong_version", qrVisible: true, markersVisible, brightness, aligned: true, message: `Sheet version ${reading.version.detected} does not match this QR (version ${decoded.payload.version}). Wrong or duplicated sheet.` };
-  }
-  // Strict completeness: exactly items 1..totalItems, gaps flagged for review.
-  const detected: ScanDetection[] = ensureCompleteItems(reading.items, totalItems).map((r) => ({
-    item: r.item,
-    answer: r.detected ?? "",
-    status: r.status,
-    confidence: r.confidence,
-    fill: r.fill,
-  }));
-  const confidence = avgConfidence(detected);
-  const hasDoubt = detected.some(isDoubtful);
-  const doubtfulItems = detected.filter(isDoubtful).length;
-  const quality = scanQuality({
-    confidence,
-    brightness: reading.brightness,
-    sharpness: reading.sharpness,
-    aligned: reading.aligned,
-    doubtfulItems,
-    shadowLevel: readingShadowLevel(reading),
-    tiltAngle: readingTiltAngle(reading),
-    bubbleDarkness: readingBubbleDarkness(reading),
-  });
-  const scan: MobileScan = {
-    learnerId: decoded.payload.learnerId,
-    version: decoded.payload.version,
-    totalItems,
-    detected,
-    confidence,
-    quality,
-    hasDoubt,
-    reviewCount: doubtfulItems,
-    signature: scanSignature(decoded.payload.learnerId, decoded.payload.version, detected),
-  };
-  return {
-    scan,
-    status: hasDoubt || confidence < AUTO_ACCEPT ? "review" : "ready",
-    qrVisible: true,
-    markersVisible: true,
-    brightness,
-    aligned: true,
-    message: hasDoubt ? "Needs confirmation" : "Hold steady",
-  };
-}
-
-function analyzeFrame(img: ImageData, assessmentId: string, thorough = true): FrameResult {
-  const brightness = quickBrightness(img.data);
-  const qr = readQrSmart(img, thorough);
-  if (!qr) {
-    return { scan: null, status: "searching", qrVisible: false, markersVisible: false, brightness, aligned: false, message: "Find the sheet QR" };
-  }
-  return analyzeDecodedFrame(img, assessmentId, qr.data);
-}
-
 async function readNativeQr(source: CanvasImageSource): Promise<string | null> {
   const Detector = (window as unknown as { BarcodeDetector?: new (options?: { formats?: string[] }) => { detect: (source: CanvasImageSource) => Promise<Array<{ rawValue?: string }>> } }).BarcodeDetector;
   if (!Detector) return null;
@@ -260,6 +123,10 @@ export default function SmartScanMobilePage() {
   const qrCacheRef = useRef<{ text: string; expires: number } | null>(null);
   const lastAnalyzeRef = useRef(0);
   const cooldownUntilRef = useRef(0);
+  const workerRef = useRef<Worker | null>(null);
+  const workerFailedRef = useRef(false);
+  const workerReqIdRef = useRef(0);
+  const workerPendingRef = useRef(new Map<number, (a: FrameAnalysis) => void>());
   const submittingRef = useRef(false);
 
   const [stage, setStage] = useState<Flow>("ready");
@@ -352,6 +219,73 @@ export default function SmartScanMobilePage() {
     return ctx.getImageData(0, 0, canvas.width, canvas.height);
   }, []);
 
+  // Worker-first frame analysis. QR decoding + OMR run off the main thread so
+  // the camera preview and buttons never stutter; the pixel buffer is
+  // TRANSFERRED (zero-copy). If workers are unavailable, error, or hang, we
+  // permanently fall back to the identical pure pipeline on the main thread.
+  const analyzeAsync = useCallback(
+    (img: ImageData, qrText: string | null, thoroughQr: boolean): Promise<FrameAnalysis> => {
+      if (workerFailedRef.current) {
+        return Promise.resolve(analyzeFrameData(img, assessmentId, qrText, thoroughQr));
+      }
+      try {
+        if (!workerRef.current) {
+          const w = new Worker(new URL("../lib/scanner/omr-frame-worker.ts", import.meta.url), { type: "module" });
+          w.onmessage = (e: MessageEvent<FrameResponse>) => {
+            const pending = workerPendingRef.current.get(e.data.id);
+            workerPendingRef.current.delete(e.data.id);
+            pending?.(e.data.analysis);
+          };
+          w.onerror = () => {
+            workerFailedRef.current = true;
+          };
+          workerRef.current = w;
+        }
+        const worker = workerRef.current;
+        const id = (workerReqIdRef.current += 1);
+        return new Promise<FrameAnalysis>((resolve) => {
+          const timer = setTimeout(() => {
+            // Hung worker: drop this frame, use the sync path from now on.
+            if (workerPendingRef.current.delete(id)) {
+              workerFailedRef.current = true;
+              resolve({
+                result: { scan: null, status: "searching", qrVisible: false, markersVisible: false, brightness: 0, aligned: false, message: "Find the sheet QR" },
+                qrText: null,
+              });
+            }
+          }, WORKER_TIMEOUT_MS);
+          workerPendingRef.current.set(id, (analysis) => {
+            clearTimeout(timer);
+            resolve(analysis);
+          });
+          const req: FrameRequest = {
+            id,
+            buffer: img.data.buffer as ArrayBuffer,
+            width: img.width,
+            height: img.height,
+            assessmentId,
+            qrText,
+            thoroughQr,
+          };
+          worker.postMessage(req, [req.buffer]);
+        });
+      } catch {
+        workerFailedRef.current = true;
+        return Promise.resolve(analyzeFrameData(img, assessmentId, qrText, thoroughQr));
+      }
+    },
+    [assessmentId],
+  );
+
+  // Tear the worker down when the page unmounts.
+  useEffect(() => {
+    return () => {
+      workerRef.current?.terminate();
+      workerRef.current = null;
+      workerPendingRef.current.clear();
+    };
+  }, []);
+
   const submitScan = useCallback(
     async (scan: MobileScan) => {
       if (submittingRef.current) return;
@@ -419,25 +353,25 @@ export default function SmartScanMobilePage() {
 
     const frame = grabFrame();
     if (frame && now >= cooldownUntilRef.current) {
-      // Fast path first: the native BarcodeDetector (Android / iOS 17+) reads the
-      // QR far faster and more reliably than jsQR. Only fall back to a *cheap*
-      // jsQR pass (dontInvert) so the per-frame cost stays low and the RAF loop
-      // keeps sampling a handheld sheet. The expensive multi-pass recovery
-      // (invert/contrast/threshold) is reserved for the still-photo fallback.
+      // Fast path first: the native BarcodeDetector (Android / iOS 17+) reads
+      // the QR quickly off the main thread. Everything else — jsQR fallback,
+      // marker search, homography, bubble sampling — runs in the Web Worker,
+      // so the preview and buttons stay responsive on low-end phones.
       const nativeQr = canvasRef.current ? await readNativeQr(canvasRef.current) : null;
-      let qrText = nativeQr ?? readQrSmart(frame, false)?.data ?? null;
-      if (qrText) {
-        // Genuine decode: refresh the sticky cache.
-        qrCacheRef.current = { text: qrText, expires: now + QR_STICKY_MS };
-      } else {
+      let qrText = nativeQr;
+      if (!qrText) {
         // Mid-consensus frames where the QR momentarily blurs reuse the last
-        // genuine decode; alignment is still verified below, every frame.
+        // genuine decode; alignment is still verified per frame in the worker.
         const cached = qrCacheRef.current;
         if (cached && now < cached.expires) qrText = cached.text;
       }
-      const result = qrText
-        ? analyzeDecodedFrame(frame, assessmentId, qrText)
-        : { scan: null, status: "searching", qrVisible: false, markersVisible: false, brightness: quickBrightness(frame.data), aligned: false, message: "Find the sheet QR" };
+      const analysis = await analyzeAsync(frame, qrText, false);
+      const result = analysis.result;
+      // Refresh the sticky cache only on GENUINE decodes: a native hit, or a
+      // fresh jsQR decode inside the worker (qrText echoed back when we sent
+      // one, so a new decode is exactly the case where none was sent).
+      const genuineQr = nativeQr ?? (!qrText ? analysis.qrText : null);
+      if (genuineQr) qrCacheRef.current = { text: genuineQr, expires: now + QR_STICKY_MS };
       setLastFrame(result);
       if (result.scan) {
         // Trusted layer: accumulate per-bubble darkness across aligned frames of
@@ -486,7 +420,7 @@ export default function SmartScanMobilePage() {
       }
     }
     rafRef.current = requestAnimationFrame(() => void loopRef.current());
-  }, [assessmentId, grabFrame, handleStableScan]);
+  }, [analyzeAsync, grabFrame, handleStableScan]);
 
   useEffect(() => {
     loopRef.current = loop;
@@ -566,8 +500,10 @@ export default function SmartScanMobilePage() {
         ctx.drawImage(im, 0, 0, canvas.width, canvas.height);
         const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
         const nativeQr = await readNativeQr(canvas);
-        if (nativeQr) return analyzeDecodedFrame(img, assessmentId, nativeQr);
-        return analyzeFrame(img, assessmentId);
+        // Thorough QR recovery + full OMR run in the worker — a 3200px photo
+        // used to freeze the page for seconds when decoded on the main thread.
+        const analysis = await analyzeAsync(img, nativeQr, true);
+        return analysis.result;
       };
       let result = await decodeAt(3200);
       for (const maxW of [2600, 2000, 1600, 1100]) {
