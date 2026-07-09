@@ -42,6 +42,21 @@ interface FillAccum {
   misses: number; // consecutive non-aligned frames tolerated before reset
 }
 
+// A scan captured on the phone that has not reached the PC yet. Held scans
+// survive "Scan next sheet" and page reloads (localStorage) and auto-retry
+// until the PC session is reachable — a captured sheet is never discarded.
+interface HeldScan {
+  learnerId: string;
+  version: string;
+  answerMap: Record<string, string>;
+  detected: ScanDetection[];
+  confidence: number;
+  ts: number;
+}
+
+// Minimum capture-quality score for hands-free auto-submit; anything below
+// confirms with the teacher first (review screen), even if item reads agree.
+const QUALITY_ACCEPT = 60;
 // Number of aligned frames averaged before we trust a reading. A short burst
 // denoises the read while still locking fast (~3 good frames).
 const CONSENSUS_FRAMES = 3;
@@ -144,6 +159,26 @@ export default function SmartScanMobilePage() {
   const [torchAvailable, setTorchAvailable] = useState(false);
   const [torchOn, setTorchOn] = useState(false);
   const [engineInfo, setEngineInfo] = useState<{ engine: "worker" | "fallback"; ms: number } | null>(null);
+  // Outbox of captured-but-unsent scans, persisted per session so neither
+  // "Scan next sheet" nor a page reload can lose a teacher's work.
+  const outboxKey = "smartscan_outbox_" + sessionId;
+  const [outbox, setOutbox] = useState<HeldScan[]>(() => {
+    try {
+      const raw = localStorage.getItem(outboxKey);
+      const parsed = raw ? (JSON.parse(raw) as HeldScan[]) : [];
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  });
+  useEffect(() => {
+    try {
+      if (outbox.length === 0) localStorage.removeItem(outboxKey);
+      else localStorage.setItem(outboxKey, JSON.stringify(outbox));
+    } catch {
+      /* storage full/blocked — retries still work in-memory */
+    }
+  }, [outbox, outboxKey]);
   const [sentCount, setSentCount] = useState(0);
   const [lastSent, setLastSent] = useState("");
   const [lastScore, setLastScore] = useState<ScoreBroadcast | null>(null);
@@ -294,16 +329,26 @@ export default function SmartScanMobilePage() {
     };
   }, []);
 
+  const sendHeld = useCallback(
+    async (held: HeldScan): Promise<boolean> => {
+      const ch = channelRef.current;
+      if (!ch) return false;
+      return ch.sendScan({
+        token,
+        learnerId: held.learnerId,
+        version: held.version,
+        answerMap: held.answerMap,
+        detected: held.detected,
+        confidence: held.confidence,
+        deviceName: navigator.userAgent.slice(0, 60),
+      });
+    },
+    [token],
+  );
+
   const submitScan = useCallback(
     async (scan: MobileScan) => {
       if (submittingRef.current) return;
-      const ch = channelRef.current;
-      if (!ch) {
-        setPendingScan(scan);
-        setSyncState("failed");
-        setError("Not connected to the PC. Keep SmartScan open on the computer, then retry submit.");
-        return;
-      }
       submittingRef.current = true;
       setPendingScan(scan);
       setSyncState("pending");
@@ -311,19 +356,28 @@ export default function SmartScanMobilePage() {
       setLastScore(null);
       const answerMap: Record<string, string> = {};
       scan.detected.forEach((d) => { answerMap[String(d.item)] = d.answer; });
-      const ok = await ch.sendScan({
-        token,
+      const held: HeldScan = {
         learnerId: scan.learnerId,
         version: scan.version,
         answerMap,
         detected: scan.detected,
         confidence: scan.confidence,
-        deviceName: navigator.userAgent.slice(0, 60),
-      });
+        ts: Date.now(),
+      };
+      const ok = await sendHeld(held);
       submittingRef.current = false;
       if (!ok) {
+        // NEVER lose a captured scan: park it in the persistent outbox and
+        // keep retrying in the background. Tapping "Scan next sheet" no longer
+        // discards it — the outbox is independent of the current scan flow.
+        // Same learner+version replaces its older held copy (manual retries
+        // must not queue duplicates).
+        setOutbox((prev) => [
+          ...prev.filter((h) => !(h.learnerId === held.learnerId && h.version === held.version)),
+          held,
+        ]);
         setSyncState("failed");
-        setError("Submit failed before reaching the PC. The scan is held here; retry when the PC session is open.");
+        setError("Not connected to the PC yet. The scan is saved on this phone and will auto-send when the PC session is reachable.");
         setStage("done");
         return;
       }
@@ -333,15 +387,53 @@ export default function SmartScanMobilePage() {
       setStage("done");
       closeCamera();
     },
-    [closeCamera, token],
+    [closeCamera, sendHeld],
   );
+
+  // Auto-retry the outbox every few seconds while anything is held. Successes
+  // leave the queue; failures stay for the next tick. Also persisted to
+  // localStorage so a page reload cannot lose captured scans.
+  useEffect(() => {
+    if (outbox.length === 0) return;
+    let cancelled = false;
+    const tick = async () => {
+      if (cancelled || submittingRef.current) return;
+      const remaining: HeldScan[] = [];
+      let sent = 0;
+      let last = "";
+      for (const held of outbox) {
+        const ok = !cancelled && (await sendHeld(held));
+        if (ok) {
+          sent += 1;
+          last = held.learnerId;
+        } else {
+          remaining.push(held);
+        }
+      }
+      if (cancelled) return;
+      if (sent > 0) {
+        setSentCount((c) => c + sent);
+        setLastSent(last);
+        setOutbox(remaining);
+        if (remaining.length === 0) setError("");
+      }
+    };
+    const t = setInterval(() => void tick(), 4000);
+    return () => {
+      cancelled = true;
+      clearInterval(t);
+    };
+  }, [outbox, sendHeld]);
 
   const handleStableScan = useCallback(
     (scan: MobileScan) => {
       setPendingScan(scan);
       setLastScore(null);
       closeCamera();
-      if (scan.confidence >= AUTO_ACCEPT && !scan.hasDoubt) {
+      // Auto-accept needs BOTH clean item reads and a trustworthy capture.
+      // A fast lock on a blurry/badly-lit sheet must confirm with the teacher
+      // instead of silently submitting misreads.
+      if (scan.confidence >= AUTO_ACCEPT && !scan.hasDoubt && scan.quality.score >= QUALITY_ACCEPT) {
         void submitScan(scan);
       } else {
         setStage("review");
@@ -503,22 +595,24 @@ export default function SmartScanMobilePage() {
         setBusy(false);
         return;
       }
-      const decodeAt = async (maxW: number) => {
+      const decodeAt = async (maxW: number, thoroughQr: boolean) => {
         const scale = Math.min(1, maxW / im.naturalWidth);
         canvas.width = Math.round(im.naturalWidth * scale);
         canvas.height = Math.round(im.naturalHeight * scale);
         ctx.drawImage(im, 0, 0, canvas.width, canvas.height);
         const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
         const nativeQr = await readNativeQr(canvas);
-        // Thorough QR recovery + full OMR run in the worker — a 3200px photo
-        // used to freeze the page for seconds when decoded on the main thread.
-        const analysis = await analyzeAsync(img, nativeQr, true);
+        const analysis = await analyzeAsync(img, nativeQr, thoroughQr);
         return analysis.result;
       };
-      let result = await decodeAt(3200);
-      for (const maxW of [2600, 2000, 1600, 1100]) {
+      // Small-and-cheap first: QR decoders work best at 1–2K, and most photos
+      // resolve on the first pass in well under a second. Escalate resolution
+      // and the expensive multi-pass recovery ONLY while nothing is found —
+      // the old big-first thorough ladder made every photo pay worst-case time.
+      let result = await decodeAt(1600, false);
+      for (const [maxW, thoroughQr] of [[2200, false], [2800, true], [1300, true]] as const) {
         if (result.scan || result.status !== "searching") break;
-        result = await decodeAt(maxW);
+        result = await decodeAt(maxW, thoroughQr);
       }
       URL.revokeObjectURL(im.src);
       setLastFrame(result);
@@ -583,6 +677,12 @@ export default function SmartScanMobilePage() {
       ) : null}
       {cameraMessage ? (
         <div className="mb-3 rounded-lg border border-amber-300 bg-amber-50 p-2 text-sm text-amber-800">{cameraMessage}</div>
+      ) : null}
+      {outbox.length > 0 ? (
+        <div className="mb-3 rounded-lg border border-amber-300 bg-amber-50 p-2 text-sm font-bold text-amber-800">
+          📤 {outbox.length} scan{outbox.length === 1 ? "" : "s"} held on this phone — auto-sending when the PC session is reachable.
+          Keep SmartScan open on the computer. Held scans survive reloads.
+        </div>
       ) : null}
 
       {!configured ? (

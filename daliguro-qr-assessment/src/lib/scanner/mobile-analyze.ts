@@ -56,8 +56,20 @@ export function avgConfidence(data: ScanDetection[]): number {
   return data.length ? data.reduce((s, d) => s + d.confidence, 0) / data.length : 0;
 }
 
+// Blanks below this confidence mean the darkest bubble was close to the shade
+// threshold — the classic signature of a REAL mark washed out by blur,
+// distance, or dim light. Those must confirm with the teacher, not silently
+// submit as "no answer". Clean blanks (near-zero darkness) score ~1.0 and are
+// unaffected.
+const BLANK_DOUBT = 0.55;
+
 export function isDoubtful(d: ScanDetection): boolean {
-  return d.status === "unclear" || d.status === "multiple" || (d.status === "selected" && d.confidence < REVIEW_CONFIDENCE);
+  return (
+    d.status === "unclear" ||
+    d.status === "multiple" ||
+    (d.status === "selected" && d.confidence < REVIEW_CONFIDENCE) ||
+    (d.status === "blank" && d.confidence < BLANK_DOUBT)
+  );
 }
 
 export function scanSignature(lId: string, ver: string, data: ScanDetection[]): string {

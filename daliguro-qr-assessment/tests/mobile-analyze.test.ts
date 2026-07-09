@@ -3,7 +3,7 @@
 // assessment, item-count, version mismatch) and the strict completeness
 // contract, independent of any browser APIs.
 import { describe, expect, it } from "vitest";
-import { analyzeFrameData, type FrameImage } from "../src/lib/scanner/mobile-analyze";
+import { analyzeFrameData, isDoubtful, type FrameImage } from "../src/lib/scanner/mobile-analyze";
 import { buildTemplate, MARKER_RECTS, SHEET_H, SHEET_W } from "../src/lib/scanner/omr-template";
 
 function whiteRgba(width: number, height: number): FrameImage {
@@ -81,6 +81,22 @@ describe("analyzeFrameData guard rails", () => {
     const { result } = analyzeFrameData(img, "AX", qrFor(10, "A"), false);
     expect(result.status).toBe("wrong_version");
     expect(result.scan).toBeNull();
+  });
+});
+
+describe("isDoubtful blank handling", () => {
+  it("flags a low-confidence blank (washed-out real mark) for review", () => {
+    // Darkest bubble near the shade threshold → blank with weak confidence.
+    expect(isDoubtful({ item: 1, answer: "", status: "blank", confidence: 0.4 })).toBe(true);
+  });
+  it("keeps a clean blank (near-zero darkness) out of review", () => {
+    expect(isDoubtful({ item: 1, answer: "", status: "blank", confidence: 1 })).toBe(false);
+  });
+  it("still flags unclear, multiple, and weak selected reads", () => {
+    expect(isDoubtful({ item: 1, answer: "A", status: "unclear", confidence: 0.4 })).toBe(true);
+    expect(isDoubtful({ item: 1, answer: "", status: "multiple", confidence: 0.2 })).toBe(true);
+    expect(isDoubtful({ item: 1, answer: "B", status: "selected", confidence: 0.5 })).toBe(true);
+    expect(isDoubtful({ item: 1, answer: "B", status: "selected", confidence: 0.95 })).toBe(false);
   });
 });
 
