@@ -12,8 +12,8 @@ import { isSupabaseConfigured } from "../lib/supabase/client";
 import { decodeQrPayload } from "../lib/qr-parse";
 import { assessmentMatches, type ScanDetection, type ScoreBroadcast } from "../lib/sync/pairing";
 import { joinScanChannel, type ScanChannel } from "../lib/sync/realtimeSmartScan";
-import { buildTemplate } from "../lib/scanner/omr-template";
-import { findCornerMarkers, readSheet, toGray, type SheetReading } from "../lib/scanner/omr-detect";
+import { buildTemplate, CHOICES } from "../lib/scanner/omr-template";
+import { classifyItem, findCornerMarkers, readSheet, toGray, type SheetReading } from "../lib/scanner/omr-detect";
 import { readQrSmart } from "../lib/scanner/qr-detect";
 import { REVIEW_CONFIDENCE } from "../lib/scanner/omr-score";
 import { scanQuality, type ScanQuality } from "../lib/scanner/scan-quality";
@@ -43,19 +43,51 @@ interface FrameResult {
   message: string;
 }
 
-interface StableCandidate {
-  signature: string;
-  count: number;
-  scan: MobileScan;
+// Temporal consensus accumulator: sums each bubble's darkness across aligned
+// frames of the SAME sheet so we classify from an averaged, denoised signal
+// instead of a single shaky phone frame.
+interface FillAccum {
+  key: string; // learnerId|version — resets when a different sheet appears
+  n: number;
+  fills: Map<number, number[]>; // item -> summed per-choice darkness
+  base: MobileScan; // most recent frame, kept for capture-quality metrics
 }
 
 const AUTO_ACCEPT = 0.8;
-const STABLE_FRAMES = 2;
+// Number of aligned frames averaged before we trust a reading. More frames =
+// steadier answers and higher confidence; camera OMR needs a short burst.
+const CONSENSUS_FRAMES = 4;
 const FRAME_W = 1300;
 const COOLDOWN_MS = 2500;
+// Throttle the heavy analysis so the RAF loop yields the main thread to touch
+// events — keeps buttons responsive on phones instead of janky/laggy.
+const ANALYZE_INTERVAL_MS = 90;
 
 function avgConfidence(data: ScanDetection[]): number {
   return data.length ? data.reduce((s, d) => s + d.confidence, 0) / data.length : 0;
+}
+
+function isDoubtful(d: ScanDetection): boolean {
+  return d.status === "unclear" || d.status === "multiple" || (d.status === "selected" && d.confidence < REVIEW_CONFIDENCE);
+}
+
+// Fold the accumulated per-choice darkness into a single trusted reading by
+// averaging each bubble across frames, then re-running the tested classifier.
+function buildConsensusScan(acc: FillAccum): MobileScan {
+  const detected: ScanDetection[] = acc.base.detected.map((d) => {
+    const summed = acc.fills.get(d.item) ?? d.fill ?? [];
+    const avg = summed.map((v) => v / acc.n);
+    const r = classifyItem(d.item, avg, CHOICES.length);
+    return { item: r.item, answer: r.detected ?? "", status: r.status, confidence: r.confidence, fill: r.fill };
+  });
+  const confidence = avgConfidence(detected);
+  return {
+    ...acc.base,
+    detected,
+    confidence,
+    hasDoubt: detected.some(isDoubtful),
+    signature: scanSignature(acc.base.learnerId, acc.base.version, detected),
+  };
 }
 
 function scanSignature(lId: string, ver: string, data: ScanDetection[]): string {
@@ -117,12 +149,8 @@ function analyzeDecodedFrame(img: ImageData, assessmentId: string, qrText: strin
     fill: r.fill,
   }));
   const confidence = avgConfidence(detected);
-  const hasDoubt = detected.some(
-    (d) => d.status === "unclear" || d.status === "multiple" || (d.status === "selected" && d.confidence < REVIEW_CONFIDENCE),
-  );
-  const doubtfulItems = detected.filter(
-    (d) => d.status === "unclear" || d.status === "multiple" || (d.status === "selected" && d.confidence < REVIEW_CONFIDENCE),
-  ).length;
+  const hasDoubt = detected.some(isDoubtful);
+  const doubtfulItems = detected.filter(isDoubtful).length;
   const quality = scanQuality({
     confidence,
     brightness: reading.brightness,
@@ -188,7 +216,8 @@ export default function SmartScanMobilePage() {
   const rafRef = useRef<number | null>(null);
   const loopRef = useRef<() => void>(() => {});
   const channelRef = useRef<ScanChannel | null>(null);
-  const stableRef = useRef<StableCandidate | null>(null);
+  const accumRef = useRef<FillAccum | null>(null);
+  const lastAnalyzeRef = useRef(0);
   const cooldownUntilRef = useRef(0);
   const submittingRef = useRef(false);
 
@@ -321,8 +350,16 @@ export default function SmartScanMobilePage() {
   );
 
   const loop = useCallback(async () => {
+    const now = Date.now();
+    // Throttle heavy work so the main thread stays free for taps/scrolling.
+    if (now - lastAnalyzeRef.current < ANALYZE_INTERVAL_MS) {
+      rafRef.current = requestAnimationFrame(() => void loopRef.current());
+      return;
+    }
+    lastAnalyzeRef.current = now;
+
     const frame = grabFrame();
-    if (frame && Date.now() >= cooldownUntilRef.current) {
+    if (frame && now >= cooldownUntilRef.current) {
       // Fast path first: the native BarcodeDetector (Android / iOS 17+) reads the
       // QR far faster and more reliably than jsQR. Only fall back to a *cheap*
       // jsQR pass (dontInvert) so the per-frame cost stays low and the RAF loop
@@ -334,19 +371,39 @@ export default function SmartScanMobilePage() {
         : analyzeFrame(frame, assessmentId, false);
       setLastFrame(result);
       if (result.scan) {
-        const prev = stableRef.current;
-        const nextCount = prev?.signature === result.scan.signature ? prev.count + 1 : 1;
-        stableRef.current = { signature: result.scan.signature, count: nextCount, scan: result.scan };
-        setStableCount(nextCount);
-        if (nextCount >= STABLE_FRAMES) {
+        // Trusted layer: accumulate per-bubble darkness across aligned frames of
+        // the same sheet, then classify from the averaged (denoised) signal.
+        const scan = result.scan;
+        const key = scan.learnerId + "|" + scan.version;
+        const acc = accumRef.current;
+        let active: FillAccum;
+        if (!acc || acc.key !== key) {
+          const fills = new Map<number, number[]>();
+          scan.detected.forEach((d) => fills.set(d.item, (d.fill ?? []).slice()));
+          active = { key, n: 1, fills, base: scan };
+        } else {
+          scan.detected.forEach((d) => {
+            const f = d.fill ?? [];
+            const cur = acc.fills.get(d.item);
+            if (cur) for (let i = 0; i < f.length; i += 1) cur[i] += f[i] ?? 0;
+            else acc.fills.set(d.item, f.slice());
+          });
+          acc.n += 1;
+          acc.base = scan;
+          active = acc;
+        }
+        accumRef.current = active;
+        setStableCount(active.n);
+        if (active.n >= CONSENSUS_FRAMES) {
+          const consensus = buildConsensusScan(active);
           cooldownUntilRef.current = Date.now() + COOLDOWN_MS;
-          stableRef.current = null;
+          accumRef.current = null;
           setStableCount(0);
-          handleStableScan(result.scan);
+          handleStableScan(consensus);
           return;
         }
       } else {
-        stableRef.current = null;
+        accumRef.current = null;
         setStableCount(0);
       }
     }
@@ -502,7 +559,7 @@ export default function SmartScanMobilePage() {
               <div className="flex items-center justify-between gap-2">
                 <div>
                   <div className="text-sm font-extrabold">Live SmartScan</div>
-                  <div className="text-xs text-slate-500">Auto-submits clean sheets after {STABLE_FRAMES} matching reads.</div>
+                  <div className="text-xs text-slate-500">Averages {CONSENSUS_FRAMES} steady reads for a trusted result, then auto-submits clean sheets.</div>
                 </div>
                 <span className="rounded-full bg-emerald-100 px-2 py-1 text-[11px] font-extrabold text-emerald-700">
                   PC paired
@@ -619,7 +676,7 @@ function makeSignals(frame: FrameResult | null, stableCount: number) {
     { label: "QR", text: frame?.qrVisible ? "visible" : "searching", tone: frame?.qrVisible ? "good" : "bad" },
     { label: "Targets", text: frame?.markersVisible ? "4 found" : "align sheet", tone: frame?.markersVisible ? "good" : "bad" },
     { label: "Light", text: frame ? String(frame.brightness) : "waiting", tone: frame && frame.brightness >= 75 ? "good" : frame && frame.brightness >= 55 ? "warn" : "bad" },
-    { label: "Hold", text: `${Math.min(stableCount, STABLE_FRAMES)}/${STABLE_FRAMES}`, tone: stableCount >= STABLE_FRAMES ? "good" : stableCount > 0 ? "warn" : "bad" },
+    { label: "Hold", text: `${Math.min(stableCount, CONSENSUS_FRAMES)}/${CONSENSUS_FRAMES}`, tone: stableCount >= CONSENSUS_FRAMES ? "good" : stableCount > 0 ? "warn" : "bad" },
   ] as { label: string; text: string; tone: SignalTone }[];
 }
 
