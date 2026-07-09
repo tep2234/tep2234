@@ -9,6 +9,7 @@ import {
 import {
   classifyItem,
   ensureCompleteItems,
+  findCornerMarkers,
   readSheet,
   type GrayImage,
   type ItemReading,
@@ -379,4 +380,30 @@ describe("readSheet returns complete item coverage for large sheets", () => {
       expect(complete[total - 1]).toMatchObject({ detected: "D", status: "selected" });
     });
   }
+});
+
+// ---- precomputed corners: live loop runs marker search only once --------
+describe("readSheet with precomputed corners", () => {
+  it("matches a normal read when the caller passes the corners in", () => {
+    const t = buildTemplate(10);
+    const g = blankSheet();
+    MARKER_RECTS.forEach((m) => fillRect(g, m.x, m.y, m.w, m.h, 0));
+    shade(g, t, 2, 1); // 2 -> B
+    const corners = findCornerMarkers(g);
+    expect(corners).not.toBeNull();
+    const fresh = readSheet(g, t);
+    const reused = readSheet(g, t, {}, corners);
+    expect(reused.aligned).toBe(true);
+    expect(reused.items.map((r) => r.detected)).toEqual(fresh.items.map((r) => r.detected));
+    expect(reused.items[1]).toMatchObject({ detected: "B", status: "selected" });
+  });
+
+  it("treats an explicit null as markers-not-found (no silent re-search)", () => {
+    const t = buildTemplate(10);
+    const g = blankSheet();
+    MARKER_RECTS.forEach((m) => fillRect(g, m.x, m.y, m.w, m.h, 0));
+    const res = readSheet(g, t, {}, null);
+    expect(res.aligned).toBe(false);
+    expect(res.items).toHaveLength(0);
+  });
 });

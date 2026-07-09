@@ -68,6 +68,11 @@ const COOLDOWN_MS = 2500;
 // Throttle the heavy analysis so the RAF loop yields the main thread to touch
 // events — keeps buttons responsive on phones instead of janky/laggy.
 const ANALYZE_INTERVAL_MS = 90;
+// After a genuine QR decode, reuse the payload for this long instead of
+// re-decoding every frame. Alignment is still verified per frame, and the TTL
+// is shorter than the post-submit cooldown, so a swapped sheet cannot inherit
+// the previous sheet's identity.
+const QR_STICKY_MS = 1500;
 
 function avgConfidence(data: ScanDetection[]): number {
   return data.length ? data.reduce((s, d) => s + d.confidence, 0) / data.length : 0;
@@ -159,11 +164,19 @@ function analyzeDecodedFrame(img: ImageData, assessmentId: string, qrText: strin
     return { scan: null, status: "bad_item_count", qrVisible: true, markersVisible: false, brightness, aligned: false, message: `Unsupported item count (${decoded.payload.n}). Sheets must have 1–${MAX_ITEMS} items.` };
   }
   const gray = toGray(img);
-  const markersVisible = findCornerMarkers(gray) !== null;
+  // Marker search is the most expensive step — run it ONCE and share the
+  // result with readSheet instead of paying for it twice per frame.
+  const corners = findCornerMarkers(gray);
+  const markersVisible = corners !== null;
   const template = buildTemplate(totalItems);
-  const reading: SheetReading = readSheet(gray, template);
+  const reading: SheetReading = readSheet(gray, template, {}, corners);
   if (!reading.aligned) {
     return { scan: null, status: "markers", qrVisible: true, markersVisible, brightness, aligned: false, message: "Show all 4 corner targets" };
+  }
+  // Identity layer 2: the printed shade-one VERSION row must agree with the
+  // QR payload. A clear mismatch means a wrong or duplicated sheet — block it.
+  if (reading.version.detected && decoded.payload.version && reading.version.detected !== decoded.payload.version) {
+    return { scan: null, status: "wrong_version", qrVisible: true, markersVisible, brightness, aligned: true, message: `Sheet version ${reading.version.detected} does not match this QR (version ${decoded.payload.version}). Wrong or duplicated sheet.` };
   }
   // Strict completeness: exactly items 1..totalItems, gaps flagged for review.
   const detected: ScanDetection[] = ensureCompleteItems(reading.items, totalItems).map((r) => ({
@@ -244,6 +257,7 @@ export default function SmartScanMobilePage() {
   const loopRef = useRef<() => void>(() => {});
   const channelRef = useRef<ScanChannel | null>(null);
   const accumRef = useRef<FillAccum | null>(null);
+  const qrCacheRef = useRef<{ text: string; expires: number } | null>(null);
   const lastAnalyzeRef = useRef(0);
   const cooldownUntilRef = useRef(0);
   const submittingRef = useRef(false);
@@ -256,6 +270,8 @@ export default function SmartScanMobilePage() {
   const [stableCount, setStableCount] = useState(0);
   const [pendingScan, setPendingScan] = useState<MobileScan | null>(null);
   const [syncState, setSyncState] = useState<SyncState>("idle");
+  const [torchAvailable, setTorchAvailable] = useState(false);
+  const [torchOn, setTorchOn] = useState(false);
   const [sentCount, setSentCount] = useState(0);
   const [lastSent, setLastSent] = useState("");
   const [lastScore, setLastScore] = useState<ScoreBroadcast | null>(null);
@@ -272,6 +288,22 @@ export default function SmartScanMobilePage() {
     streamRef.current?.getTracks().forEach((track) => track.stop());
     streamRef.current = null;
     if (videoRef.current) videoRef.current.srcObject = null;
+    setTorchAvailable(false);
+    setTorchOn(false);
+  }, []);
+
+  // Toggle the camera flashlight (Android Chrome and other torch-capable
+  // devices). Low light is the #1 real-world scan failure; this fixes it at
+  // the source instead of trying to recover a dark frame in software.
+  const applyTorch = useCallback(async (on: boolean) => {
+    const track = streamRef.current?.getVideoTracks()[0];
+    if (!track) return;
+    try {
+      await track.applyConstraints({ advanced: [{ torch: on } as MediaTrackConstraintSet] });
+      setTorchOn(on);
+    } catch {
+      setTorchAvailable(false);
+    }
   }, []);
 
   useEffect(() => {
@@ -393,9 +425,19 @@ export default function SmartScanMobilePage() {
       // keeps sampling a handheld sheet. The expensive multi-pass recovery
       // (invert/contrast/threshold) is reserved for the still-photo fallback.
       const nativeQr = canvasRef.current ? await readNativeQr(canvasRef.current) : null;
-      const result = nativeQr
-        ? analyzeDecodedFrame(frame, assessmentId, nativeQr)
-        : analyzeFrame(frame, assessmentId, false);
+      let qrText = nativeQr ?? readQrSmart(frame, false)?.data ?? null;
+      if (qrText) {
+        // Genuine decode: refresh the sticky cache.
+        qrCacheRef.current = { text: qrText, expires: now + QR_STICKY_MS };
+      } else {
+        // Mid-consensus frames where the QR momentarily blurs reuse the last
+        // genuine decode; alignment is still verified below, every frame.
+        const cached = qrCacheRef.current;
+        if (cached && now < cached.expires) qrText = cached.text;
+      }
+      const result = qrText
+        ? analyzeDecodedFrame(frame, assessmentId, qrText)
+        : { scan: null, status: "searching", qrVisible: false, markersVisible: false, brightness: quickBrightness(frame.data), aligned: false, message: "Find the sheet QR" };
       setLastFrame(result);
       if (result.scan) {
         // Trusted layer: accumulate per-bubble darkness across aligned frames of
@@ -426,6 +468,7 @@ export default function SmartScanMobilePage() {
           const consensus = buildConsensusScan(active);
           cooldownUntilRef.current = Date.now() + COOLDOWN_MS;
           accumRef.current = null;
+          qrCacheRef.current = null;
           setStableCount(0);
           handleStableScan(consensus);
           return;
@@ -481,6 +524,19 @@ export default function SmartScanMobilePage() {
       if (!video) return;
       video.srcObject = stream;
       await video.play();
+      // Optional camera upgrades: continuous autofocus keeps a handheld sheet
+      // sharp, and torch support unlocks the flashlight button in low light.
+      // Both are best-effort — unsupported devices just skip them.
+      try {
+        const track = stream.getVideoTracks()[0];
+        const caps = track?.getCapabilities?.() as (MediaTrackCapabilities & { torch?: boolean; focusMode?: string[] }) | undefined;
+        setTorchAvailable(Boolean(caps?.torch));
+        if (caps?.focusMode?.includes("continuous")) {
+          await track.applyConstraints({ advanced: [{ focusMode: "continuous" } as MediaTrackConstraintSet] });
+        }
+      } catch {
+        /* best-effort enhancements only */
+      }
       setStage("live");
       rafRef.current = requestAnimationFrame(() => loopRef.current());
     } catch (err) {
@@ -607,6 +663,15 @@ export default function SmartScanMobilePage() {
                   <div className="absolute inset-0 grid place-items-center px-8 text-center text-sm font-bold text-slate-300">
                     Start live camera or scan one photo.
                   </div>
+                ) : null}
+                {stage === "live" && torchAvailable ? (
+                  <button
+                    type="button"
+                    onClick={() => void applyTorch(!torchOn)}
+                    className={"absolute right-2 top-2 z-10 rounded-full px-3 py-2 text-base font-black " + (torchOn ? "bg-yellow-300 text-yellow-950" : "bg-black/60 text-white")}
+                  >
+                    {torchOn ? "🔦 On" : "💡 Light"}
+                  </button>
                 ) : null}
                 <ScannerOverlay signals={signal} />
               </div>

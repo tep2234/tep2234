@@ -460,15 +460,18 @@ function readVersionMarks(g: GrayImage, h: number[], template: OmrTemplate): Ver
 const NO_FILL = () => new Array<number>(CHOICES.length).fill(0);
 
 // Read a whole sheet. `validChoicesByItem` limits which choices count per item
-// (e.g. a 4-option MC ignores E).
+// (e.g. a 4-option MC ignores E). Pass `precomputedCorners` when the caller
+// already ran findCornerMarkers on this frame — marker search is the most
+// expensive step, so live scanning must not pay for it twice.
 export function readSheet(
   g: GrayImage,
   template: OmrTemplate,
   validChoicesByItem: Record<number, number> = {},
+  precomputedCorners?: Point[] | null,
 ): SheetReading {
   const brightness = meanGray(g);
   const sharpness = sharpnessOf(g);
-  const corners = findCornerMarkers(g);
+  const corners = precomputedCorners !== undefined ? precomputedCorners : findCornerMarkers(g);
   if (!corners) {
     return {
       aligned: false,
