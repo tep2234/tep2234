@@ -153,9 +153,9 @@ function analyzeDecodedFrame(img: ImageData, assessmentId: string, qrText: strin
   };
 }
 
-function analyzeFrame(img: ImageData, assessmentId: string): FrameResult {
+function analyzeFrame(img: ImageData, assessmentId: string, thorough = true): FrameResult {
   const brightness = quickBrightness(img.data);
-  const qr = readQrSmart(img, true);
+  const qr = readQrSmart(img, thorough);
   if (!qr) {
     return { scan: null, status: "searching", qrVisible: false, markersVisible: false, brightness, aligned: false, message: "Find the sheet QR" };
   }
@@ -320,10 +320,18 @@ export default function SmartScanMobilePage() {
     [closeCamera, submitScan],
   );
 
-  const loop = useCallback(() => {
+  const loop = useCallback(async () => {
     const frame = grabFrame();
     if (frame && Date.now() >= cooldownUntilRef.current) {
-      const result = analyzeFrame(frame, assessmentId);
+      // Fast path first: the native BarcodeDetector (Android / iOS 17+) reads the
+      // QR far faster and more reliably than jsQR. Only fall back to a *cheap*
+      // jsQR pass (dontInvert) so the per-frame cost stays low and the RAF loop
+      // keeps sampling a handheld sheet. The expensive multi-pass recovery
+      // (invert/contrast/threshold) is reserved for the still-photo fallback.
+      const nativeQr = canvasRef.current ? await readNativeQr(canvasRef.current) : null;
+      const result = nativeQr
+        ? analyzeDecodedFrame(frame, assessmentId, nativeQr)
+        : analyzeFrame(frame, assessmentId, false);
       setLastFrame(result);
       if (result.scan) {
         const prev = stableRef.current;
@@ -342,7 +350,7 @@ export default function SmartScanMobilePage() {
         setStableCount(0);
       }
     }
-    rafRef.current = requestAnimationFrame(() => loopRef.current());
+    rafRef.current = requestAnimationFrame(() => void loopRef.current());
   }, [assessmentId, grabFrame, handleStableScan]);
 
   useEffect(() => {
