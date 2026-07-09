@@ -8,6 +8,7 @@ import {
 } from "../src/lib/scanner/omr-template";
 import {
   classifyItem,
+  ensureCompleteItems,
   readSheet,
   type GrayImage,
   type ItemReading,
@@ -328,4 +329,54 @@ describe("buildReview", () => {
     const r = buildReview(items, key, readings, { 1: "" });
     expect(r.rawScore).toBe(1); // item 1 now blank, only item 2 correct
   });
+});
+
+// ---- strict completeness: never miss an item number --------------------
+describe("ensureCompleteItems (no-missed-number guarantee)", () => {
+  it("returns exactly items 1..total in order for every supported size", () => {
+    for (const total of [40, 50, 60, 80]) {
+      const partial: ItemReading[] = [
+        { item: 3, detected: "B", status: "selected", confidence: 0.9, fill: [0, 0.7, 0, 0, 0] },
+        { item: total, detected: "A", status: "selected", confidence: 0.9, fill: [0.7, 0, 0, 0, 0] },
+      ];
+      const out = ensureCompleteItems(partial, total);
+      expect(out).toHaveLength(total);
+      expect(out.map((r) => r.item)).toEqual(Array.from({ length: total }, (_, i) => i + 1));
+    }
+  });
+
+  it("flags any inserted (missing) item as Needs Review, never silently blank", () => {
+    const out = ensureCompleteItems([{ item: 2, detected: "A", status: "selected", confidence: 0.9, fill: [] }], 3);
+    expect(out[0]).toMatchObject({ item: 1, status: "unclear", detected: null });
+    expect(out[1]).toMatchObject({ item: 2, status: "selected" });
+    expect(out[2]).toMatchObject({ item: 3, status: "unclear", detected: null });
+  });
+
+  it("is idempotent on an already-complete list", () => {
+    const full: ItemReading[] = Array.from({ length: 40 }, (_, i) => ({
+      item: i + 1, detected: null, status: "blank" as const, confidence: 0.9, fill: [],
+    }));
+    expect(ensureCompleteItems(full, 40).map((r) => r.item)).toEqual(full.map((r) => r.item));
+  });
+});
+
+describe("readSheet returns complete item coverage for large sheets", () => {
+  for (const total of [40, 50, 60, 80]) {
+    it(`reads exactly ${total} items, numbered 1..${total} with no gaps`, () => {
+      const t = buildTemplate(total);
+      const g = blankSheet();
+      MARKER_RECTS.forEach((m) => fillRect(g, m.x, m.y, m.w, m.h, 0));
+      // Shade a spread of items to exercise the full grid.
+      shade(g, t, 1, 0);
+      shade(g, t, Math.floor(total / 2), 2);
+      shade(g, t, total, 3);
+      const res = readSheet(g, t);
+      expect(res.aligned).toBe(true);
+      const complete = ensureCompleteItems(res.items, total);
+      expect(complete).toHaveLength(total);
+      expect(complete.map((r) => r.item)).toEqual(Array.from({ length: total }, (_, i) => i + 1));
+      expect(complete[0]).toMatchObject({ detected: "A", status: "selected" });
+      expect(complete[total - 1]).toMatchObject({ detected: "D", status: "selected" });
+    });
+  }
 });

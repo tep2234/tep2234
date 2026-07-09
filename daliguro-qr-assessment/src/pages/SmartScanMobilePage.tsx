@@ -12,8 +12,8 @@ import { isSupabaseConfigured } from "../lib/supabase/client";
 import { decodeQrPayload } from "../lib/qr-parse";
 import { assessmentMatches, type ScanDetection, type ScoreBroadcast } from "../lib/sync/pairing";
 import { joinScanChannel, type ScanChannel } from "../lib/sync/realtimeSmartScan";
-import { buildTemplate, CHOICES } from "../lib/scanner/omr-template";
-import { classifyItem, findCornerMarkers, readSheet, toGray, type SheetReading } from "../lib/scanner/omr-detect";
+import { buildTemplate, CHOICES, MAX_ITEMS } from "../lib/scanner/omr-template";
+import { classifyItem, ensureCompleteItems, findCornerMarkers, readSheet, toGray, type SheetReading } from "../lib/scanner/omr-detect";
 import { readQrSmart } from "../lib/scanner/qr-detect";
 import { REVIEW_CONFIDENCE } from "../lib/scanner/omr-score";
 import { scanQuality, type ScanQuality } from "../lib/scanner/scan-quality";
@@ -26,10 +26,12 @@ type SignalTone = "good" | "warn" | "bad";
 interface MobileScan {
   learnerId: string;
   version: string;
+  totalItems: number;
   detected: ScanDetection[];
   confidence: number;
   quality: ScanQuality;
   hasDoubt: boolean;
+  reviewCount: number;
   signature: string;
 }
 
@@ -51,12 +53,16 @@ interface FillAccum {
   n: number;
   fills: Map<number, number[]>; // item -> summed per-choice darkness
   base: MobileScan; // most recent frame, kept for capture-quality metrics
+  misses: number; // consecutive non-aligned frames tolerated before reset
 }
 
 const AUTO_ACCEPT = 0.8;
-// Number of aligned frames averaged before we trust a reading. More frames =
-// steadier answers and higher confidence; camera OMR needs a short burst.
-const CONSENSUS_FRAMES = 4;
+// Number of aligned frames averaged before we trust a reading. A short burst
+// denoises the read while still locking fast (~3 good frames).
+const CONSENSUS_FRAMES = 3;
+// A brief wobble shouldn't throw away accumulated frames — tolerate this many
+// consecutive misses so the read keeps building instead of restarting.
+const MISS_TOLERANCE = 3;
 const FRAME_W = 1300;
 const COOLDOWN_MS = 2500;
 // Throttle the heavy analysis so the RAF loop yields the main thread to touch
@@ -86,8 +92,20 @@ function buildConsensusScan(acc: FillAccum): MobileScan {
     detected,
     confidence,
     hasDoubt: detected.some(isDoubtful),
+    reviewCount: detected.filter(isDoubtful).length,
     signature: scanSignature(acc.base.learnerId, acc.base.version, detected),
   };
+}
+
+// Human-readable status for the review screen — every item carries a clear
+// label and (when uncertain) a reason, so nothing is silently empty.
+function statusLabel(status: string, confidence: number): { label: string; review: boolean } {
+  if (status === "multiple") return { label: "Multiple Marks", review: true };
+  if (status === "unclear") return { label: "Ambiguous", review: true };
+  if (status === "blank") return { label: "Blank", review: false };
+  // selected
+  if (confidence < REVIEW_CONFIDENCE) return { label: "Low Confidence", review: true };
+  return { label: "OK", review: false };
 }
 
 function scanSignature(lId: string, ver: string, data: ScanDetection[]): string {
@@ -132,16 +150,23 @@ function analyzeDecodedFrame(img: ImageData, assessmentId: string, qrText: strin
     return { scan: null, status: "qr_error", qrVisible: true, markersVisible: false, brightness, aligned: false, message: decoded.reason };
   }
   if (assessmentId && !assessmentMatches(assessmentId, decoded.payload.assessmentId)) {
-    return { scan: null, status: "wrong_assessment", qrVisible: true, markersVisible: false, brightness, aligned: false, message: "Wrong assessment sheet" };
+    return { scan: null, status: "wrong_assessment", qrVisible: true, markersVisible: false, brightness, aligned: false, message: "Wrong assessment sheet — this QR is for a different assessment." };
+  }
+  // Item-count guard: block sheets whose declared item count is invalid or
+  // exceeds the printable grid, rather than reading a partial sheet.
+  const totalItems = Math.round(decoded.payload.n || 0);
+  if (!Number.isFinite(totalItems) || totalItems < 1 || totalItems > MAX_ITEMS) {
+    return { scan: null, status: "bad_item_count", qrVisible: true, markersVisible: false, brightness, aligned: false, message: `Unsupported item count (${decoded.payload.n}). Sheets must have 1–${MAX_ITEMS} items.` };
   }
   const gray = toGray(img);
   const markersVisible = findCornerMarkers(gray) !== null;
-  const template = buildTemplate(Math.max(1, decoded.payload.n || 1));
+  const template = buildTemplate(totalItems);
   const reading: SheetReading = readSheet(gray, template);
   if (!reading.aligned) {
     return { scan: null, status: "markers", qrVisible: true, markersVisible, brightness, aligned: false, message: "Show all 4 corner targets" };
   }
-  const detected: ScanDetection[] = reading.items.map((r) => ({
+  // Strict completeness: exactly items 1..totalItems, gaps flagged for review.
+  const detected: ScanDetection[] = ensureCompleteItems(reading.items, totalItems).map((r) => ({
     item: r.item,
     answer: r.detected ?? "",
     status: r.status,
@@ -164,10 +189,12 @@ function analyzeDecodedFrame(img: ImageData, assessmentId: string, qrText: strin
   const scan: MobileScan = {
     learnerId: decoded.payload.learnerId,
     version: decoded.payload.version,
+    totalItems,
     detected,
     confidence,
     quality,
     hasDoubt,
+    reviewCount: doubtfulItems,
     signature: scanSignature(decoded.payload.learnerId, decoded.payload.version, detected),
   };
   return {
@@ -380,7 +407,7 @@ export default function SmartScanMobilePage() {
         if (!acc || acc.key !== key) {
           const fills = new Map<number, number[]>();
           scan.detected.forEach((d) => fills.set(d.item, (d.fill ?? []).slice()));
-          active = { key, n: 1, fills, base: scan };
+          active = { key, n: 1, fills, base: scan, misses: 0 };
         } else {
           scan.detected.forEach((d) => {
             const f = d.fill ?? [];
@@ -390,6 +417,7 @@ export default function SmartScanMobilePage() {
           });
           acc.n += 1;
           acc.base = scan;
+          acc.misses = 0;
           active = acc;
         }
         accumRef.current = active;
@@ -403,8 +431,15 @@ export default function SmartScanMobilePage() {
           return;
         }
       } else {
-        accumRef.current = null;
-        setStableCount(0);
+        // A momentary miss (wobble/glare) shouldn't discard progress — keep the
+        // accumulated frames unless misses pile up or the sheet is truly gone.
+        const acc = accumRef.current;
+        if (acc && acc.misses + 1 < MISS_TOLERANCE) {
+          acc.misses += 1;
+        } else {
+          accumRef.current = null;
+          setStableCount(0);
+        }
       }
     }
     rafRef.current = requestAnimationFrame(() => void loopRef.current());
@@ -602,15 +637,28 @@ export default function SmartScanMobilePage() {
           {stage === "review" && pendingScan ? (
             <section className="rounded-xl border border-amber-200 bg-white p-3 text-slate-950">
               <div className="text-sm font-extrabold">Confirm detected answers</div>
-              <p className="text-xs text-slate-500">
-                Learner {pendingScan.learnerId} · trust {Math.round(pendingScan.confidence * 100)}% · quality {pendingScan.quality.score}/100.
-                Confirm to submit into the open PC dashboard.
-              </p>
+              <div className="mt-1 grid grid-cols-2 gap-1 text-[11px] text-slate-600">
+                <span>Learner: <b className="text-slate-900">{pendingScan.learnerId}</b></span>
+                <span>Version: <b className="text-slate-900">{pendingScan.version || "—"}</b></span>
+                <span>Assessment: <b className="text-slate-900">{assessmentId || "—"}</b></span>
+                <span>Items: <b className="text-slate-900">{pendingScan.detected.length}/{pendingScan.totalItems}</b></span>
+                <span>Confidence: <b className="text-slate-900">{Math.round(pendingScan.confidence * 100)}%</b></span>
+                <span>Quality: <b className="text-slate-900">{pendingScan.quality.score}/100</b></span>
+              </div>
+              {pendingScan.reviewCount > 0 ? (
+                <div className="mt-2 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-xs font-bold text-amber-800">
+                  ⚠ {pendingScan.reviewCount} item{pendingScan.reviewCount === 1 ? "" : "s"} need review (highlighted below). Check each before submitting.
+                </div>
+              ) : (
+                <div className="mt-2 rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs font-bold text-emerald-800">
+                  All {pendingScan.totalItems} items read cleanly. Confirm to submit.
+                </div>
+              )}
               <MobileQuality scan={pendingScan} />
               <AnswerGrid detected={pendingScan.detected} />
               <div className="mt-3 grid gap-2">
                 <Button onClick={() => void submitScan(pendingScan)} disabled={syncState === "pending"}>
-                  Confirm & submit
+                  {pendingScan.reviewCount > 0 ? `Confirm ${pendingScan.reviewCount} review item(s) & submit` : "Confirm & submit"}
                 </Button>
                 <Button variant="ghost" onClick={resetForNext}>Scan again</Button>
               </div>
@@ -713,15 +761,21 @@ function signalCls(tone: SignalTone): string {
 
 function AnswerGrid({ detected }: { detected: ScanDetection[] }) {
   return (
-    <div className="mt-2 grid max-h-64 grid-cols-2 gap-1 overflow-y-auto text-xs">
-      {detected.map((d) => (
-        <div key={d.item} className={"flex items-center justify-between rounded border px-2 py-1 " +
-          (d.status === "unclear" || d.status === "multiple" ? "border-amber-300 bg-amber-50" : "border-slate-200")}>
-          <span className="font-bold">{d.item}</span>
-          <span>{d.answer || "-"}</span>
-          <span className="text-slate-400">{Math.round(d.confidence * 100)}%</span>
-        </div>
-      ))}
+    <div className="mt-2 grid max-h-72 grid-cols-2 gap-1 overflow-y-auto text-xs">
+      {detected.map((d) => {
+        const { label, review } = statusLabel(d.status, d.confidence);
+        return (
+          <div key={d.item} className={"flex items-center justify-between gap-1 rounded border px-2 py-1 " +
+            (review ? "border-amber-400 bg-amber-50" : "border-slate-200")}>
+            <span className="w-6 font-bold">{d.item}</span>
+            <span className="w-4 text-center font-extrabold">{d.answer || "–"}</span>
+            <span className={"flex-1 truncate text-right text-[10px] font-semibold " + (review ? "text-amber-700" : "text-slate-400")}>
+              {label}
+            </span>
+            <span className="w-8 text-right text-slate-400">{Math.round(d.confidence * 100)}%</span>
+          </div>
+        );
+      })}
     </div>
   );
 }

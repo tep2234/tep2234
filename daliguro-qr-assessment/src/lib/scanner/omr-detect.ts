@@ -421,6 +421,28 @@ function clamp01(v: number): number {
   return v < 0 ? 0 : v > 1 ? 1 : v;
 }
 
+// Strict no-missed-number guarantee: return EXACTLY items 1..total in order.
+// Any index the detector failed to produce is inserted as an explicit
+// "unclear" (Needs Review) placeholder — never silently dropped. This is the
+// contract the scan result relies on: a 40-item sheet always yields 40 entries.
+export function ensureCompleteItems(items: ItemReading[], total: number): ItemReading[] {
+  const byItem = new Map<number, ItemReading>();
+  for (const r of items) byItem.set(r.item, r);
+  const out: ItemReading[] = [];
+  for (let n = 1; n <= total; n += 1) {
+    out.push(
+      byItem.get(n) ?? {
+        item: n,
+        detected: null,
+        status: "unclear",
+        confidence: 0,
+        fill: NO_FILL(),
+      },
+    );
+  }
+  return out;
+}
+
 // Read the shade-one VERSION bubbles using an existing homography.
 function readVersionMarks(g: GrayImage, h: number[], template: OmrTemplate): VersionReading {
   const fill = template.versionBubbles.map((b) =>
