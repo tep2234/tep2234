@@ -42,12 +42,6 @@ export type ScanResolution =
       version: TestVersion;
     };
 
-function resolveVersion(assessment: Assessment, payload: QrPayload): TestVersion {
-  return assessment.versions.includes(payload.version)
-    ? payload.version
-    : assessment.versions[0] ?? "A";
-}
-
 export function resolveScanIdentity(
   raw: string,
   state: QrAssessmentState,
@@ -60,10 +54,17 @@ export function resolveScanIdentity(
   const assessment = state.assessments.find((a) => a.id === payload.assessmentId);
   if (!assessment) return { status: "ASSESSMENT_NOT_FOUND", payload };
 
+  if (!assessment.versions.includes(payload.version)) {
+    return {
+      status: "QR_PAYLOAD_INVALID",
+      reason: `QR version ${payload.version} is not enabled for ${assessment.title}. Reprint the sheet.`,
+    };
+  }
+
   const learner = state.learners.find((l) => l.id === payload.learnerId);
   if (!learner) return { status: "LEARNER_NOT_FOUND", payload, assessment };
 
-  const version = resolveVersion(assessment, payload);
+  const version: TestVersion = payload.version;
 
   if (activeId !== assessment.id) {
     return { status: "ASSESSMENT_NOT_ACTIVE", payload, assessment, learner, version };

@@ -85,6 +85,13 @@ describe("reportItems", () => {
     expect(rows[0].mostWrong).toBe("C");
     expect(rows[0].mastery).toBe("Not Mastered");
   });
+
+  it("does not report unresolved unreadable evidence as an error or a taker", () => {
+    const rows = reportItems(items, [
+      result({ itemScores: [score({ itemId: "i1", unresolved: true, unresolvedStatus: "unreadable" })] }),
+    ]);
+    expect(rows[0]).toMatchObject({ takers: 0, correct: 0, errors: 0, percentCorrect: 0, freqOfError: 0 });
+  });
 });
 
 describe("reportSummary", () => {

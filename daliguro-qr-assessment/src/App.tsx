@@ -4,6 +4,8 @@ import { useQrStore } from "./lib/useQrStore";
 import type { PanelProps } from "./components/panel-types";
 import type { Assessment, Learner, QrAssessmentState } from "./lib/types";
 import { downloadCsv, safeFilename, toCsv } from "./lib/export";
+import { pendingReviewResults } from "./lib/result-trust";
+import { flushReviewAuditOutbox } from "./lib/sync/review-audit-outbox";
 import SetupPanel from "./components/SetupPanel";
 import ItemsPanel from "./components/ItemsPanel";
 import LearnersPanel from "./components/LearnersPanel";
@@ -136,16 +138,19 @@ export default function App() {
   const { state, setState, loaded } = useQrStore();
   const location = useLocation();
   const routerNavigate = useNavigate();
-  const [tab, setTab] = useState<TabId>(() => tabFromPath(location.pathname));
+  const tab = tabFromPath(location.pathname);
   const [activeId, setActiveId] = useState<string | null>(() => loadActiveAssessmentId());
-
-  useEffect(() => {
-    setTab(tabFromPath(location.pathname));
-  }, [location.pathname]);
 
   useEffect(() => {
     saveActiveAssessmentId(activeId);
   }, [activeId]);
+
+  useEffect(() => {
+    void flushReviewAuditOutbox();
+    const retry = () => void flushReviewAuditOutbox();
+    window.addEventListener("online", retry);
+    return () => window.removeEventListener("online", retry);
+  }, []);
 
   if (!loaded) {
     return (
@@ -164,7 +169,6 @@ export default function App() {
         : state.assessments[0]?.id ?? null;
   const active = state.assessments.find((a) => a.id === effectiveActiveId) ?? null;
   function goToTab(next: TabId) {
-    setTab(next);
     routerNavigate(TAB_ROUTES[next]);
   }
   const panelProps: PanelProps = {
@@ -174,7 +178,7 @@ export default function App() {
     setActiveId,
     navigate: (next) => goToTab(validTab(next)),
   };
-  const pendingReview = state.results.filter((r) => r.reviewStatus === "needs_review").length;
+  const pendingReview = pendingReviewResults(state.results).length;
   const activeResults = active ? state.results.filter((r) => r.assessmentId === active.id) : [];
   const currentMeta = PAGE_META[tab];
   const navGroups: NavGroup[] = [

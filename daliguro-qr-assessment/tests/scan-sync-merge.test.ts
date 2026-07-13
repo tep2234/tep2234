@@ -31,6 +31,7 @@ function baseState(results: Result[] = []): QrAssessmentState {
 }
 
 const input: SyncedResultInput = {
+  scanId: "scan-id-0001",
   assessmentId: "A1",
   learnerId: "L1",
   version: "A",
@@ -56,7 +57,8 @@ describe("upsertSyncedResult (phone -> PC scoring bridge)", () => {
     expect(r.percentage).toBe(50);
     expect(r.masteryStatus).toBe("Needs Reinforcement");
     expect(r.source).toBe("scan");
-    expect(r.reviewStatus).toBe("auto");
+    expect(r.reviewStatus).toBe("needs_review");
+    expect(r.reviewed).toBe(false);
     expect(r.scanConfidence).toBe(0.92);
   });
 
@@ -66,26 +68,57 @@ describe("upsertSyncedResult (phone -> PC scoring bridge)", () => {
     expect(results[0].reviewed).toBe(false);
   });
 
-  it("re-syncing the same learner replaces in place (same id), keeps audit trail", () => {
+  it("replaying the same submission id is idempotent and does not mutate answers", () => {
     const first = upsertSyncedResult(baseState(), input);
     const second = upsertSyncedResult(baseState(first.results), {
       ...input,
-      responses: { i1: "A", i2: "B" }, // corrected -> 100%
     });
     expect(second.results).toHaveLength(1);
     expect(second.results[0].id).toBe(first.results[0].id);
-    expect(second.results[0].percentage).toBe(100);
-    expect(second.results[0].auditLog.length).toBeGreaterThanOrEqual(2);
+    expect(second.results[0].percentage).toBe(50);
+    expect(second.results[0].auditLog).toHaveLength(1);
+    expect(second.disposition).toBe("replayed");
   });
 
-  it("never clobbers a locally finalized (locked) result", () => {
+  it("rejects the same submission id when its answer payload changes", () => {
     const first = upsertSyncedResult(baseState(), input);
-    const locked = first.results.map((r) => ({ ...r, finalizedAt: 123, percentage: 50 }));
-    const after = upsertSyncedResult(baseState(locked), {
+    const after = upsertSyncedResult(baseState(first.results), {
       ...input,
-      responses: { i1: "A", i2: "B" }, // would be 100% if it overwrote
+      responses: { i1: "A", i2: "B" },
     });
-    expect(after.results[0].finalizedAt).toBe(123);
-    expect(after.results[0].percentage).toBe(50); // unchanged
+    expect(after.disposition).toBe("conflict");
+    expect(after.reason).toBe("scan_id_payload_mismatch");
+    expect(after.results[0].percentage).toBe(50);
+  });
+
+  it("requires an explicit decision before a different scan replaces any existing result", () => {
+    const first = upsertSyncedResult(baseState(), input);
+    const after = upsertSyncedResult(baseState(first.results), {
+      ...input,
+      scanId: "scan-id-0002",
+      responses: { i1: "A", i2: "B" },
+    });
+    expect(after.disposition).toBe("conflict");
+    expect(after.reason).toBe("existing_result_requires_decision");
+    expect(after.results[0].percentage).toBe(50);
+  });
+
+  it("returns an OMR subtotal for mixed assessments instead of treating manual items as wrong", () => {
+    const mixed = baseState();
+    mixed.items.splice(1, 0, {
+      ...item(3, ""),
+      id: "essay",
+      itemNumber: 2,
+      type: "Essay",
+      choices: 0,
+      points: 5,
+    });
+    mixed.items[2] = { ...mixed.items[2], itemNumber: 3 };
+    const outcome = upsertSyncedResult(mixed, input);
+    expect(outcome.raw).toBe(1);
+    expect(outcome.total).toBe(2);
+    expect(outcome.pct).toBe(50);
+    expect(outcome.results[0].totalScore).toBe(7);
+    expect(outcome.results[0].reviewStatus).toBe("needs_review");
   });
 });

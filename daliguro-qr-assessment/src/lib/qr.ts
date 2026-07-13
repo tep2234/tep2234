@@ -19,8 +19,12 @@ export function payloadChecksum(
   assessmentId: string,
   learnerId: string,
   version: string,
+  securityToken = "",
+  omrItemCount = 0,
 ): string {
-  return checksumOf(assessmentId + "|" + learnerId + "|" + version);
+  return checksumOf(
+    [assessmentId, learnerId, version, securityToken, String(omrItemCount)].join("|"),
+  );
 }
 
 // Construct the QR payload for one learner sheet.
@@ -33,6 +37,7 @@ export function buildQrPayload(
   version: TestVersion,
   omrItemCount: number,
 ): QrPayload {
+  const token = buildSecurityToken(assessmentId, learner.id, version);
   return {
     assessmentId,
     learnerId: learner.id,
@@ -40,9 +45,9 @@ export function buildQrPayload(
     section: learner.section,
     gradeLevel: learner.gradeLevel,
     version,
-    securityToken: buildSecurityToken(assessmentId, learner.id, version),
+    securityToken: token,
     n: omrItemCount,
-    checksum: payloadChecksum(assessmentId, learner.id, version),
+    checksum: payloadChecksum(assessmentId, learner.id, version, token, omrItemCount),
   };
 }
 

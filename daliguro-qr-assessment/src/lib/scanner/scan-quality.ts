@@ -1,12 +1,24 @@
 // SmartScan quality scoring. This does not decide the academic score; it rates
 // whether the camera capture is trustworthy enough for auto-accept vs. review.
 
+import {
+  evaluateQualityGates,
+  type CaptureQualityReasonCode,
+  type QualityDisposition,
+} from "./quality-gates";
+
 export type ScanQualityLabel = "Excellent" | "Good" | "Review" | "Retake";
 
 export interface ScanQuality {
   score: number; // 0..100
   label: ScanQualityLabel;
   issues: string[];
+  // Structured safety decision. Consumers must use autoEligible for automatic
+  // acceptance; score is presentation-only and cannot override hard blockers.
+  disposition: QualityDisposition;
+  autoEligible: boolean;
+  reasonCodes: CaptureQualityReasonCode[];
+  hardBlockers: CaptureQualityReasonCode[];
 }
 
 function clamp(v: number, lo: number, hi: number): number {
@@ -26,6 +38,8 @@ export function scanQuality(args: {
   shadowLevel?: number;
   tiltAngle?: number;
   bubbleDarkness?: number;
+  glareLevel?: number;
+  obscuredBubbleCount?: number;
 }): ScanQuality {
   const confidence = clamp(args.confidence, 0, 1);
   const light = band(args.brightness, 55, 145);
@@ -44,22 +58,36 @@ export function scanQuality(args: {
     tilt * 7 +
     print * 4 +
     (1 - doubtPenalty) * 4;
-  const score = Math.round(clamp(raw, 0, 100));
-  const issues: string[] = [];
-  if (!args.aligned) issues.push("corner targets not aligned");
-  if (args.brightness < 70) issues.push("low light");
-  if (args.brightness > 230) issues.push("possible glare");
-  if (args.sharpness < 2.4) issues.push("soft focus");
-  if ((args.shadowLevel ?? 0) > 42) issues.push("uneven shadow");
-  if ((args.tiltAngle ?? 0) > 8) issues.push("sheet tilted");
-  if (args.bubbleDarkness != null && args.bubbleDarkness < 0.18) issues.push("print or mark contrast too weak");
-  if (confidence < 0.75) issues.push("weak bubble confidence");
-  if (args.doubtfulItems > 0) issues.push(`${args.doubtfulItems} doubtful mark${args.doubtfulItems === 1 ? "" : "s"}`);
+  const gates = evaluateQualityGates({
+    aligned: args.aligned,
+    brightness: args.brightness,
+    sharpness: args.sharpness,
+    shadowLevel: args.shadowLevel,
+    tiltAngle: args.tiltAngle,
+    bubbleDarkness: args.bubbleDarkness,
+    glareLevel: args.glareLevel,
+    obscuredBubbleCount: args.obscuredBubbleCount,
+    confidence,
+    doubtfulItems: args.doubtfulItems,
+  });
+  // Keep a useful relative presentation score, but cap unsafe results below
+  // the historic automatic thresholds as defense in depth for older callers.
+  let score = Math.round(clamp(raw, 0, 100));
+  if (gates.disposition === "retake") score = Math.min(score, 54);
+  const issues = gates.reasons.map((reason) => reason.issue);
 
   let label: ScanQualityLabel;
-  if (score >= 88 && issues.length === 0) label = "Excellent";
-  else if (score >= 74 && args.doubtfulItems === 0) label = "Good";
-  else if (score >= 55 || (args.aligned && confidence >= 0.55)) label = "Review";
-  else label = "Retake";
-  return { score, label, issues };
+  if (gates.disposition === "retake") label = "Retake";
+  else if (gates.disposition === "review") label = "Review";
+  else if (score >= 88) label = "Excellent";
+  else label = "Good";
+  return {
+    score,
+    label,
+    issues,
+    disposition: gates.disposition,
+    autoEligible: gates.autoEligible,
+    reasonCodes: gates.reasonCodes,
+    hardBlockers: gates.hardBlockers,
+  };
 }

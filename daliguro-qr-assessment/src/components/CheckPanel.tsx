@@ -1,7 +1,7 @@
 // SmartScan panel — scan → verify → review → save pipeline.
-// Batch mode: clean, high-confidence scans save automatically; doubtful scans
-// are stored as "needs review" for the Review tab. Manual checking and QR
-// paste remain as fallbacks. Results are self-contained: scored under the
+// Phase 1 safety mode: every scan is verified by a teacher before it is saved;
+// doubtful phone scans are stored as "needs review" for the Review tab. Manual
+// checking and QR paste remain as fallbacks. Results are self-contained: scored under the
 // QR's OWN assessment, never whatever happens to be active.
 
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -12,12 +12,12 @@ import type {
   QrAssessmentState,
   Result,
   ReviewStatus,
-  ScanItemMeta,
   TestVersion,
   VersionKey,
 } from "../lib/types";
 import { isObjective } from "../lib/items";
-import { emptyInput, type CheckingInput } from "../lib/scoring";
+import { pendingReviewResults } from "../lib/result-trust";
+import { emptyInput, masteryBand, type CheckingInput } from "../lib/scoring";
 import { parseQrPayload } from "../lib/qr-parse";
 import { saveEvidence } from "../lib/offline-store";
 import { ActiveGate } from "./ActiveGate";
@@ -28,9 +28,9 @@ import {
   evaluateCertification,
   type CertificationReport,
 } from "../lib/scanner/calibration";
-import { REVIEW_CONFIDENCE } from "../lib/scanner/omr-score";
-import type { ReviewSummary } from "../lib/scanner/omr-score";
-import { upsertScanResult, upsertSyncedResult, type SyncedResultInput } from "../lib/scanner/scan-save";
+import { upsertScanResult, upsertSyncedResult } from "../lib/scanner/scan-save";
+import type { ReviewDecisions } from "../lib/scanner/omr-score";
+import { mapSyncedRow } from "../lib/scanner/synced-row";
 import type { CheckedResultRow, ScoredSummary } from "../lib/sync/pairing";
 import { AnswerSheetScanner, type ScanResult } from "./scanner/AnswerSheetScanner";
 import { ScanReviewPanel } from "./scanner/ScanReviewPanel";
@@ -40,8 +40,7 @@ import { Button, Empty } from "./ui";
 
 type CheckMode = "scan" | "manual" | "paste";
 
-// Auto-accept threshold: at or above this trust score (and with no unclear or
-// multiple marks) a batch scan saves without review.
+// Trust display threshold only. Phase 1 requires teacher review even above it.
 const AUTO_ACCEPT = 0.8;
 const MIN_PRODUCTION_QUALITY = 55;
 const calibrationKey = (assessmentId: string) => `daliguro_scanner_certification_${assessmentId}`;
@@ -119,56 +118,6 @@ function inputFromResult(result: Result | undefined): CheckingInput {
   return input;
 }
 
-function responsesFrom(summary: ReviewSummary): Record<string, string> {
-  const responses: Record<string, string> = {};
-  summary.rows.forEach((r) => {
-    responses[r.item.id] = r.detected ?? "";
-  });
-  return responses;
-}
-
-// The phone's raw detection shape stored in a synced row's item_results.
-type SyncedDetection = { item: number; answer: string; status: string; confidence: number; fill?: number[] };
-
-// Convert a phone-synced checked-result row into the primitives the local
-// scorer needs. Answers arrive keyed by item NUMBER; map them to itemIds via
-// the assessment's ordered items. Returns null for a row that isn't for this
-// assessment. Version comes from the QR (carried in qr_payload), falling back
-// to the assessment's first version.
-function rowToSyncedInput(
-  row: CheckedResultRow,
-  active: Assessment,
-  aItems: Item[],
-  forceReview = false,
-): SyncedResultInput | null {
-  if (row.assessment_id !== active.id) return null;
-  const rv = (row.qr_payload as { version?: string } | null)?.version;
-  const version = rv && active.versions.includes(rv as TestVersion) ? rv : active.versions[0] ?? "A";
-  const responses: Record<string, string> = {};
-  Object.entries(row.answer_map ?? {}).forEach(([num, letter]) => {
-    const it = aItems[Number(num) - 1];
-    if (it) responses[it.id] = String(letter ?? "");
-  });
-  const scanItems: ScanItemMeta[] = ((row.item_results as SyncedDetection[]) ?? []).map((d) => ({
-    itemNumber: Number(d.item),
-    detected: d.answer ? String(d.answer) : null,
-    status: (d.status ?? "selected") as ScanItemMeta["status"],
-    confidence: Number(d.confidence ?? 0),
-    fill: Array.isArray(d.fill) ? d.fill : undefined,
-  }));
-  // Item-count guard: a scan whose detected item count doesn't match the
-  // assessment (stale/wrong-format sheet) must NOT auto-finalize — route it to
-  // review so no silently-misaligned result slips through.
-  const detectedCount = row.total_items || Object.keys(row.answer_map ?? {}).length;
-  const countMismatch = aItems.length > 0 && detectedCount !== aItems.length;
-  const hasDoubt =
-    (row.low_confidence_items?.length ?? 0) > 0 ||
-    scanItems.some((s) => s.status === "unclear" || s.status === "multiple" || (s.status === "selected" && s.confidence < REVIEW_CONFIDENCE));
-  const trust = Number(row.scan_confidence ?? 0);
-  const reviewStatus: ReviewStatus = forceReview || countMismatch || hasDoubt || trust < AUTO_ACCEPT ? "needs_review" : "auto";
-  return { assessmentId: active.id, learnerId: row.learner_id, version, responses, scanItems, confidence: row.scan_confidence, reviewStatus };
-}
-
 function trustTone(confidence: number): string {
   if (confidence >= AUTO_ACCEPT) return "border-emerald-300 bg-emerald-50 text-emerald-800";
   if (confidence >= 0.6) return "border-amber-300 bg-amber-50 text-amber-800";
@@ -235,10 +184,12 @@ function CheckEditor({
   function persistScan(
     result: ScanResult,
     responses: Record<string, string>,
+    decisions: ReviewDecisions,
     reviewStatus: ReviewStatus,
   ): { raw: number; total: number; pct: number } | null {
+    const current = stateRef.current;
     const existing = findResult(
-      state.results,
+      current.results,
       result.assessment.id,
       result.learner.id,
       result.version,
@@ -251,12 +202,13 @@ function CheckEditor({
       if (!reason || !reason.trim()) return null;
       auditReason = reason.trim();
     }
-    const saved = upsertScanResult(state, result, responses, reviewStatus, auditReason);
-    setState((prev) => {
-      // Recompute against the freshest state so batch saves never clobber.
-      const next = upsertScanResult(prev, result, responses, reviewStatus, auditReason);
-      return { ...prev, results: next.results };
-    });
+    const actorId = result.assessment.teacherName || "local-teacher";
+    const saved = upsertScanResult(current, result, responses, decisions, reviewStatus, auditReason, actorId);
+    // Advance the mutable latest-state reference immediately so rapid batch
+    // captures cannot race a React render or generate different audit ids.
+    const nextState = { ...current, results: saved.results };
+    stateRef.current = nextState;
+    setState(nextState);
     if (result.evidence) void saveEvidence(saved.id, result.evidence);
     setLastSaved({
       id: Date.now(),
@@ -274,8 +226,9 @@ function CheckEditor({
     return { raw: saved.raw, total: saved.total, pct: saved.pct };
   }
 
-  // Route a completed scan: batch mode auto-saves clean scans and queues
-  // doubtful ones; otherwise (or on duplicates) open the review panel.
+  // Phase 1 safety policy: every production scan requires a teacher decision.
+  // Quality failures are rejected; readable scans open the review panel rather
+  // than being silently accepted in batch mode.
   function handleScanResult(r: ScanResult) {
     if (calibrationMode || !certification || certification.verdict === "Failed") {
       const report = evaluateCertification(r);
@@ -296,32 +249,15 @@ function CheckEditor({
       log(r.learner.fullName, `rescan required · quality ${r.quality.score}/100`, "err");
       return;
     }
-    const existing = findResult(state.results, r.assessment.id, r.learner.id, r.version);
-    if (!batch || existing) {
-      setScanResult(r);
-      return;
-    }
-    const responses = responsesFrom(r.summary);
-    if (r.summary.needsReview || r.confidence < AUTO_ACCEPT) {
-      const saved = persistScan(r, responses, "needs_review");
-      if (saved) {
-        log(
-          r.learner.fullName,
-          `→ Review queue (trust ${Math.round(r.confidence * 100)}%, ` +
-            `${r.summary.unclearCount + r.summary.multipleCount} doubtful item(s))`,
-          "warn",
-        );
-      }
-    } else {
-      const saved = persistScan(r, responses, "auto");
-      if (saved) {
-        log(r.learner.fullName, `${saved.raw}/${saved.total} (${saved.pct}%) · auto-accepted`, "ok");
-      }
-    }
+    setScanResult(r);
   }
 
-  function saveReviewedScan(result: ScanResult, responses: Record<string, string>) {
-    const saved = persistScan(result, responses, "reviewed");
+  function saveReviewedScan(
+    result: ScanResult,
+    responses: Record<string, string>,
+    decisions: ReviewDecisions,
+  ) {
+    const saved = persistScan(result, responses, decisions, "reviewed");
     if (!saved) return;
     setScanResult(null);
     log(result.learner.fullName, `${saved.raw}/${saved.total} (${saved.pct}%) · reviewed & saved`, "ok");
@@ -336,28 +272,63 @@ function CheckEditor({
   // phone sends raw detected answers; we score them against THIS device's answer
   // key so they flow into Results / Review / Analysis exactly like a PC scan.
   const handleSyncedRows = useCallback(
-    (rows: CheckedResultRow[]): ScoredSummary[] => {
+    (rows: CheckedResultRow[], persist = true): ScoredSummary[] => {
       if (rows.length === 0) return [];
       const current = stateRef.current;
       const aItems = current.items
         .filter((i) => i.assessmentId === active.id)
         .sort((a, b) => a.itemNumber - b.itemNumber);
+      const knownLearnerIds = new Set(current.learners.map((learnerRow) => learnerRow.id));
+      const omrItemIds = new Set(omrItemsOf(aItems).map((item) => item.id));
       // Score each row against the current answer key (pure) for the phone reply.
       const scored: ScoredSummary[] = [];
       const confirmations: SavedScanNotice[] = [];
-      const forceReview = !certification || certification.verdict === "Failed";
+      const forceReview = true;
+      let working = current;
       for (const row of rows) {
-        const input = rowToSyncedInput(row, active, aItems, forceReview);
-        if (!input) continue;
-        const outcome = upsertSyncedResult(current, input);
+        // Terminal ledger rows retain raw detector evidence by design. They
+        // are lifecycle notifications, not inputs to be rescored or reopened.
+        if (row.review_status !== "needs_review") continue;
+        const mapped = mapSyncedRow(row, {
+          assessment: active,
+          items: aItems,
+          knownLearnerIds,
+          forceReview,
+        });
+        if (!mapped.ok) {
+          log(row.learner_name || row.learner_id || "Unknown sheet", `rejected · ${mapped.message}`, "err");
+          continue;
+        }
+        const input = mapped.input;
+        const outcome = upsertSyncedResult(working, input);
+        if (outcome.disposition === "conflict") {
+          const message = outcome.reason === "scan_id_payload_mismatch"
+            ? "the submission id was reused with different answers"
+            : "a result already exists; choose how to handle the rescan before replacing it";
+          log(row.learner_name || row.learner_id, `rejected · ${message}`, "err");
+          continue;
+        }
+        working = { ...working, results: outcome.results };
         const r = outcome.results.find(
-          (x) => x.assessmentId === active.id && x.learnerId === input.learnerId && x.version === input.version,
+          (x) => input.scanId ? x.sourceScanId === input.scanId : x.id === outcome.id,
         );
         if (!r) continue;
-        const correct = r.itemScores.filter((s) => s.correct).length;
-        const blank = r.itemScores.filter((s) => s.blank).length;
-        const wrong = Math.max(0, r.itemScores.length - correct - blank);
-        scored.push({ learnerId: r.learnerId, raw: outcome.raw, total: outcome.total, pct: outcome.pct, correct, wrong, blank, mastery: r.masteryStatus });
+        const omrScores = r.itemScores.filter((score) => omrItemIds.has(score.itemId));
+        const resolvedOmrScores = omrScores.filter((score) => !score.unresolved);
+        const correct = resolvedOmrScores.filter((score) => score.correct).length;
+        const blank = resolvedOmrScores.filter((score) => score.blank).length;
+        const wrong = resolvedOmrScores.filter((score) => !score.correct && !score.blank).length;
+        scored.push({
+          scanId: input.scanId ?? row.scan_id ?? "",
+          learnerId: r.learnerId,
+          raw: outcome.raw,
+          total: outcome.total,
+          pct: outcome.pct,
+          correct,
+          wrong,
+          blank,
+          mastery: masteryBand(outcome.pct),
+        });
         confirmations.push({
           id: Date.now() + Math.random(),
           learnerName:
@@ -367,29 +338,42 @@ function CheckEditor({
           raw: outcome.raw,
           total: outcome.total,
           pct: outcome.pct,
-          reviewStatus: input.reviewStatus,
+          reviewStatus: "needs_review",
           confidence: input.confidence,
           quality: input.confidence == null ? null : Math.round(input.confidence * 100),
-          qualityIssues: forceReview
-            ? ["scanner certification required"]
-            : input.reviewStatus === "needs_review"
-              ? ["needs teacher review"]
-              : [],
+          qualityIssues: ["Phase 1 safety policy: teacher review required"],
           version: input.version,
           source: "phone",
         });
       }
+      // Live phone broadcasts first call this bridge in preview mode. Scoring
+      // may be returned to the durable commit boundary, but no grade-visible
+      // state or success notice exists until the server receipt is confirmed.
+      if (!persist) return scored;
+
       // Merge into live state (recompute against freshest state so batch scans
       // never clobber each other).
       setState((prev) => {
         const pItems = prev.items
           .filter((i) => i.assessmentId === active.id)
           .sort((a, b) => a.itemNumber - b.itemNumber);
+        const knownPrevLearnerIds = new Set(prev.learners.map((learnerRow) => learnerRow.id));
         let next = prev;
-        const mustReview = !certification || certification.verdict === "Failed";
+        const mustReview = true;
         for (const row of rows) {
-          const input = rowToSyncedInput(row, active, pItems, mustReview);
-          if (input) next = { ...next, results: upsertSyncedResult(next, input).results };
+          if (row.review_status !== "needs_review") continue;
+          const mapped = mapSyncedRow(row, {
+            assessment: active,
+            items: pItems,
+            knownLearnerIds: knownPrevLearnerIds,
+            forceReview: mustReview,
+          });
+          if (mapped.ok) {
+            const outcome = upsertSyncedResult(next, mapped.input);
+            if (outcome.disposition !== "conflict") {
+              next = { ...next, results: outcome.results };
+            }
+          }
         }
         return next;
       });
@@ -404,7 +388,7 @@ function CheckEditor({
       }
       return scored;
     },
-    [active, certification, setState],
+    [active, setState],
   );
 
   const activeVersion = active.versions.includes(version)
@@ -471,9 +455,8 @@ function CheckEditor({
 
   const existing = findResult(state.results, active.id, learnerId, activeVersion);
   const initialInput = inputFromResult(existing);
-  const pendingCount = state.results.filter(
-    (r) => r.assessmentId === active.id && r.reviewStatus === "needs_review",
-  ).length;
+  const pendingCount = pendingReviewResults(state.results)
+    .filter((result) => result.assessmentId === active.id).length;
 
   return (
     <section>
@@ -516,7 +499,7 @@ function CheckEditor({
         {mode === "scan" ? (
           <label className="ml-auto flex items-center gap-2 text-xs font-bold text-slate-600">
             <input type="checkbox" checked={batch} onChange={(e) => setBatch(e.target.checked)} />
-            Batch mode: auto-save clean scans
+            Batch workflow: review every scan
           </label>
         ) : null}
       </div>
@@ -524,7 +507,7 @@ function CheckEditor({
       <p className="mt-2 text-xs text-slate-500">
         {mode === "scan"
           ? batch
-            ? "Batch: scan sheet after sheet. High-confidence scans save automatically; doubtful ones go to the Review tab. Duplicates always open for confirmation."
+            ? "Batch safety mode: each sheet opens for teacher verification before saving; doubtful items remain highlighted."
             : "Single: each scan opens for review before saving."
           : mode === "manual"
             ? "Manual (fallback): choose the learner and version below, then mark answers by hand."
@@ -564,7 +547,8 @@ function CheckEditor({
                   scanResult.version,
                 ),
               )}
-              onSave={(_learner, _version, responses) => saveReviewedScan(scanResult, responses)}
+              onSave={(_learner, _version, responses, decisions) =>
+                saveReviewedScan(scanResult, responses, decisions)}
               onRescan={() => setScanResult(null)}
             />
           </>
@@ -743,6 +727,7 @@ function CheckEditor({
               learner={learner}
               version={activeVersion}
               initialInput={initialInput}
+              existingResult={existing}
               alreadySaved={Boolean(existing)}
               dirty={dirty}
               onDirty={setDirty}
@@ -788,7 +773,9 @@ function SubmittedToSystemCard({
             </div>
           ) : null}
           <div className="mt-2 text-xs font-bold">
-            Reports, Results, Item Analysis, and Remediation now use this saved result.
+            {needsReview
+              ? "Saved safely, but excluded from scoring reports until every flagged item is explicitly resolved."
+              : "Reports, Results, Item Analysis, and Remediation now use this reviewed result."}
           </div>
         </div>
         <div className="text-right">

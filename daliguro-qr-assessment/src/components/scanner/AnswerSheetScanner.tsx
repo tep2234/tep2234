@@ -18,8 +18,14 @@ import {
   INSECURE_MESSAGE,
   SECURE_CONTEXT_CHECKLIST,
 } from "../../lib/camera";
-import { findCornerMarkers, toGray } from "../../lib/scanner/omr-detect";
+import { findCornerMarkers, sharpnessOf, toGray } from "../../lib/scanner/omr-detect";
 import { readQrSmart } from "../../lib/scanner/qr-detect";
+import {
+  advanceFrameStability,
+  normalizedSheetGeometry,
+  REQUIRED_STABLE_FRAMES,
+  type FrameStabilityState,
+} from "../../lib/scanner/frame-stability";
 import { resolveScanIdentity, type ScanResolution } from "../../lib/scanner/resolve";
 import { processStillImage, type ScanResult } from "../../lib/scanner/still-pipeline";
 import { Button } from "../ui";
@@ -40,6 +46,11 @@ const LIVE_W = 900;
 const HOLD_MS = 1100; // stable-good time before auto-capture
 const COOLDOWN_MS = 3500; // pause after a capture before the next auto fire
 const SAME_SHEET_MS = 8000; // extra wait before re-capturing the SAME learner
+
+interface StableCaptureExpectation {
+  identity: string;
+  state: FrameStabilityState;
+}
 
 function quickBrightness(data: Uint8ClampedArray | number[]): number {
   let sum = 0;
@@ -77,6 +88,7 @@ export function AnswerSheetScanner({
   const lastEvidenceRef = useRef<string | null>(null);
   // Auto-capture pacing.
   const goodSinceRef = useRef<number | null>(null);
+  const stabilityRef = useRef<FrameStabilityState | null>(null);
   const cooldownUntilRef = useRef(0);
   const lastAcceptedRef = useRef<{ learnerId: string; at: number } | null>(null);
   const capturingRef = useRef(false);
@@ -86,12 +98,13 @@ export function AnswerSheetScanner({
   const [insecure, setInsecure] = useState(false);
   const [imageMsg, setImageMsg] = useState("");
   const [recovery, setRecovery] = useState<ScanResolution | null>(null);
-  const [manualLearnerId, setManualLearnerId] = useState("");
   // live feedback
   const [liveQr, setLiveQr] = useState<ScanResolution | null>(null);
   const [aligned, setAligned] = useState(false);
   const [brightness, setBrightness] = useState(255);
   const [holding, setHolding] = useState(false);
+  const [stableFrames, setStableFrames] = useState(0);
+  const [stabilityMessage, setStabilityMessage] = useState("");
   const [usingFallback, setUsingFallback] = useState(false);
 
   const release = useCallback(() => {
@@ -110,14 +123,18 @@ export function AnswerSheetScanner({
     setLiveQr(null);
     setAligned(false);
     setHolding(false);
+    stabilityRef.current = null;
+    goodSinceRef.current = null;
+    setStableFrames(0);
+    setStabilityMessage("");
     setPhase("idle");
   }, [release]);
 
   // ---------- core pipeline (used by photo AND live capture) ----------
   // Runs the pure still-image pipeline, then routes its outcome into UI state.
   const runStill = useCallback(
-    (img: ImageData, manualId?: string) => {
-      const out = processStillImage(img, state, activeId, manualId, lastEvidenceRef.current);
+    (img: ImageData) => {
+      const out = processStillImage(img, state, activeId, lastEvidenceRef.current);
       cooldownUntilRef.current = Date.now() + COOLDOWN_MS;
       if (out.kind === "ready") {
         setImageMsg("");
@@ -131,7 +148,6 @@ export function AnswerSheetScanner({
       } else {
         setRecovery(out.resolution);
         setImageMsg("");
-        setManualLearnerId("");
       }
     },
     [state, activeId, onSetActive, onResult],
@@ -165,15 +181,48 @@ export function AnswerSheetScanner({
     [],
   );
 
-  const capture = useCallback(() => {
+  const capture = useCallback((expected?: StableCaptureExpectation): boolean => {
     const v = videoRef.current;
-    if (!v || v.readyState < 2 || capturingRef.current) return;
+    if (!v || v.readyState < 2 || capturingRef.current) return false;
     capturingRef.current = true;
     try {
       const img = grabImageData(v, v.videoWidth, v.videoHeight);
-      if (!img) return;
+      if (!img) return false;
+      if (expected) {
+        const gray = toGray(img);
+        const geometry = normalizedSheetGeometry(
+          findCornerMarkers(gray),
+          img.width,
+          img.height,
+        );
+        const identity = readQrSmart(img, true)?.data ?? null;
+        const brightness = Math.round(quickBrightness(img.data));
+        const sharpness = sharpnessOf(gray);
+        if (!geometry || identity !== expected.identity) {
+          setStabilityMessage("The sheet or QR moved during capture. Hold the same sheet still and try again.");
+          return false;
+        }
+        const finalObservation = advanceFrameStability(expected.state, {
+          identity,
+          geometry,
+          luminance: brightness,
+          sharpness,
+          observedAt: Date.now(),
+          freshIdentity: true,
+        });
+        if (
+          !finalObservation.ready ||
+          brightness < 70 ||
+          brightness > 245 ||
+          sharpness < 2.4
+        ) {
+          setStabilityMessage("Movement, focus, or lighting changed during capture. Hold still for four new stable frames.");
+          return false;
+        }
+      }
       lastImageRef.current = img;
       runStill(img);
+      return true;
     } finally {
       capturingRef.current = false;
     }
@@ -202,15 +251,6 @@ export function AnswerSheetScanner({
     [grabImageData, runStill],
   );
 
-  const confirmManual = useCallback(() => {
-    const img = lastImageRef.current;
-    if (!img || !manualLearnerId) return;
-    const picked = state.learners.find((l) => l.id === manualLearnerId);
-    if (!picked) return;
-    if (!window.confirm(`The QR learner was NOT found. Assign this scan to ${picked.fullName} instead?`)) return;
-    runStill(img, manualLearnerId);
-  }, [manualLearnerId, runStill, state.learners]);
-
   // ---------- live preview loop (status chips + auto-capture) ----------
   const liveGray = useCallback(() => {
     const v = videoRef.current;
@@ -231,15 +271,24 @@ export function AnswerSheetScanner({
   }, []);
 
   const loop = useCallback(async () => {
+    const session = sessionRef.current;
+    const runIsActive = () =>
+      mountedRef.current &&
+      session === sessionRef.current &&
+      streamRef.current !== null;
+    if (!runIsActive()) return;
     const frame = liveGray();
     if (frame) {
-      const v = videoRef.current;
+      const canvas = liveCanvasRef.current;
       let raw: string | null = null;
-      if (detectorRef.current && v) {
+      if (detectorRef.current && canvas) {
         try {
-          const codes = await detectorRef.current.detect(v);
+          // Identity and geometry must come from the exact same preview pixels.
+          const codes = await detectorRef.current.detect(canvas);
+          if (!runIsActive()) return;
           raw = codes[0]?.rawValue ?? null;
         } catch {
+          if (!runIsActive()) return;
           detectorRef.current = null;
           setUsingFallback(true);
         }
@@ -250,12 +299,16 @@ export function AnswerSheetScanner({
       const res = raw ? resolveScanIdentity(raw, state, activeId) : null;
       setLiveQr(res);
       const gray = toGray(frame);
-      const isAligned = findCornerMarkers(gray) !== null;
+      const corners = findCornerMarkers(gray);
+      const geometry = normalizedSheetGeometry(corners, frame.width, frame.height);
+      const isAligned = geometry !== null;
       setAligned(isAligned);
       const bright = Math.round(quickBrightness(frame.data));
+      const sharpness = sharpnessOf(gray);
       setBrightness(bright);
 
-      // Auto-capture: all signals good and stable for HOLD_MS, past cooldown.
+      // Auto-capture requires exact fresh QR identity plus several consecutive
+      // frames with stable sheet corners, scale, rotation, lighting, and focus.
       const qrOk = res?.status === "READY" || res?.status === "ASSESSMENT_NOT_ACTIVE";
       const now = Date.now();
       const sameSheet =
@@ -264,22 +317,67 @@ export function AnswerSheetScanner({
         (res.status === "READY" || res.status === "ASSESSMENT_NOT_ACTIVE") &&
         res.learner.id === lastAcceptedRef.current.learnerId &&
         now - lastAcceptedRef.current.at < SAME_SHEET_MS;
-      const good = qrOk && isAligned && bright >= 70 && now >= cooldownUntilRef.current && !sameSheet;
-      if (good) {
-        if (goodSinceRef.current === null) goodSinceRef.current = now;
-        const held = now - goodSinceRef.current;
+      const good =
+        qrOk &&
+        raw !== null &&
+        geometry !== null &&
+        bright >= 70 &&
+        bright <= 245 &&
+        sharpness >= 2.4 &&
+        now >= cooldownUntilRef.current &&
+        !sameSheet;
+      if (good && raw !== null && geometry !== null) {
+        const decision = advanceFrameStability(stabilityRef.current, {
+          identity: raw,
+          geometry,
+          luminance: bright,
+          sharpness,
+          observedAt: now,
+          freshIdentity: true,
+        });
+        stabilityRef.current = decision.state;
+        const count = decision.state?.consecutive ?? 0;
+        setStableFrames(count);
+        if (count === 1) goodSinceRef.current = now;
+        const stableSince = goodSinceRef.current ?? now;
+        goodSinceRef.current = stableSince;
+        const held = now - stableSince;
         setHolding(true);
-        if (held >= HOLD_MS) {
+        if (decision.resetReason === "motion") {
+          setStabilityMessage(`Sheet movement detected. Hold still for ${REQUIRED_STABLE_FRAMES} consecutive frames.`);
+        } else if (decision.resetReason === "quality_changed") {
+          setStabilityMessage(`Focus or lighting changed. Keep the sheet clear for ${REQUIRED_STABLE_FRAMES} consecutive frames.`);
+        } else if (decision.resetReason === "timeout") {
+          setStabilityMessage(`Frame analysis paused. Hold still for ${REQUIRED_STABLE_FRAMES} new consecutive frames.`);
+        } else {
+          setStabilityMessage(`Hold still: ${Math.min(count, REQUIRED_STABLE_FRAMES)}/${REQUIRED_STABLE_FRAMES} stable frames.`);
+        }
+        if (decision.ready && held >= HOLD_MS) {
+          const expectation = stabilityRef.current && raw
+            ? { identity: raw, state: stabilityRef.current }
+            : null;
           goodSinceRef.current = null;
+          stabilityRef.current = null;
+          setStableFrames(0);
           setHolding(false);
-          capture();
+          if (expectation && capture(expectation)) {
+            setStabilityMessage("Stable capture confirmed. Processing sheet…");
+          }
         }
       } else {
         goodSinceRef.current = null;
+        stabilityRef.current = null;
+        setStableFrames(0);
         setHolding(false);
+        if (!raw) setStabilityMessage("Keep the QR fully visible on every frame.");
+        else if (!isAligned) setStabilityMessage("Place the full sheet inside the frame with all four corner targets visible.");
+        else if (bright < 70) setStabilityMessage("Too dark. Use brighter, even light.");
+        else if (bright > 245) setStabilityMessage("Strong glare or overexposure detected. Change the angle or light.");
+        else if (sharpness < 2.4) setStabilityMessage("Image is blurred. Hold still and wait for focus.");
+        else if (sameSheet) setStabilityMessage("This sheet was just captured. Move to the next learner or wait before rescanning.");
       }
     }
-    rafRef.current = requestAnimationFrame(() => loopRef.current());
+    if (runIsActive()) rafRef.current = requestAnimationFrame(() => loopRef.current());
   }, [activeId, capture, liveGray, state]);
 
   useEffect(() => {
@@ -291,6 +389,10 @@ export function AnswerSheetScanner({
     const alive = () => mountedRef.current && session === sessionRef.current;
     setCamMessage("");
     setInsecure(false);
+    stabilityRef.current = null;
+    goodSinceRef.current = null;
+    setStableFrames(0);
+    setStabilityMessage("Requesting camera access…");
     setPhase("checking");
     logCameraContext("scan-start");
 
@@ -351,6 +453,10 @@ export function AnswerSheetScanner({
     } catch {
       /* muted autoplay */
     }
+    if (!alive()) {
+      release();
+      return;
+    }
     rafRef.current = requestAnimationFrame(() => loopRef.current());
   }, [release]);
 
@@ -364,7 +470,7 @@ export function AnswerSheetScanner({
   }, [release]);
 
   const live = phase === "live";
-  const dark = brightness < 70;
+  const lightingOk = brightness >= 70 && brightness <= 245;
   const liveQrOk = liveQr?.status === "READY" || liveQr?.status === "ASSESSMENT_NOT_ACTIVE";
   const liveLearnerName =
     liveQr && (liveQr.status === "READY" || liveQr.status === "ASSESSMENT_NOT_ACTIVE")
@@ -382,7 +488,7 @@ export function AnswerSheetScanner({
           <Button onClick={() => fileInputRef.current?.click()}>📷 Scan with camera</Button>
           {live ? (
             <>
-              <Button variant="small" onClick={capture}>📸 Capture now</Button>
+              <Button variant="small" onClick={() => { void capture(); }}>📸 Capture now</Button>
               <Button variant="smallDanger" onClick={stop}>Stop</Button>
             </>
           ) : (
@@ -405,10 +511,19 @@ export function AnswerSheetScanner({
         <div className="mt-3 flex flex-wrap gap-2 text-xs font-bold">
           <Chip ok={liveQrOk} okText={liveLearnerName ? "Learner: " + liveLearnerName : "QR ready"} badText={liveQr ? "QR: data not loaded" : "QR: searching…"} />
           <Chip ok={aligned} okText="Sheet aligned ✓" badText="Align all 4 corners…" />
-          <Chip ok={!dark} okText="Lighting OK" badText="Too dark" />
+          <Chip
+            ok={lightingOk}
+            okText="Lighting OK"
+            badText={brightness > 245 ? "Too bright / glare" : "Too dark"}
+          />
           {holding ? (
             <span className="animate-pulse rounded-full bg-indigo-100 px-2.5 py-1 text-indigo-800">
-              Hold steady — capturing…
+              Hold steady — {Math.min(stableFrames, REQUIRED_STABLE_FRAMES)}/{REQUIRED_STABLE_FRAMES}
+            </span>
+          ) : null}
+          {stabilityMessage ? (
+            <span className="w-full rounded-lg bg-slate-100 px-2.5 py-1 text-slate-700" role="status">
+              {stabilityMessage}
             </span>
           ) : null}
         </div>
@@ -451,9 +566,6 @@ export function AnswerSheetScanner({
         <Recovery
           resolution={recovery}
           state={state}
-          manualLearnerId={manualLearnerId}
-          onManualLearnerId={setManualLearnerId}
-          onConfirmManual={confirmManual}
           onSwitchActive={(id) => {
             onSetActive(id);
             const img = lastImageRef.current;

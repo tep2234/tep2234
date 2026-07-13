@@ -53,7 +53,7 @@ export function classStats(results: Result[]): ClassStats {
 
 export function discriminationIndex(itemId: string, results: Result[]): number | null {
   const attempted = results.filter((r) =>
-    r.itemScores.some((s) => s.itemId === itemId),
+    r.itemScores.some((s) => s.itemId === itemId && !s.unresolved),
   );
   if (attempted.length < 4) return null;
   const sorted = [...attempted].sort((a, b) => b.percentage - a.percentage);
@@ -63,7 +63,7 @@ export function discriminationIndex(itemId: string, results: Result[]): number |
   const correctIn = (group: Result[]) =>
     group.filter((r) => {
       const s = r.itemScores.find((x) => x.itemId === itemId);
-      return !!s && !s.blank && !s.manual && s.correct;
+      return !!s && !s.unresolved && !s.blank && !s.manual && s.correct;
     }).length;
   return round1((correctIn(top) - correctIn(bottom)) / g);
 }
@@ -138,7 +138,7 @@ function longestSameRun(result: Result): number {
 
 export function attentionFor(result: Result, itemsById: Map<string, Item>): AttentionReading {
   const reasons: string[] = [];
-  const auto = result.itemScores.filter((s) => !s.manual);
+  const auto = result.itemScores.filter((s) => !s.manual && !s.unresolved);
   const blanks = auto.filter((s) => s.blank).length;
   const blankRatio = auto.length > 0 ? blanks / auto.length : 0;
   const missedEasy = auto.filter((s) => {

@@ -68,11 +68,10 @@ describe("resolveScanIdentity", () => {
     expect(r.status).toBe("QR_PAYLOAD_INVALID");
   });
 
-  it("falls back to the first enabled version when the QR version isn't enabled", () => {
+  it("rejects the QR when its version is not enabled instead of silently changing it", () => {
     const a = { ...assessment("A1"), versions: ["B"] as ("A" | "B")[] };
     const st = stateWith([a], [learner("L1")]);
     const r = resolveScanIdentity(qrFor("A1", "L1", "A"), st, "A1");
-    expect(r.status).toBe("READY");
-    if (r.status === "READY") expect(r.version).toBe("B");
+    expect(r.status).toBe("QR_PAYLOAD_INVALID");
   });
 });

@@ -23,10 +23,51 @@ export interface ScanChannel {
   close: Unsubscribe;
 }
 
-export interface ScanAckBroadcast {
+interface ScanAckCommon {
   token: string;
+  scanId: string;
   learnerId: string;
-  status: "pc_received" | "saved";
+}
+
+export type ScanAckBroadcast =
+  | (ScanAckCommon & { status: "pc_received" })
+  | (ScanAckCommon & { status: "saved"; receiptId: string })
+  | (ScanAckCommon & { status: "failed"; reason?: string });
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+export function isValidReceiptId(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length >= 8 && value.length <= 160;
+}
+
+export function isScanAckBroadcast(value: unknown): value is ScanAckBroadcast {
+  if (!isRecord(value)) return false;
+  if (
+    typeof value.token !== "string" || !value.token ||
+    typeof value.scanId !== "string" || value.scanId.length < 8 ||
+    typeof value.learnerId !== "string" || !value.learnerId
+  ) return false;
+  if (value.status === "pc_received") return true;
+  if (value.status === "saved") return isValidReceiptId(value.receiptId);
+  if (value.status === "failed") return value.reason === undefined || typeof value.reason === "string";
+  return false;
+}
+
+export function isScoreBroadcast(value: unknown): value is ScoreBroadcast {
+  if (!isRecord(value)) return false;
+  return (
+    typeof value.token === "string" && !!value.token &&
+    typeof value.scanId === "string" && value.scanId.length >= 8 &&
+    isValidReceiptId(value.receiptId) &&
+    typeof value.learnerId === "string" && !!value.learnerId &&
+    ["raw", "total", "pct", "correct", "wrong", "blank"].every((key) =>
+      typeof value[key] === "number" && Number.isFinite(value[key]) && (value[key] as number) >= 0,
+    ) &&
+    (value.pct as number) <= 100 &&
+    typeof value.mastery === "string"
+  );
 }
 
 interface ScanChannelHandlers {
@@ -41,16 +82,24 @@ export function joinScanChannel(sessionId: string, handlers: ScanChannelHandlers
   if (!sb) return { sendScan: async () => false, sendHello: () => {}, sendAck: () => {}, sendScore: () => {}, close: NOOP };
   const channel = sb.channel(`smartscan-live-${sessionId}`, { config: { broadcast: { self: false } } });
   if (handlers.onScan) {
-    channel.on("broadcast", { event: "scan" }, ({ payload }) => handlers.onScan?.(payload as ScanBroadcast));
+    channel.on("broadcast", { event: "scan" }, ({ payload }) => {
+      if (isRecord(payload) && typeof payload.token === "string") {
+        handlers.onScan?.(payload as unknown as ScanBroadcast);
+      }
+    });
   }
   if (handlers.onHello) {
     channel.on("broadcast", { event: "hello" }, ({ payload }) => handlers.onHello?.(payload as { deviceName: string; token: string }));
   }
   if (handlers.onAck) {
-    channel.on("broadcast", { event: "ack" }, ({ payload }) => handlers.onAck?.(payload as ScanAckBroadcast));
+    channel.on("broadcast", { event: "ack" }, ({ payload }) => {
+      if (isScanAckBroadcast(payload)) handlers.onAck?.(payload);
+    });
   }
   if (handlers.onScore) {
-    channel.on("broadcast", { event: "score" }, ({ payload }) => handlers.onScore?.(payload as ScoreBroadcast));
+    channel.on("broadcast", { event: "score" }, ({ payload }) => {
+      if (isScoreBroadcast(payload)) handlers.onScore?.(payload);
+    });
   }
   channel.subscribe();
   return {
@@ -69,7 +118,7 @@ export function joinScanChannel(sessionId: string, handlers: ScanChannelHandlers
   };
 }
 
-// Fires on INSERT or UPDATE of a checked result for this teacher+assessment.
+// Fires for immutable phone-scan submissions for this teacher+assessment.
 export function subscribeCheckedResults(
   teacherUserId: string,
   assessmentId: string,
@@ -84,7 +133,7 @@ export function subscribeCheckedResults(
       {
         event: "*",
         schema: "public",
-        table: "smartscan_checked_results",
+        table: "smartscan_scan_submissions",
         filter: `teacher_user_id=eq.${teacherUserId}`,
       },
       (payload) => {

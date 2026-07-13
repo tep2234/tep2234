@@ -6,7 +6,12 @@ import type { Item, Learner, TestVersion, VersionKey } from "../../lib/types";
 import { masteryColor } from "../../lib/scoring";
 import { CHOICES } from "../../lib/scanner/omr-template";
 import type { ItemStatus } from "../../lib/scanner/omr-detect";
-import { REVIEW_CONFIDENCE, buildReview, type ReviewRow } from "../../lib/scanner/omr-score";
+import {
+  REVIEW_CONFIDENCE,
+  buildReview,
+  type ReviewDecisions,
+  type ReviewRow,
+} from "../../lib/scanner/omr-score";
 import { Button } from "../ui";
 
 const STATUS_TONE: Record<ItemStatus, string> = {
@@ -14,6 +19,7 @@ const STATUS_TONE: Record<ItemStatus, string> = {
   blank: "bg-slate-100 text-slate-500",
   unclear: "bg-amber-100 text-amber-800",
   multiple: "bg-red-100 text-red-700",
+  unreadable: "bg-red-100 text-red-700",
 };
 
 function confidenceBadge(conf: number): string {
@@ -41,11 +47,16 @@ export function ScanReviewPanel({
   versionKey: VersionKey;
   readings: import("../../lib/scanner/omr-detect").ItemReading[];
   alreadySaved: boolean;
-  onSave: (learner: Learner, version: TestVersion, responses: Record<string, string>) => void;
+  onSave: (
+    learner: Learner,
+    version: TestVersion,
+    responses: Record<string, string>,
+    decisions: ReviewDecisions,
+  ) => void;
   onRescan: () => void;
 }) {
   const ordered = omrItems.slice().sort((a, b) => a.itemNumber - b.itemNumber);
-  const [corrections, setCorrections] = useState<Record<number, string>>({});
+  const [corrections, setCorrections] = useState<ReviewDecisions>({});
   const summary = buildReview(ordered, versionKey, readings, corrections);
 
   function correct(itemNumber: number, value: string) {
@@ -53,19 +64,12 @@ export function ScanReviewPanel({
   }
 
   function save() {
-    if (
-      summary.needsReview &&
-      !window.confirm(
-        "Some items are still unclear or have multiple marks. Save anyway? You can fix them first.",
-      )
-    ) {
-      return;
-    }
+    if (summary.needsReview) return;
     const responses: Record<string, string> = {};
     summary.rows.forEach((r) => {
       responses[r.item.id] = r.detected ?? "";
     });
-    onSave(learner, version, responses);
+    onSave(learner, version, responses, { ...corrections });
   }
 
   const color = masteryColor(summary.masteryStatus);
@@ -92,6 +96,11 @@ export function ScanReviewPanel({
         </div>
 
         <div className="mt-3 flex flex-wrap gap-2 text-xs font-bold">
+          {summary.unresolvedCount > 0 && (
+            <span className="rounded-full bg-red-100 px-2.5 py-1 text-red-700">
+              ⛔ {summary.unresolvedCount} unscored pending decision
+            </span>
+          )}
           <span className="rounded-full bg-emerald-100 px-2.5 py-1 text-emerald-700">
             ✓ {summary.correctCount} correct
           </span>
@@ -111,6 +120,11 @@ export function ScanReviewPanel({
               ✗✗ {summary.multipleCount} multiple
             </span>
           )}
+          {summary.unreadableCount > 0 && (
+            <span className="rounded-full bg-red-100 px-2.5 py-1 text-red-700">
+              ◉ {summary.unreadableCount} unreadable
+            </span>
+          )}
           {summary.lowConfidenceCount > 0 && (
             <span className="rounded-full bg-orange-100 px-2.5 py-1 text-orange-800">
               ◷ {summary.lowConfidenceCount} low confidence
@@ -120,8 +134,8 @@ export function ScanReviewPanel({
 
         {summary.needsReview && (
           <div className="mt-3 rounded-lg border border-amber-300 bg-amber-50 p-2 text-sm text-amber-800">
-            ⚠ Some items are unclear, low-confidence, or have multiple marks. Confirm the suggested
-            answer, choose another letter, or leave blank before saving.
+            ⚠ Saving is blocked. Explicitly confirm or correct every unreadable, ambiguous, multiple,
+            or low-confidence item. Unresolved visual evidence is not scored.
           </div>
         )}
         {alreadySaved && (
@@ -131,7 +145,9 @@ export function ScanReviewPanel({
         )}
 
         <div className="mt-4 flex flex-wrap gap-2">
-          <Button onClick={save}>💾 Save result</Button>
+          <Button onClick={save} disabled={summary.needsReview} aria-disabled={summary.needsReview}>
+            {summary.needsReview ? "Resolve highlighted items to save" : "💾 Save reviewed result"}
+          </Button>
           <Button variant="ghost" onClick={onRescan}>
             ↺ Scan again
           </Button>
@@ -266,6 +282,7 @@ function MobileCard({ row, onCorrect }: { row: ReviewRow; onCorrect: (value: str
       <div className="mt-2">
         <ChoiceButtons row={row} onCorrect={onCorrect} />
       </div>
+      <UnreadableChoices row={row} />
       <BubbleStrength row={row} />
     </div>
   );
@@ -310,6 +327,7 @@ function TableRow({ row, onCorrect }: { row: ReviewRow; onCorrect: (value: strin
         ) : null}
       </td>
       <td className="px-3 py-2">
+        <UnreadableChoices row={row} />
         <BubbleStrength row={row} compact />
       </td>
       <td className="px-3 py-2">
@@ -326,12 +344,13 @@ function BubbleStrength({ row, compact = false }: { row: ReviewRow; compact?: bo
       {CHOICES.slice(0, valid).map((c, idx) => {
         const value = Math.max(0, Math.min(1, row.fill[idx] ?? 0));
         const active = row.suggested === c || row.detected === c;
+        const unreadable = row.unreadableChoices.includes(idx);
         return (
           <div key={c} className="grid grid-cols-[1rem,1fr,2.5rem] items-center gap-1 text-[10px] font-bold text-slate-500">
-            <span className={active ? "text-indigo-700" : ""}>{c}</span>
+            <span className={unreadable ? "text-red-700" : active ? "text-indigo-700" : ""}>{c}</span>
             <span className="h-1.5 overflow-hidden rounded-full bg-slate-200">
               <span
-                className={(active ? "bg-indigo-600" : "bg-slate-400") + " block h-full rounded-full"}
+                className={(unreadable ? "bg-red-500" : active ? "bg-indigo-600" : "bg-slate-400") + " block h-full rounded-full"}
                 style={{ width: `${Math.round(value * 100)}%` }}
               />
             </span>
@@ -339,6 +358,16 @@ function BubbleStrength({ row, compact = false }: { row: ReviewRow; compact?: bo
           </div>
         );
       })}
+    </div>
+  );
+}
+
+function UnreadableChoices({ row }: { row: ReviewRow }) {
+  if (row.unreadableChoices.length === 0) return null;
+  const labels = row.unreadableChoices.map((index) => CHOICES[index] ?? `#${index + 1}`);
+  return (
+    <div className="mt-1 text-[10px] font-extrabold text-red-700" role="alert">
+      Unreadable visual evidence at choice{labels.length === 1 ? "" : "s"} {labels.join(", ")}. Confirm an answer or explicit blank.
     </div>
   );
 }

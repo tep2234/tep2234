@@ -5,6 +5,7 @@
 import type { Item, Result } from "./types";
 import { analyzeItems } from "./analysis";
 import { discriminationIndex } from "./insights";
+import { hasUnresolvedScanEvidence, isTrustedResult } from "./result-trust";
 
 // ---- Mastery bands (dashboard: 90 / 75 / 50) ----------------
 export type IntelMastery = "Mastered" | "Approaching Mastery" | "Developing" | "Beginning";
@@ -76,7 +77,7 @@ export function difficultySummary(items: Item[], results: Result[]): DifficultyS
   const rows = analyzeItems(items, results);
   const s: DifficultySummary = { easy: 0, moderate: 0, difficult: 0 };
   rows.forEach((r) => {
-    const attempts = r.attempts || results.length;
+    const attempts = r.attempts;
     const p = attempts > 0 ? r.correct / attempts : 0;
     const d = difficulty3(p);
     if (d === "Easy") s.easy += 1;
@@ -122,9 +123,9 @@ export function reliability(results: Result[]): Reliability {
     ? Math.round((conf.reduce((s, r) => s + (r.scanConfidence ?? 0), 0) / conf.length) * 1000) / 10
     : 0;
   const needsReview = results.filter((r) => r.reviewStatus === "needs_review").length;
-  const finalized = results.filter((r) => r.finalizedAt != null).length;
+  const finalized = results.filter((r) => r.finalizedAt != null && isTrustedResult(r)).length;
   const reviewAdjusted = scans.filter((r) => r.reviewStatus === "reviewed").length;
-  const cleanAccepted = results.filter((r) => r.reviewStatus !== "needs_review").length;
+  const cleanAccepted = results.filter(isTrustedResult).length;
   const autoFinalizedPct = results.length ? Math.round((cleanAccepted / results.length) * 1000) / 10 : 0;
   return {
     totalScanned: results.length,
@@ -142,8 +143,8 @@ export function reliability(results: Result[]): Reliability {
 export type Verification = "Verified" | "Needs Review" | "Adjusted" | "Pending";
 
 export function verificationOf(r: Result): Verification {
-  if (r.finalizedAt != null) return "Verified";
-  if (r.reviewStatus === "needs_review") return "Needs Review";
+  if (r.finalizedAt != null && isTrustedResult(r)) return "Verified";
+  if (r.reviewStatus === "needs_review" || hasUnresolvedScanEvidence(r)) return "Needs Review";
   if (r.reviewStatus === "reviewed") return "Adjusted";
   return "Pending";
 }

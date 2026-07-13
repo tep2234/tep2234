@@ -44,12 +44,13 @@ describe("parseQrPayload", () => {
     if (!res.ok) expect(res.reason).toMatch(/integrity/i);
   });
 
-  it("still accepts an old QR that carries no checksum", () => {
+  it("rejects a legacy QR that carries no checksum or sheet token", () => {
     const res = parseQrPayload(
       JSON.stringify({ assessmentId: "A1", learnerId: "L1", version: "A" }),
       ctx(),
     );
-    expect(res.ok).toBe(true);
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.reason).toMatch(/item count|token|checksum|reprint/i);
   });
 
   it("rejects non-JSON text", () => {
@@ -97,13 +98,13 @@ describe("parseQrPayload", () => {
     expect(parseQrPayload(hostile, ctx()).ok).toBe(false);
   });
 
-  it("falls back to the first enabled version when version is missing/unknown", () => {
+  it("rejects a QR with a missing version instead of silently changing versions", () => {
     const res = parseQrPayload(
       JSON.stringify({ assessmentId: "A1", learnerId: "L1" }),
       ctx({ versions: ["B", "C"] }),
     );
-    expect(res.ok).toBe(true);
-    if (res.ok) expect(res.payload.version).toBe("B");
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.reason).toMatch(/version|reprint/i);
   });
 
   it("rejects a JSON array (not an identity object)", () => {

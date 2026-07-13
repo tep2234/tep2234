@@ -320,7 +320,8 @@ describe("buildReview", () => {
       { item: 3, detected: null, status: "blank", confidence: 0.9, fill: [0, 0, 0, 0] },
       { item: 4, detected: "D", status: "selected", confidence: 0.9, fill: [0, 0, 0, 0.7] },
     ]);
-    expect(r.rows[0].detected).toBe("A");
+    expect(r.rows[0].detected).toBeNull();
+    expect(r.rows[0].suggested).toBe("A");
     expect(r.rows[0].needsReview).toBe(true);
     expect(r.lowConfidenceCount).toBe(1);
     expect(r.needsReview).toBe(true);
@@ -329,6 +330,14 @@ describe("buildReview", () => {
   it("a correction to blank keeps the item unscored", () => {
     const r = buildReview(items, key, readings, { 1: "" });
     expect(r.rawScore).toBe(1); // item 1 now blank, only item 2 correct
+  });
+
+  it("treats a missing detector row as unresolved evidence, never a trusted blank", () => {
+    const r = buildReview(items, key, readings.slice(0, 3));
+    expect(r.rows[3]).toMatchObject({ detected: null, status: "unclear", confidence: 0, needsReview: true });
+    expect(r.unresolvedCount).toBe(1);
+    expect(r.blankCount).toBe(1);
+    expect(r.needsReview).toBe(true);
   });
 });
 

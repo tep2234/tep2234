@@ -141,6 +141,10 @@ export interface ItemScore {
   awarded: number;
   correct: boolean;
   blank: boolean;
+  // Scanner evidence exists but cannot yet be classified as an answer/blank.
+  // Pending results are excluded from reporting until a teacher resolves it.
+  unresolved?: boolean;
+  unresolvedStatus?: ScanItemStatus;
   // True for subjective items scored manually by the teacher.
   manual: boolean;
   // True when the teacher overrode the auto-computed score.
@@ -148,8 +152,16 @@ export interface ItemScore {
   remarks: string;
 }
 
-// How a bubble read was classified by the OMR detector.
-export type ScanItemStatus = "selected" | "blank" | "unclear" | "multiple";
+// How a bubble read was classified by the OMR detector. Runtime validators and
+// UI maps share this one canonical vocabulary.
+export const SCAN_ITEM_STATUSES = [
+  "selected",
+  "blank",
+  "unclear",
+  "multiple",
+  "unreadable",
+] as const;
+export type ScanItemStatus = (typeof SCAN_ITEM_STATUSES)[number];
 
 // Raw per-item detection snapshot kept on scanned results so the Review tab
 // can re-examine doubtful marks without the original image.
@@ -159,13 +171,23 @@ export interface ScanItemMeta {
   status: ScanItemStatus;
   confidence: number; // 0..1
   fill?: number[]; // darkness/read strength per choice, A..E
+  unreadableChoices?: number[]; // zero-based choice indexes whose visual region was not trustworthy
 }
 
 // One entry per state change / manual edit, for score audit trails.
 export interface AuditEntry {
+  eventId?: string;
   at: number;
   action: string;
   reason?: string;
+  itemId?: string;
+  itemNumber?: number;
+  originalValue?: string;
+  originalStatus?: ScanItemStatus;
+  correctedValue?: string;
+  actorId?: string;
+  source?: "review_queue" | "manual_check" | "results" | "scanner";
+  scanId?: string | null;
 }
 
 export interface Result {
@@ -190,6 +212,11 @@ export interface Result {
   finalizedAt: number | null;
   // Raw detection snapshot (scanned results only).
   scanItems: ScanItemMeta[] | null;
+  // Idempotency key of the originating phone submission, when applicable.
+  sourceScanId?: string | null;
+  // Deterministic payload fingerprint paired with sourceScanId. A repeated id
+  // with different answers is a conflict, never an idempotent replay.
+  sourceScanFingerprint?: string | null;
   auditLog: AuditEntry[];
   // createdAt doubles as checkedAt; updatedAt changes on every re-save.
   createdAt: number;

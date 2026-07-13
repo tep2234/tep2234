@@ -3,8 +3,10 @@
 // assessment, item-count, version mismatch) and the strict completeness
 // contract, independent of any browser APIs.
 import { describe, expect, it } from "vitest";
+import { buildQrPayload, qrText as serializeQr } from "../src/lib/qr";
 import { analyzeFrameData, isDoubtful, type FrameImage } from "../src/lib/scanner/mobile-analyze";
 import { buildTemplate, MARKER_RECTS, SHEET_H, SHEET_W } from "../src/lib/scanner/omr-template";
+import type { Learner, TestVersion } from "../src/lib/types";
 
 function whiteRgba(width: number, height: number): FrameImage {
   const data = new Uint8ClampedArray(width * height * 4).fill(255);
@@ -31,11 +33,38 @@ function fillDiscRgba(img: FrameImage, cx: number, cy: number, r: number, v: num
   }
 }
 
+function drawRingRgba(img: FrameImage, cx: number, cy: number, r: number, v: number) {
+  for (let yy = Math.floor(cy - r); yy <= cy + r; yy += 1) {
+    for (let xx = Math.floor(cx - r); xx <= cx + r; xx += 1) {
+      const distance = Math.hypot(xx - cx, yy - cy);
+      if (distance >= r * 0.78 && distance <= r) {
+        const i = (yy * img.width + xx) * 4;
+        img.data[i] = img.data[i + 1] = img.data[i + 2] = v;
+      }
+    }
+  }
+}
+
 // Canonical-size sheet: markers + optional shaded bubbles + version bubble.
 function syntheticSheet(items: number, version: "A" | "B" | null): FrameImage {
   const img = whiteRgba(SHEET_W, SHEET_H);
+  for (let i = 0; i < img.data.length; i += 4) {
+    // A photographed/printed sheet has fine paper and sensor texture. Keep
+    // that texture bright enough to remain background while giving the focus
+    // gate a realistic, deterministic edge signal.
+    const x = (i / 4) % img.width;
+    const paper = x % 2 === 0 ? 234 : 242;
+    img.data[i] = img.data[i + 1] = img.data[i + 2] = paper;
+  }
   MARKER_RECTS.forEach((m) => fillRectRgba(img, m.x, m.y, m.w, m.h, 0));
   const t = buildTemplate(items);
+  // Approximate the printed column/table edges so the synthetic fixture has
+  // realistic sharp high-frequency structure for the focus safety gate.
+  for (const x of [160, 320, 480, 640]) {
+    fillRectRgba(img, x, 180, 2, SHEET_H - 360, 80);
+  }
+  t.bubbles.forEach((bubble) => drawRingRgba(img, bubble.cx, bubble.cy, bubble.r, 45));
+  t.versionBubbles.forEach((bubble) => drawRingRgba(img, bubble.cx, bubble.cy, bubble.r, 45));
   const shade = (item: number, ci: number) => {
     const b = t.bubbles.find((x) => x.item === item && x.choiceIndex === ci)!;
     fillDiscRgba(img, b.cx, b.cy, b.r * 0.8, 0);
@@ -49,8 +78,17 @@ function syntheticSheet(items: number, version: "A" | "B" | null): FrameImage {
   return img;
 }
 
-const qrFor = (n: number, version = "A", assessment = "AX") =>
-  JSON.stringify({ a: assessment, l: "L1", v: version, n });
+const testLearner: Learner = {
+  id: "L1",
+  lrn: "123456789012",
+  fullName: "Learner One",
+  sex: "F",
+  gradeLevel: "10",
+  section: "A",
+};
+
+const qrFor = (n: number, version: TestVersion = "A", assessment = "AX") =>
+  serializeQr(buildQrPayload(assessment, testLearner, version, n));
 
 describe("analyzeFrameData guard rails", () => {
   it("reports searching when no QR is present or provided", () => {
@@ -73,13 +111,13 @@ describe("analyzeFrameData guard rails", () => {
 
   it("blocks an unsupported item count", () => {
     const { result } = analyzeFrameData(whiteRgba(200, 200), "AX", qrFor(999), false);
-    expect(result.status).toBe("bad_item_count");
+    expect(result.status).toBe("qr_error");
   });
 
   it("blocks a sheet whose printed VERSION row disagrees with the QR", () => {
     const img = syntheticSheet(10, "B");
     const { result } = analyzeFrameData(img, "AX", qrFor(10, "A"), false);
-    expect(result.status).toBe("wrong_version");
+    expect(result.status, JSON.stringify(result)).toBe("wrong_version");
     expect(result.scan).toBeNull();
   });
 });
@@ -103,9 +141,10 @@ describe("isDoubtful blank handling", () => {
 describe("analyzeFrameData complete coverage", () => {
   it("returns exactly items 1..N for a matching sheet", () => {
     const img = syntheticSheet(40, "A");
-    const { result, qrText } = analyzeFrameData(img, "AX", qrFor(40, "A"), false);
-    expect(qrText).toBe(qrFor(40, "A"));
-    expect(result.scan).not.toBeNull();
+    const encodedQr = qrFor(40, "A");
+    const { result, qrText } = analyzeFrameData(img, "AX", encodedQr, false);
+    expect(qrText).toBe(encodedQr);
+    expect(result.scan, JSON.stringify(result)).not.toBeNull();
     const detected = result.scan!.detected;
     expect(detected).toHaveLength(40);
     expect(detected.map((d) => d.item)).toEqual(Array.from({ length: 40 }, (_, i) => i + 1));

@@ -4,7 +4,7 @@
 // enforces teacher ownership; these helpers never send the service-role key.
 
 import { getSupabaseClient } from "../supabase/client";
-import type { Result } from "../types";
+import type { Result, ScanItemStatus } from "../types";
 import {
   checkedResultRow,
   expiresAt,
@@ -115,16 +115,102 @@ export async function touchSession(sessionId: string): Promise<void> {
     .eq("id", sessionId);
 }
 
-// Upsert a checked result. Conflict target (assessment_id, learner_id,
-// teacher_user_id) means a rescan of the same learner UPDATES the row — never a
-// duplicate. Returns false on failure (caller keeps it local + retries).
-export async function upsertCheckedResult(row: CheckedResultRow): Promise<boolean> {
+export type CommitResult =
+  | { ok: true; receiptId: string; committedAt: string; replayed: boolean }
+  | { ok: false; reason: "offline" | "write_failed" };
+
+export interface RemoteReviewDecision {
+  eventId: string;
+  omrRowNumber: number;
+  itemId: string;
+  itemNumber: number;
+  originalStatus: ScanItemStatus;
+  originalValue: string;
+  correctedValue: string;
+  source: "review_queue" | "manual_check" | "results" | "scanner";
+  reason: string;
+}
+
+export type ReviewAuditCommitResult =
+  | { ok: true; recorded: number }
+  | { ok: false; reason: "offline" | "write_failed" };
+
+export interface RemoteSubmissionResolution {
+  eventId: string;
+  decision: "reviewed" | "discarded";
+  reason: string;
+}
+
+export type SubmissionResolutionResult =
+  | { ok: true; resolutionId: string; replayed: boolean }
+  | { ok: false; reason: "offline" | "write_failed" };
+
+// Append immutable teacher decisions beside the original phone submission.
+// This never updates or deletes detector evidence; exact event-id retries are
+// idempotent in the RPC and altered replays are rejected.
+export async function recordScanReviewDecisions(
+  scanId: string,
+  decisions: RemoteReviewDecision[],
+): Promise<ReviewAuditCommitResult> {
   const sb = getSupabaseClient();
-  if (!sb) return false;
-  const { error } = await sb
-    .from("smartscan_checked_results")
-    .upsert(row, { onConflict: "assessment_id,learner_id,teacher_user_id" });
-  return !error;
+  if (!sb) return { ok: false, reason: "offline" };
+  if (!scanId || decisions.length === 0) return { ok: false, reason: "write_failed" };
+  const { data, error } = await sb.rpc("record_smartscan_review_decisions", {
+    p_scan_id: scanId,
+    p_decisions: decisions,
+  });
+  if (error || !Array.isArray(data) || data.length !== decisions.length) {
+    return { ok: false, reason: "write_failed" };
+  }
+  return { ok: true, recorded: data.length };
+}
+
+// Resolve the provisional server ledger only after its item-level audit events
+// are durable. The RPC is single-transition and exact-event idempotent.
+export async function resolveScanSubmission(
+  scanId: string,
+  resolution: RemoteSubmissionResolution,
+): Promise<SubmissionResolutionResult> {
+  const sb = getSupabaseClient();
+  if (!sb) return { ok: false, reason: "offline" };
+  const { data, error } = await sb.rpc("resolve_smartscan_submission", {
+    p_scan_id: scanId,
+    p_resolution: resolution,
+  });
+  const record = Array.isArray(data) ? data[0] : data;
+  if (error || !record || typeof record.resolution_id !== "string") {
+    return { ok: false, reason: "write_failed" };
+  }
+  return {
+    ok: true,
+    resolutionId: record.resolution_id,
+    replayed: record.replayed === true,
+  };
+}
+
+// Commit an immutable, provisional submission through the transactional server
+// boundary. The RPC enforces owner/session/expiry checks, exact replay, and a
+// one-pending-submission rule before returning a scan-specific receipt.
+export async function commitCheckedResult(row: CheckedResultRow): Promise<CommitResult> {
+  const sb = getSupabaseClient();
+  if (!sb) return { ok: false, reason: "offline" };
+  const { data, error } = await sb
+    .rpc("commit_smartscan_submission", { p_submission: row });
+  const record = Array.isArray(data) ? data[0] : data;
+  if (error || !record || typeof record.receipt_id !== "string") {
+    return { ok: false, reason: "write_failed" };
+  }
+  return {
+    ok: true,
+    receiptId: record.receipt_id,
+    committedAt: typeof record.committed_at === "string" ? record.committed_at : new Date().toISOString(),
+    replayed: record.replayed === true,
+  };
+}
+
+// Compatibility wrapper for existing callers that only need success/failure.
+export async function upsertCheckedResult(row: CheckedResultRow): Promise<boolean> {
+  return (await commitCheckedResult(row)).ok;
 }
 
 export async function uploadResult(result: Result, ctx: RowContext): Promise<boolean> {
@@ -138,7 +224,7 @@ export async function fetchCheckedResults(
   const sb = getSupabaseClient();
   if (!sb) return [];
   const { data } = await sb
-    .from("smartscan_checked_results")
+    .from("smartscan_scan_submissions")
     .select("*")
     .eq("teacher_user_id", teacherUserId)
     .eq("assessment_id", assessmentId)

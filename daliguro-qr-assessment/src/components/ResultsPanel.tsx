@@ -16,7 +16,13 @@ import type {
 import { MASTERY_STATUSES } from "../lib/types";
 import { masteryColor } from "../lib/scoring";
 import { classStats } from "../lib/insights";
+import { finalizeResults } from "../lib/result-finalization";
 import { downloadCsv, safeFilename, toCsv } from "../lib/export";
+import {
+  hasUnresolvedScanEvidence,
+  isTrustedResult,
+  trustedResults,
+} from "../lib/result-trust";
 import { ActiveGate } from "./ActiveGate";
 import { Button, Empty } from "./ui";
 
@@ -57,26 +63,6 @@ function formatDate(ms: number): string {
   return d.toLocaleDateString() + " " + d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 
-// Module-level so the react-hooks purity rule sees the Date.now() call is
-// outside component render scope (these run only from event handlers).
-function finalizeResults(results: Result[], ids: Set<string>, bulk: boolean): Result[] {
-  const now = Date.now();
-  return results.map((r) =>
-    ids.has(r.id) && (r.reviewStatus === "reviewed" || r.reviewStatus === "auto")
-      ? {
-          ...r,
-          reviewStatus: "finalized" as const,
-          finalizedAt: now,
-          auditLog: r.auditLog.concat({
-            at: now,
-            action: bulk ? "Finalized (locked, bulk)" : "Finalized (locked)",
-          }),
-          updatedAt: now,
-        }
-      : r,
-  );
-}
-
 function ResultsView({
   active,
   state,
@@ -112,11 +98,14 @@ function ResultsView({
     })
     .sort((a, b) => sortRows(a, b, sortKey));
 
-  const stats = classStats(allResults);
-  const pending = allResults.filter((r) => r.reviewStatus === "needs_review").length;
-  const finalized = allResults.filter((r) => r.reviewStatus === "finalized").length;
+  const trusted = trustedResults(allResults);
+  const stats = classStats(trusted);
+  const pending = allResults.filter((r) => !isTrustedResult(r)).length;
+  const finalized = trusted.filter((r) => r.reviewStatus === "finalized").length;
   const readyToFinalize = allResults.filter(
-    (r) => r.reviewStatus === "reviewed" || r.reviewStatus === "auto",
+    (r) =>
+      (r.reviewStatus === "reviewed" || r.reviewStatus === "auto") &&
+      !hasUnresolvedScanEvidence(r),
   ).length;
 
   function finalizeOne(id: string) {
@@ -145,8 +134,9 @@ function ResultsView({
   }
 
   function exportCsv() {
-    if (rows.length === 0) {
-      window.alert("No results to export.");
+    const exportableRows = rows.filter((row) => isTrustedResult(row.result));
+    if (exportableRows.length === 0) {
+      window.alert("No reviewed results are ready to export. Resolve pending scan evidence first.");
       return;
     }
     const headers = [
@@ -163,7 +153,7 @@ function ResultsView({
       "Trust",
       "Date Checked",
     ];
-    const data = rows.map((row) => [
+    const data = exportableRows.map((row) => [
       row.learner ? row.learner.lrn : "",
       learnerName(row),
       row.learner ? row.learner.section : "",
@@ -204,7 +194,7 @@ function ResultsView({
       <div className="mt-4 grid grid-cols-2 gap-3 sm:grid-cols-3 xl:grid-cols-6">
         <Stat label="Total Learners" value={String(state.learners.length)} />
         <Stat label="Scanned" value={String(allResults.filter((r) => r.source === "scan").length)} />
-        <Stat label="Checked" value={String(stats.count)} />
+        <Stat label="Trusted" value={String(stats.count)} />
         <Stat label="Needs Review" value={String(pending)} tone={pending > 0 ? "warn" : undefined} />
         <Stat label="Passing Rate" value={stats.passingRate + "%"} />
         <Stat label="Average Score" value={stats.average + "%"} />
@@ -335,16 +325,19 @@ function ResultRow({
 }) {
   const r = row.result;
   const status = STATUS_META[r.reviewStatus];
-  const canFinalize = r.reviewStatus === "reviewed" || r.reviewStatus === "auto";
+  const unresolved = hasUnresolvedScanEvidence(r);
+  const canFinalize =
+    (r.reviewStatus === "reviewed" || r.reviewStatus === "auto") &&
+    !hasUnresolvedScanEvidence(r);
   return (
     <>
       <tr className="border-t border-slate-100">
         <td className="px-3 py-2 font-semibold">{learnerName(row)}</td>
         <td className="px-3 py-2">{r.version}</td>
         <td className="px-3 py-2">
-          {r.rawScore}/{r.totalScore}
+          {unresolved ? "Pending review" : `${r.rawScore}/${r.totalScore}`}
         </td>
-        <td className="px-3 py-2 font-bold">{r.percentage}%</td>
+        <td className="px-3 py-2 font-bold">{unresolved ? "—" : `${r.percentage}%`}</td>
         <td className="px-3 py-2">
           <MasteryTag status={r.masteryStatus} />
         </td>
@@ -385,6 +378,12 @@ function ResultRow({
                 {r.auditLog.map((e, i) => (
                   <li key={i}>
                     {formatDate(e.at)} — {e.action}
+                    {e.itemNumber != null ? ` · item ${e.itemNumber}` : ""}
+                    {e.originalStatus ? ` [${e.originalStatus}]` : ""}
+                    {e.originalValue !== undefined || e.correctedValue !== undefined
+                      ? ` · ${e.originalValue || "blank"} → ${e.correctedValue || "blank"}`
+                      : ""}
+                    {e.actorId ? ` · by ${e.actorId}` : ""}
                     {e.reason ? ` (reason: ${e.reason})` : ""}
                   </li>
                 ))}

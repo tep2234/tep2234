@@ -52,22 +52,9 @@ export function TestImport({
 
   // Parse raw text (from a file or the paste box) into preview rows. Never fails
   // silently: always sets summary + a human message, even when 0 items detected.
-  function runParse(raw: string, notices: string[] = [], source = "paste") {
+  function runParse(raw: string, notices: string[] = []) {
     const s = importTest(raw, ctx);
     if (notices.length) s.parseErrors = [...notices, ...s.parseErrors];
-    if (import.meta.env.DEV) {
-      // eslint-disable-next-line no-console
-      console.debug("[import] parsed", {
-        source,
-        rawLength: raw.length,
-        detected: s.detected,
-        ready: s.ready,
-        review: s.review,
-        manual: s.manual,
-        errors: s.errors,
-        parseErrors: s.parseErrors,
-      });
-    }
     // Nothing recognized and no error to show: stay on the upload screen with a
     // clear reason instead of flipping to an empty, misleading preview.
     if (s.detected === 0 && s.parseErrors.length === 0) {
@@ -84,32 +71,19 @@ export function TestImport({
     return s;
   }
 
-  async function handleImportFile(file: File, source = "file") {
+  async function handleImportFile(file: File) {
     if (!file) return;
     setReadingFile(true);
     setFileMessage(`Reading ${file.name}...`);
-    if (import.meta.env.DEV) {
-      // eslint-disable-next-line no-console
-      console.debug("[import] file selected", {
-        source,
-        name: file.name,
-        type: file.type,
-        size: file.size,
-      });
-    }
     try {
       const extracted = await extractImportFile(file);
       setText(extracted.text);
-      const s = runParse(extracted.text, extracted.notices, source);
+      const s = runParse(extracted.text, extracted.notices);
       if (s.detected > 0) {
         setFileMessage(`Loaded ${file.name}. Review ${s.detected} detected item(s) before saving.`);
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unable to read this file.";
-      if (import.meta.env.DEV) {
-        // eslint-disable-next-line no-console
-        console.debug("[import] read/parse failed", { name: file.name, message });
-      }
       setSummary({
         rows: [],
         versions,
@@ -154,7 +128,7 @@ export function TestImport({
   async function onFile(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
     try {
-      if (file) await handleImportFile(file, "file");
+      if (file) await handleImportFile(file);
     } finally {
       if (e.target) e.target.value = "";
     }
@@ -313,7 +287,7 @@ export function TestImport({
             onDrop={(e) => {
               e.preventDefault();
               const file = e.dataTransfer.files?.[0];
-              if (file) void handleImportFile(file, "drop");
+              if (file) void handleImportFile(file);
             }}
             className="mt-3 flex cursor-pointer flex-col items-center justify-center rounded-xl border-2 border-dashed border-indigo-200 bg-white px-4 py-5 text-center text-sm font-bold text-indigo-900 transition hover:border-indigo-500 hover:bg-indigo-50"
           >

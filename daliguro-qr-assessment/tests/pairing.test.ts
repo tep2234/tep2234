@@ -12,10 +12,12 @@ import {
   isExpired,
   normalizePairingOrigin,
   parsePairingUrl,
+  scoredCheckedRow,
   type ScanBroadcast,
   secondsLeft,
   SESSION_TTL_MS,
   verifyPairingToken,
+  validateScanBroadcast,
 } from "../src/lib/sync/pairing";
 
 describe("pairing token", () => {
@@ -89,6 +91,9 @@ describe("pairing URL build/parse", () => {
 describe("checkedRowFromScan (phone broadcast → PC DB row)", () => {
   const scan: ScanBroadcast = {
     token: "tok",
+    scanId: "scan-12345678",
+    sessionId: "sess_1",
+    assessmentId: "A1",
     learnerId: "L1",
     version: "A",
     answerMap: { "1": "B", "2": "" },
@@ -97,21 +102,33 @@ describe("checkedRowFromScan (phone broadcast → PC DB row)", () => {
       { item: 2, answer: "", status: "unclear", confidence: 0.4 },
     ],
     confidence: 0.675,
+    capturedAt: 1_000,
     deviceName: "iPhone",
   };
 
   it("maps a broadcast to the authenticated-PC row, flagging doubtful items", () => {
     const row = checkedRowFromScan(scan, { assessmentId: "A1", teacherUserId: "u1", sessionId: "sess_1" });
     expect(row.assessment_id).toBe("A1");
+    expect(row.scan_id).toBe("scan-12345678");
     expect(row.teacher_user_id).toBe("u1");
     expect(row.learner_id).toBe("L1");
     expect(row.total_items).toBe(2);
     expect(row.answer_map).toEqual({ "1": "B", "2": "" });
-    expect(row.qr_payload).toEqual({ version: "A" });
+    expect(row.qr_payload).toEqual({
+      version: "A",
+      assessmentId: "A1",
+      learnerId: "L1",
+      sessionId: "sess_1",
+      itemCount: 2,
+      capturedAt: 1_000,
+    });
     expect(row.scan_confidence).toBe(0.68); // rounded to 2dp
     expect(row.low_confidence_items).toEqual([2]); // item 2 was unclear
     expect(row.scan_session_id).toBe("sess_1");
     expect(row.scan_source).toBe("phone_camera");
+    expect(row.corrected_by_teacher).toBe(false);
+    expect(row.review_status).toBe("needs_review");
+    expect(row.is_official).toBe(false);
   });
 
   it("flags low-confidence selected answers from the phone as review items", () => {
@@ -128,6 +145,33 @@ describe("checkedRowFromScan (phone broadcast → PC DB row)", () => {
       { assessmentId: "A1", teacherUserId: "u1", sessionId: "sess_1" },
     );
     expect(row.low_confidence_items).toEqual([2]);
+  });
+
+  it("applies the PC score before the row can become the cloud record", () => {
+    const raw = checkedRowFromScan(scan, { assessmentId: "A1", teacherUserId: "u1", sessionId: "sess_1" });
+    const scored = scoredCheckedRow(raw, {
+      scanId: scan.scanId,
+      learnerId: scan.learnerId,
+      raw: 1,
+      total: 2,
+      pct: 50,
+      correct: 1,
+      wrong: 0,
+      blank: 1,
+      mastery: "Needs Reinforcement",
+    });
+    expect(scored.score).toBe(1);
+    expect(scored.percentage).toBe(50);
+    expect(scored.corrected_by_teacher).toBe(false);
+    expect(scored.review_status).toBe("needs_review");
+    expect(scored.is_official).toBe(false);
+  });
+
+  it("rejects mismatched sessions, assessments, and malformed item coverage at runtime", () => {
+    expect(validateScanBroadcast(scan, { sessionId: "sess_1", assessmentId: "A1" })).toEqual({ ok: true });
+    expect(validateScanBroadcast({ ...scan, sessionId: "other" }, { sessionId: "sess_1", assessmentId: "A1" })).toMatchObject({ ok: false });
+    expect(validateScanBroadcast({ ...scan, assessmentId: "other" }, { sessionId: "sess_1", assessmentId: "A1" })).toMatchObject({ ok: false });
+    expect(validateScanBroadcast({ ...scan, detected: [scan.detected[1], scan.detected[0]] }, { sessionId: "sess_1", assessmentId: "A1" })).toMatchObject({ ok: false });
   });
 });
 
@@ -189,6 +233,8 @@ describe("checkedResultRow mapping", () => {
     expect(row.scan_confidence).toBe(0.82);
     expect(row.low_confidence_items).toEqual([2]); // item 2 was unclear
     expect(row.corrected_by_teacher).toBe(true);
+    expect(row.review_status).toBe("reviewed");
+    expect(row.is_official).toBe(false);
     expect(row.scan_session_id).toBe("sess_1");
     expect(row.scan_source).toBe("phone_camera");
     expect(row.checked_at).toBe(new Date(200).toISOString());

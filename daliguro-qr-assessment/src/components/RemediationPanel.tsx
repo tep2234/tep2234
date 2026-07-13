@@ -313,7 +313,7 @@ function RemediationRow({ result, state, items }: { result: Result; state: QrAss
   const learner = state.learners.find((l) => l.id === result.learnerId);
   const mastery = intelMastery(result.percentage);
   const weakItems = result.itemScores
-    .filter((s) => !s.manual && !s.correct)
+    .filter((s) => !s.unresolved && !s.manual && !s.correct)
     .map((s) => s.itemNumber)
     .slice(0, 8);
   const itemsById = new Map(items.map((i) => [i.id, i]));

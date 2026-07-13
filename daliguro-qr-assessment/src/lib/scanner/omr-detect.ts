@@ -3,6 +3,7 @@
 // -> sample each bubble's inner disc darkness -> classify per item.
 
 import type { Choice, OmrTemplate, Point } from "./omr-template";
+import type { ScanItemStatus } from "../types";
 import { CHOICES } from "./omr-template";
 
 export interface GrayImage {
@@ -17,7 +18,7 @@ export interface RgbaImage {
   height: number;
 }
 
-export type ItemStatus = "selected" | "blank" | "unclear" | "multiple";
+export type ItemStatus = ScanItemStatus;
 
 export interface ItemReading {
   item: number;
@@ -25,12 +26,15 @@ export interface ItemReading {
   status: ItemStatus;
   confidence: number; // 0..1
   fill: number[]; // darkness ratio 0..1 per choice A..E
+  unreadableChoices?: number[];
 }
 
 // The shade-one VERSION row, read as a second identity layer.
 export interface VersionReading {
   detected: string | null; // "A".."D" or null when nothing is clearly shaded
   fill: number[];
+  status: "selected" | "blank" | "unclear" | "multiple";
+  confidence: number;
 }
 
 export interface SheetReading {
@@ -41,6 +45,13 @@ export interface SheetReading {
   sharpness: number; // higher = sharper
   version: VersionReading;
   items: ItemReading[];
+  // Canonical answer-area diagnostics used by independent capture gates.
+  // These are derived from local paper/background and expected print outlines,
+  // not from the mix of marked and unmarked answers.
+  shadowLevel?: number; // 0..100, higher means less even illumination
+  glareLevel?: number; // percentage of answer bubbles with washed-out bright regions
+  printContrast?: number; // 0..1 median expected bubble-outline contrast
+  obscuredBubbleCount?: number;
 }
 
 // Adaptive contrast thresholds. markScore = (localBg - innerBrightness) / localBg,
@@ -49,6 +60,7 @@ const MARK_HI = 0.25; // clearly shaded (inner 25%+ darker than surrounding pape
 const MARK_LO = 0.12; // clearly empty (below = no mark; paper noise is 5–10%)
 const MARGIN = 0.08; // gap needed between top choice and runner-up
 const STRONG_MARGIN = 0.13; // clean separation needed for faint marks
+export const MIN_VERSION_CONFIDENCE = 0.75;
 
 // --- grayscale ---------------------------------------------------------
 export function toGray(img: RgbaImage): GrayImage {
@@ -344,7 +356,13 @@ function sample(g: GrayImage, x: number, y: number): number {
 // Returns 0 (empty) to 1 (fully filled), independent of ambient brightness.
 // innerR samples the mark; the ring between r*0.85 and r*1.35 samples paper background
 // (r*0.85 skips the printed ink outline; r*1.35 stays clear of adjacent bubbles).
-function bubbleAdaptive(g: GrayImage, h: number[], cx: number, cy: number, r: number): number {
+interface BubbleFeature {
+  darkness: number;
+  background: number;
+  outlineContrast: number;
+}
+
+function bubbleFeature(g: GrayImage, h: number[], cx: number, cy: number, r: number): BubbleFeature {
   const innerR = r * 0.55;
   const outMinR2 = (r * 0.85) * (r * 0.85);
   const outMaxR = r * 1.35;
@@ -370,7 +388,68 @@ function bubbleAdaptive(g: GrayImage, h: number[], cx: number, cy: number, r: nu
   const inner = innerN > 0 ? innerSum / innerN : 255;
   const outer = outerN > 0 ? outerSum / outerN : 200;
   const bg = Math.max(outer, 40); // floor prevents near-zero division in deep shadow
-  return Math.max(0, (bg - inner) / bg);
+  // The sheet always prints a bubble outline. Sampling the darkest of three
+  // nearby radii tolerates small scale/focus errors while still detecting an
+  // outline erased by glare or very weak printing.
+  let outlineSum = 0;
+  const outlineSamples = 32;
+  for (let i = 0; i < outlineSamples; i += 1) {
+    const angle = (i / outlineSamples) * Math.PI * 2;
+    let darkest = 255;
+    for (const radiusScale of [0.9, 1, 1.1]) {
+      const p = applyHomography(
+        h,
+        cx + Math.cos(angle) * r * radiusScale,
+        cy + Math.sin(angle) * r * radiusScale,
+      );
+      darkest = Math.min(darkest, sample(g, p.x, p.y));
+    }
+    outlineSum += darkest;
+  }
+  const outline = outlineSum / outlineSamples;
+  return {
+    darkness: Math.max(0, (bg - inner) / bg),
+    background: outer,
+    outlineContrast: clamp01((bg - outline) / bg),
+  };
+}
+
+function percentile(values: number[], fraction: number): number {
+  if (values.length === 0) return 0;
+  const sorted = values.slice().sort((a, b) => a - b);
+  const index = Math.max(0, Math.min(sorted.length - 1, Math.round((sorted.length - 1) * fraction)));
+  return sorted[index];
+}
+
+function isBubbleUnreadable(feature: BubbleFeature): boolean {
+  // A missing outline means there is no trustworthy visual evidence that the
+  // expected answer region was actually visible. Bright glare and deep local
+  // obstruction receive a slightly wider threshold.
+  return (
+    feature.outlineContrast < 0.045 ||
+    ((feature.background >= 248 || feature.background <= 65) && feature.outlineContrast < 0.08)
+  );
+}
+
+function captureMetrics(features: BubbleFeature[]): {
+  shadowLevel: number;
+  glareLevel: number;
+  printContrast: number;
+  obscuredBubbleCount: number;
+} {
+  if (features.length === 0) {
+    return { shadowLevel: 100, glareLevel: 100, printContrast: 0, obscuredBubbleCount: 0 };
+  }
+  const backgrounds = features.map((feature) => feature.background);
+  const spread = percentile(backgrounds, 0.9) - percentile(backgrounds, 0.1);
+  const shadowLevel = Math.round(Math.max(0, Math.min(100, (spread / 255) * 180)));
+  const washedOut = features.filter(
+    (feature) => feature.background >= 248 && feature.outlineContrast < 0.08,
+  ).length;
+  const glareLevel = Math.round((washedOut / features.length) * 100);
+  const printContrast = Math.round(percentile(features.map((feature) => feature.outlineContrast), 0.5) * 1000) / 1000;
+  const obscuredBubbleCount = features.filter(isBubbleUnreadable).length;
+  return { shadowLevel, glareLevel, printContrast, obscuredBubbleCount };
 }
 
 export function classifyItem(
@@ -446,15 +525,25 @@ export function ensureCompleteItems(items: ItemReading[], total: number): ItemRe
 // Read the shade-one VERSION bubbles using an existing homography.
 function readVersionMarks(g: GrayImage, h: number[], template: OmrTemplate): VersionReading {
   const fill = template.versionBubbles.map((b) =>
-    bubbleAdaptive(g, h, b.cx, b.cy, b.r),
+    bubbleFeature(g, h, b.cx, b.cy, b.r).darkness,
   );
   const order = fill.map((v, i) => ({ v, i })).sort((a, b) => b.v - a.v);
   const top = order[0];
   const second = order[1] ?? { v: 0, i: -1 };
-  if (!top || top.v < MARK_HI || top.v - second.v < MARGIN) {
-    return { detected: null, fill };
+  if (!top || top.v < MARK_LO) {
+    return { detected: null, fill, status: "blank", confidence: top ? clamp01(1 - top.v / MARK_LO) : 0 };
   }
-  return { detected: template.versionBubbles[top.i].version, fill };
+  if (fill.filter((value) => value > MARK_HI).length >= 2) {
+    return { detected: null, fill, status: "multiple", confidence: 0.2 };
+  }
+  if (top.v < MARK_HI || top.v - second.v < MARGIN) {
+    return { detected: null, fill, status: "unclear", confidence: 0.35 };
+  }
+  const confidence = clamp01(Math.min(top.v / 0.45, (top.v - second.v) / 0.2));
+  if (confidence < MIN_VERSION_CONFIDENCE) {
+    return { detected: null, fill, status: "unclear", confidence };
+  }
+  return { detected: template.versionBubbles[top.i].version, fill, status: "selected", confidence };
 }
 
 const NO_FILL = () => new Array<number>(CHOICES.length).fill(0);
@@ -479,26 +568,53 @@ export function readSheet(
       corners: null,
       brightness,
       sharpness,
-      version: { detected: null, fill: [] },
+      version: { detected: null, fill: [], status: "blank", confidence: 0 },
       items: [],
+      shadowLevel: 100,
+      glareLevel: 100,
+      printContrast: 0,
     };
   }
   const h = solveHomography(template.markerCenters, corners);
 
   // Gather darkness per item/choice.
   const fillByItem = new Map<number, number[]>();
+  const features: BubbleFeature[] = [];
+  const featuresByItem = new Map<number, BubbleFeature[]>();
   for (const b of template.bubbles) {
     if (!fillByItem.has(b.item)) fillByItem.set(b.item, NO_FILL());
-    fillByItem.get(b.item)![b.choiceIndex] = bubbleAdaptive(g, h, b.cx, b.cy, b.r);
+    const feature = bubbleFeature(g, h, b.cx, b.cy, b.r);
+    features.push(feature);
+    if (!featuresByItem.has(b.item)) featuresByItem.set(b.item, []);
+    featuresByItem.get(b.item)![b.choiceIndex] = feature;
+    fillByItem.get(b.item)![b.choiceIndex] = feature.darkness;
   }
+  const metrics = captureMetrics(features);
+  const localizedVisibilityComparable = metrics.printContrast >= 0.12;
 
   const items: ItemReading[] = [];
   for (let n = 1; n <= template.items; n += 1) {
     const fill = fillByItem.get(n) ?? NO_FILL();
-    items.push(classifyItem(n, fill, validChoicesByItem[n] ?? CHOICES.length));
+    const validChoices = validChoicesByItem[n] ?? CHOICES.length;
+    const classified = classifyItem(n, fill, validChoices);
+    const unreadableChoices = localizedVisibilityComparable
+      ? (featuresByItem.get(n) ?? [])
+          .slice(0, validChoices)
+          .flatMap((feature, index) => feature && isBubbleUnreadable(feature) ? [index] : [])
+      : [];
+    items.push(
+      unreadableChoices.length > 0
+        ? {
+            ...classified,
+            status: "unreadable",
+            confidence: Math.min(classified.confidence, 0.15),
+            unreadableChoices,
+          }
+        : classified,
+    );
   }
 
   const version = readVersionMarks(g, h, template);
 
-  return { aligned: true, markersFound: 4, corners, brightness, sharpness, version, items };
+  return { aligned: true, markersFound: 4, corners, brightness, sharpness, version, items, ...metrics };
 }

@@ -76,7 +76,7 @@ function makeResult(overrides: Partial<SheetReading> = {}, readings?: ItemReadin
     ],
     brightness: 155,
     sharpness: 5.2,
-    version: { detected: "A", fill: [0.6, 0.02, 0.02, 0.02] },
+    version: { detected: "A", fill: [0.6, 0.02, 0.02, 0.02], status: "selected", confidence: 0.95 },
     items: actualReadings,
     ...overrides,
   };

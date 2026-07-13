@@ -158,11 +158,10 @@ export function reportItems(
   items: Item[],
   results: Result[],
 ): ReportItemRow[] {
-  const takers = results.length;
   const rows = analyzeItems(items, results);
   const wrong = commonWrongAnswers(items, results);
   return rows.map((r) => {
-    const attempts = r.attempts || takers;
+    const attempts = r.attempts;
     const correct = r.correct;
     const errors = Math.max(0, attempts - correct - r.blank) + r.blank; // wrong + blank
     const pct = attempts > 0 ? Math.round((correct / attempts) * 1000) / 10 : 0;
@@ -208,6 +207,7 @@ export function reportCompetencies(
   const groups = new Map<string, { itemNums: Set<number>; possible: number; earned: number }>();
   results.forEach((r) => {
     r.itemScores.forEach((s) => {
+      if (s.unresolved) return;
       const item = itemsById.get(s.itemId);
       if (!item) return;
       const comp = item.competency.trim() || "Untagged Competency";
@@ -224,6 +224,7 @@ export function reportCompetencies(
   results.forEach((r) => {
     const per = new Map<string, { possible: number; earned: number }>();
     r.itemScores.forEach((s) => {
+      if (s.unresolved) return;
       const item = itemsById.get(s.itemId);
       if (!item) return;
       const comp = item.competency.trim() || "Untagged Competency";
@@ -287,6 +288,7 @@ export function reportLearners(
       const weak: string[] = [];
       const per = new Map<string, { possible: number; earned: number }>();
       r.itemScores.forEach((s) => {
+        if (s.unresolved) return;
         const item = itemsById.get(s.itemId);
         if (!item) return;
         const comp = item.competency.trim() || "Untagged Competency";
@@ -299,7 +301,7 @@ export function reportLearners(
         if (g.possible > 0 && (g.earned / g.possible) * 100 < PASSING_PERCENT) weak.push(comp);
       });
       const missed = r.itemScores
-        .filter((s) => !s.manual && !s.correct)
+        .filter((s) => !s.unresolved && !s.manual && !s.correct)
         .map((s) => numberOf.get(s.itemId) ?? s.itemNumber)
         .sort((a, b) => a - b);
       const mastery = depedMasteryLabel(r.percentage);

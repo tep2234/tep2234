@@ -18,7 +18,7 @@ describe("scanQuality", () => {
     expect(q.issues).toHaveLength(0);
   });
 
-  it("pushes doubtful low-confidence scans into review with useful reasons", () => {
+  it("requires a retake when doubtful low-confidence scans also fail hard light/focus gates", () => {
     const q = scanQuality({
       confidence: 0.62,
       brightness: 64,
@@ -29,7 +29,8 @@ describe("scanQuality", () => {
       tiltAngle: 2,
       bubbleDarkness: 0.3,
     });
-    expect(q.label).toBe("Review");
+    expect(q.label).toBe("Retake");
+    expect(q.autoEligible).toBe(false);
     expect(q.issues).toContain("low light");
     expect(q.issues).toContain("soft focus");
     expect(q.issues).toContain("weak bubble confidence");
@@ -51,5 +52,24 @@ describe("scanQuality", () => {
     expect(q.issues).toContain("uneven shadow");
     expect(q.issues).toContain("sheet tilted");
     expect(q.issues).toContain("print or mark contrast too weak");
+  });
+
+  it("routes a localized unreadable bubble to mandatory review without auto-eligibility", () => {
+    const q = scanQuality({
+      confidence: 0.9,
+      brightness: 150,
+      sharpness: 6,
+      aligned: true,
+      doubtfulItems: 1,
+      shadowLevel: 5,
+      tiltAngle: 0,
+      bubbleDarkness: 0.5,
+      obscuredBubbleCount: 1,
+    });
+    expect(q.disposition).toBe("review");
+    expect(q.label).toBe("Review");
+    expect(q.autoEligible).toBe(false);
+    expect(q.reasonCodes).toContain("BUBBLE_REGION_UNREADABLE");
+    expect(q.hardBlockers).not.toContain("BUBBLE_REGION_UNREADABLE");
   });
 });

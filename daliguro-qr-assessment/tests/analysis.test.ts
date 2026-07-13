@@ -145,6 +145,14 @@ describe("analyzeItems", () => {
     });
   });
 
+  it("excludes unresolved scan evidence from attempts, errors, and blanks", () => {
+    const rows = analyzeItems(items, [
+      result({ itemScores: [score({ itemId: "i1", unresolved: true, unresolvedStatus: "unreadable" })] }),
+    ]);
+    const row = rows.find((candidate) => candidate.item.id === "i1")!;
+    expect(row).toMatchObject({ attempts: 0, correct: 0, incorrect: 0, blank: 0, percentCorrect: 0 });
+  });
+
   it("mostMissed/leastMissed/blankHeavy rank and slice correctly", () => {
     const rows = analyzeItems(items, [
       result({

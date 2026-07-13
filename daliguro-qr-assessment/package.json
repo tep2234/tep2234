@@ -6,11 +6,13 @@
   "scripts": {
     "dev": "vite",
     "dev:https": "HTTPS=true vite",
+    "typecheck": "tsc -b --pretty false",
     "build": "tsc -b && vite build",
     "lint": "eslint .",
     "preview": "vite preview",
     "preview:https": "HTTPS=true vite preview",
-    "test": "vitest run"
+    "test": "vitest run",
+    "test:db": "bash scripts/test-postgres-migrations.sh"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.110.0",

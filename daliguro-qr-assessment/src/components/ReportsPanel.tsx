@@ -22,7 +22,7 @@ import {
   verificationOf,
 } from "../lib/report-intel";
 import { reportSummary } from "../lib/report";
-import { trustedResults } from "../lib/result-trust";
+import { isTrustedResult, trustedResults } from "../lib/result-trust";
 import { ActiveGate } from "./ActiveGate";
 import { SmartReport } from "./SmartReport";
 import { Button, Empty } from "./ui";
@@ -44,6 +44,7 @@ export default function ReportsPanel(props: PanelProps) {
 function weakCompetenciesOf(result: Result, itemsById: Map<string, Item>): string[] {
   const groups = new Map<string, { possible: number; earned: number }>();
   result.itemScores.forEach((s) => {
+    if (s.unresolved) return;
     const item = itemsById.get(s.itemId);
     if (!item) return;
     const comp = item.competency.trim() || "Untagged Competency";
@@ -67,7 +68,7 @@ function ReportsView({ active, state }: { active: Assessment; state: QrAssessmen
   const [showFullRoster, setShowFullRoster] = useState(false);
   const items = state.items.filter((i) => i.assessmentId === active.id);
   const allResults = state.results.filter((r) => r.assessmentId === active.id);
-  const finalizedResults = allResults.filter(isReportable);
+  const finalizedResults = allResults.filter((result) => isReportable(result) && isTrustedResult(result));
   const trustedDraftResults = trustedResults(allResults);
   const results = finalizedResults.length > 0 ? finalizedResults : trustedDraftResults;
   const isDraft = finalizedResults.length === 0 && trustedDraftResults.length > 0;
@@ -211,7 +212,7 @@ function ReportsView({ active, state }: { active: Assessment; state: QrAssessmen
     const data = results.map((r) => {
       const l = learnerOf(r);
       const nums = (pred: (s: Result["itemScores"][number]) => boolean) =>
-        r.itemScores.filter(pred).map((s) => s.itemNumber).join(" ");
+        r.itemScores.filter((score) => !score.unresolved && pred(score)).map((s) => s.itemNumber).join(" ");
       return [
         l?.lrn ?? "",
         l?.fullName ?? "(unknown)",
