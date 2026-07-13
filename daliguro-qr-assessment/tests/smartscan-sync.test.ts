@@ -5,10 +5,9 @@ import {
   createPairingSession,
   endSession,
   fetchCheckedResults,
-  touchSession,
   upsertCheckedResult,
 } from "../src/lib/sync/smartscanSync";
-import { subscribeCheckedResults, subscribeSession } from "../src/lib/sync/realtimeSmartScan";
+import { subscribeCheckedResults, subscribePhoneSubmissions, subscribeSession } from "../src/lib/sync/realtimeSmartScan";
 import type { CheckedResultRow } from "../src/lib/sync/pairing";
 
 // No VITE_SUPABASE_* in the test env -> everything must degrade safely so the
@@ -20,12 +19,11 @@ describe("Supabase disabled mode (offline safety)", () => {
   });
 
   it("session helpers no-op without throwing", async () => {
-    expect(await createPairingSession({ teacherUserId: "u", assessmentId: "A1" })).toBeNull();
+    expect(await createPairingSession({ assessmentId: "A1", learnerIds: ["L1"], allowedVersions: ["A"], itemCount: 1 })).toBeNull();
     const claim = await claimSession("s", "t", "device");
     expect(claim.ok).toBe(false);
     if (!claim.ok) expect(claim.reason).toBe("offline");
     await expect(endSession("s")).resolves.toBeUndefined();
-    await expect(touchSession("s")).resolves.toBeUndefined();
   });
 
   it("result helpers no-op without throwing", async () => {
@@ -39,8 +37,9 @@ describe("realtime subscriptions (disabled mode)", () => {
   it("return a no-op unsubscribe that is safe to call", () => {
     const off1 = subscribeCheckedResults("u", "A1", () => {});
     const off2 = subscribeSession("s", () => {});
+    const off3 = subscribePhoneSubmissions("u", "A1", () => {});
     expect(typeof off1).toBe("function");
     expect(typeof off2).toBe("function");
-    expect(() => { off1(); off2(); }).not.toThrow();
+    expect(() => { off1(); off2(); off3(); }).not.toThrow();
   });
 });

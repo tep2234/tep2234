@@ -1,15 +1,29 @@
 \set ON_ERROR_STOP on
 
 insert into auth.users (id)
-values ('11111111-1111-4111-8111-111111111111');
+values ('11111111-1111-4111-8111-111111111111')
+on conflict (id) do nothing;
+
+insert into public.smartscan_assessment_scopes (
+  id, teacher_user_id, school_id, assessment_id
+) values (
+  '12111111-1111-4111-8111-111111111111',
+  '11111111-1111-4111-8111-111111111111',
+  '11111111-1111-4111-8111-111111111111',
+  'A1'
+);
 
 insert into public.smartscan_sessions (
-  id, teacher_user_id, assessment_id, session_token_hash, status, expires_at
+  id, teacher_user_id, school_id, assessment_id, assessment_scope_id,
+  allowed_versions, item_count, status, expires_at
 ) values (
   '22222222-2222-4222-8222-222222222222',
   '11111111-1111-4111-8111-111111111111',
+  '11111111-1111-4111-8111-111111111111',
   'A1',
-  repeat('a', 64),
+  '12111111-1111-4111-8111-111111111111',
+  array['A']::text[],
+  1,
   'paired',
   now() + interval '15 minutes'
 );
@@ -177,15 +191,20 @@ $$;
 -- Lost-ack recovery: an exact committed scan retry returns its original
 -- receipt even after the session expires. Reconstruct the immutable payload
 -- from the ledger to guarantee byte-equivalent evidence.
+reset role;
 update public.smartscan_sessions
 set status = 'expired', expires_at = now() - interval '1 hour'
 where id = '22222222-2222-4222-8222-222222222222';
+set role authenticated;
+select set_config('request.jwt.claim.sub', '11111111-1111-4111-8111-111111111111', false);
 
 select * from public.commit_smartscan_submission((
   select jsonb_build_object(
     'scan_id', scan_id,
     'teacher_user_id', teacher_user_id,
-    'school_id', school_id,
+    -- Exact replay uses the original client field. The Realtime scope trigger
+    -- server-filled the stored tenant without changing that payload fingerprint.
+    'school_id', null,
     'scan_session_id', scan_session_id,
     'assessment_id', assessment_id,
     'learner_id', learner_id,
@@ -208,9 +227,12 @@ select * from public.commit_smartscan_submission((
 ));
 
 -- Restore a live session for the remaining compatibility/validation cases.
+reset role;
 update public.smartscan_sessions
 set status = 'paired', expires_at = now() + interval '15 minutes'
 where id = '22222222-2222-4222-8222-222222222222';
+set role authenticated;
+select set_config('request.jwt.claim.sub', '11111111-1111-4111-8111-111111111111', false);
 
 -- Older selected rows remain valid without unreadableChoices or newer image
 -- metrics such as glareLevel, shadowLevel, printContrast, and obscured counts.

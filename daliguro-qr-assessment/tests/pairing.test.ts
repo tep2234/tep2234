@@ -68,10 +68,11 @@ describe("pairing URL build/parse", () => {
     expect(parsePairingUrl("https://app.example.com/other?t=x")).toBeNull();
   });
 
-  it("round-trips the assessment id when present (phone needs no DB read)", () => {
-    const url = buildPairingUrl("https://app.example.com", "sess_1", "tok_1", "A_demo");
-    expect(url).toBe("https://app.example.com/smartscan/mobile/sess_1?t=tok_1&a=A_demo");
-    expect(parsePairingUrl(url)).toEqual({ sessionId: "sess_1", token: "tok_1", assessmentId: "A_demo" });
+  it("does not trust assessment or tenant scope from the QR URL", () => {
+    const url = buildPairingUrl("https://app.example.com", "sess_1", "tok_1");
+    expect(url).not.toContain("assessment");
+    expect(url).not.toContain("school");
+    expect(parsePairingUrl(url)).toEqual({ sessionId: "sess_1", token: "tok_1" });
   });
 
   it("detects loopback origins that a phone cannot open", () => {
@@ -90,7 +91,6 @@ describe("pairing URL build/parse", () => {
 
 describe("checkedRowFromScan (phone broadcast → PC DB row)", () => {
   const scan: ScanBroadcast = {
-    token: "tok",
     scanId: "scan-12345678",
     sessionId: "sess_1",
     assessmentId: "A1",

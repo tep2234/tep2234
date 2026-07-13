@@ -4,9 +4,11 @@ set role authenticated;
 select set_config('request.jwt.claim.sub', '66666666-6666-4666-8666-666666666666', false);
 
 -- A queued capture reaches the server just inside the trusted 24-hour window.
+reset role;
 update public.smartscan_sessions
 set status = 'expired', expires_at = now() - interval '23 hours 59 minutes'
 where id = '77777777-7777-4777-8777-777777777777';
+set role authenticated;
 
 select * from public.commit_smartscan_submission(
   public.test_smartscan_submission('offline-near-boundary-0005', 'RACE-L4')
@@ -14,9 +16,11 @@ select * from public.commit_smartscan_submission(
 
 -- Once the trusted server clock crosses 24 hours, new ingress is rejected,
 -- while an exact retry still recovers its already-authoritative receipt.
+reset role;
 update public.smartscan_sessions
 set expires_at = now() - interval '24 hours 1 minute'
 where id = '77777777-7777-4777-8777-777777777777';
+set role authenticated;
 
 select * from public.commit_smartscan_submission(
   public.test_smartscan_submission('offline-near-boundary-0005', 'RACE-L4')
@@ -35,9 +39,11 @@ begin
 end
 $$;
 
+reset role;
 update public.smartscan_sessions
 set status = 'paired', expires_at = now() + interval '15 minutes'
 where id = '77777777-7777-4777-8777-777777777777';
+set role authenticated;
 
 -- Reviewed resolution releases the partial unique pending slot.
 select * from public.commit_smartscan_submission(

@@ -1,16 +1,25 @@
 // PC "Use Phone as Scanner" panel: create a short-lived pairing QR -> use the
-// phone as a temporary camera companion -> receive scans through Supabase
-// Realtime broadcast. The phone never needs teacher sign-in; signed-in PC
-// sessions can additionally persist results to the teacher account.
+// phone as a temporary camera companion -> receive durable inbox rows through
+// RLS-filtered Postgres Changes. Pairing and phone writes use short-lived,
+// server-validated capabilities; no secret is sent through Broadcast.
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import QRCode from "qrcode";
 import { isSupabaseConfigured } from "../../lib/supabase/client";
 import { sendMagicLink, signOut, useSupabaseAuth } from "../../lib/auth/supabaseAuth";
 import { buildPairingUrl, checkedRowFromScan, isLoopbackOrigin, normalizePairingOrigin, scoredCheckedRow, secondsLeft, validateScanBroadcast } from "../../lib/sync/pairing";
-import { commitCheckedResult, createPairingSession, endSession, fetchCheckedResults, type SessionRow } from "../../lib/sync/smartscanSync";
+import {
+  commitCheckedResult,
+  completePhoneSubmission,
+  createPairingSession,
+  endSession,
+  fetchCheckedResults,
+  fetchPhoneSubmissions,
+  type SessionRow,
+} from "../../lib/sync/smartscanSync";
 import type { CheckedResultRow, ScanBroadcast, ScoredSummary } from "../../lib/sync/pairing";
-import { joinScanChannel, subscribeCheckedResults, subscribeSession } from "../../lib/sync/realtimeSmartScan";
+import { subscribeCheckedResults, subscribePhoneSubmissions, subscribeSession } from "../../lib/sync/realtimeSmartScan";
+import type { PhoneInboxRow } from "../../lib/sync/realtime-security";
 import { Button } from "../ui";
 
 interface FeedItem {
@@ -29,9 +38,15 @@ const learnerSubmissionKey = (learnerId: string, version: string) => `${learnerI
 
 export function UsePhoneScannerPanel({
   assessmentId,
+  learnerIds,
+  allowedVersions,
+  itemCount,
   onSyncedRows,
 }: {
   assessmentId: string;
+  learnerIds: string[];
+  allowedVersions: string[];
+  itemCount: number;
   // Called with checked-result rows from the phone (initial fetch + realtime),
   // so the PC can score + merge them into its local results. Returns the scored
   // summaries so the PC can send the score back to the phone.
@@ -40,7 +55,7 @@ export function UsePhoneScannerPanel({
   const auth = useSupabaseAuth();
   const [authErr, setAuthErr] = useState("");
 
-  const [session, setSession] = useState<{ id: string; url: string; expiresAtMs: number; token: string } | null>(null);
+  const [session, setSession] = useState<{ id: string; url: string; expiresAtMs: number } | null>(null);
   const [qrUrl, setQrUrl] = useState("");
   const [phone, setPhone] = useState<SessionRow["status"] | null>(null);
   const [phoneName, setPhoneName] = useState<string>("");
@@ -59,7 +74,6 @@ export function UsePhoneScannerPanel({
   });
   const processingScanIdsRef = useRef(new Set<string>());
   const processingLearnersRef = useRef(new Map<string, string>());
-  const completedScanReceiptsRef = useRef(new Map<string, { receiptId: string; score: ScoredSummary }>());
   const committedLearnerScansRef = useRef(new Map<string, string>());
 
   const configured = isSupabaseConfigured();
@@ -79,7 +93,7 @@ export function UsePhoneScannerPanel({
 
   // Tick the clock while a session is live.
   useEffect(() => {
-    if (!session) return;
+    if (!session?.url) return;
     const t = setInterval(() => setNowMs(Date.now()), 500);
     return () => clearInterval(t);
   }, [session]);
@@ -100,6 +114,12 @@ export function UsePhoneScannerPanel({
     const unsub = subscribeSession(session.id, (row) => {
       setPhone(row.status);
       if (row.paired_device_name) setPhoneName(row.paired_device_name);
+      if (row.status === "paired") {
+        // The QR secret is consumed. Remove its URL and rendered image from PC
+        // memory/UI so it cannot be copied as if it were still reusable.
+        setSession((current) => current ? { ...current, url: "" } : current);
+        setQrUrl("");
+      }
     });
     return () => unsub();
   }, [session]);
@@ -156,7 +176,7 @@ export function UsePhoneScannerPanel({
       seed([row], scored);
     });
     // Realtime fallback: re-pull whenever the teacher returns to the tab, so a
-    // missed realtime/broadcast event can never leave a result stuck.
+    // missed Postgres Changes event can never leave a result stuck.
     const onFocus = () => { if (document.visibilityState === "visible") refetch(); };
     window.addEventListener("focus", onFocus);
     document.addEventListener("visibilitychange", onFocus);
@@ -168,148 +188,103 @@ export function UsePhoneScannerPanel({
     };
   }, [configured, auth.teacherUserId, assessmentId, onRows]);
 
-  // Live scan channel: the phone broadcasts scans here with NO phone sign-in
-  // (it only proves it holds the QR's token). The PC verifies the token, scores
-  // immediately, and persists only when the teacher is signed into cloud sync.
-  useEffect(() => {
-    if (!session || !auth.teacherUserId) return;
+  const processPhoneSubmission = useCallback(async (inbox: PhoneInboxRow) => {
     const teacherUserId = auth.teacherUserId;
-    const sessionToken = session.token;
-    let closed = false;
-    const ch = joinScanChannel(session.id, {
-      onHello: (msg) => {
-        if (msg.token !== sessionToken) return;
-        setPhone("paired");
-        if (msg.deviceName) setPhoneName(msg.deviceName);
-      },
-      onScan: (scan: ScanBroadcast) => {
-        if (scan.token !== sessionToken) return; // not this session's paired phone
-        const fail = (reason: string) => {
-          if (closed) return;
-          ch.sendAck({
-            token: sessionToken,
-            scanId: typeof scan.scanId === "string" ? scan.scanId : "invalid-scan",
-            learnerId: typeof scan.learnerId === "string" ? scan.learnerId : "unknown",
-            status: "failed",
-            reason,
-          });
-        };
-        if (Date.now() >= session.expiresAtMs) {
-          fail("This pairing session has expired. Generate a new pairing QR on the PC.");
-          return;
-        }
-        const validation = validateScanBroadcast(scan, {
-          sessionId: session.id,
-          assessmentId,
-        });
-        if (!validation.ok) {
-          fail(validation.reason);
-          return;
-        }
-        const completed = completedScanReceiptsRef.current.get(scan.scanId);
-        if (completed) {
-          ch.sendAck({
-            token: sessionToken,
-            scanId: scan.scanId,
-            learnerId: scan.learnerId,
-            status: "saved",
-            receiptId: completed.receiptId,
-          });
-          ch.sendScore({
-            token: sessionToken,
-            receiptId: completed.receiptId,
-            ...completed.score,
-          });
-          return;
-        }
-        const learnerKey = learnerSubmissionKey(scan.learnerId, scan.version);
-        const committedScanId = committedLearnerScansRef.current.get(learnerKey);
-        if (committedScanId && committedScanId !== scan.scanId) {
-          fail("A pending result already exists for this learner and version. Review it before deciding whether to replace it.");
-          return;
-        }
-        if (processingScanIdsRef.current.has(scan.scanId)) {
-          ch.sendAck({ token: sessionToken, scanId: scan.scanId, learnerId: scan.learnerId, status: "pc_received" });
-          return;
-        }
-        const processingLearnerScan = processingLearnersRef.current.get(learnerKey);
-        if (processingLearnerScan && processingLearnerScan !== scan.scanId) {
-          fail("Another scan for this learner is still being committed. Wait for its receipt before rescanning.");
-          return;
-        }
-        processingScanIdsRef.current.add(scan.scanId);
-        processingLearnersRef.current.set(learnerKey, scan.scanId);
-        const releaseProcessing = () => {
-          processingScanIdsRef.current.delete(scan.scanId);
-          if (processingLearnersRef.current.get(learnerKey) === scan.scanId) {
-            processingLearnersRef.current.delete(learnerKey);
-          }
-        };
-        setPhone("paired");
-        ch.sendAck({ token: sessionToken, scanId: scan.scanId, learnerId: scan.learnerId, status: "pc_received" });
-        const row = checkedRowFromScan(scan, { assessmentId, teacherUserId, sessionId: session.id });
-        let summary: ScoredSummary | undefined;
-        try {
-          const scored = onRows?.([row], false); // pure validation/scoring preview
-          summary = scored?.find((candidate) => candidate.scanId === scan.scanId);
-        } catch {
-          releaseProcessing();
-          fail("The PC could not validate and score this scan. It remains queued on the phone.");
-          return;
-        }
-        if (!summary) {
-          releaseProcessing();
-          fail("The PC rejected this scan because its learner, version, or item mapping is invalid.");
-          return;
-        }
-        const acceptedSummary = summary;
-        const finish = (receiptId: string, committedRow: CheckedResultRow) => {
-          // The local merge is intentionally after the durable receipt. If it
-          // fails, do not acknowledge the phone; an exact retry will recover
-          // the same server receipt and retry this idempotent merge.
-          const merged = onRows?.([committedRow], true) ?? [];
-          if (!merged.some((candidate) => candidate.scanId === scan.scanId)) {
-            throw new Error("durable_scan_local_merge_failed");
-          }
-          completedScanReceiptsRef.current.set(scan.scanId, { receiptId, score: acceptedSummary });
-          committedLearnerScansRef.current.set(learnerKey, scan.scanId);
-          if (closed) return;
-          ch.sendAck({
-            token: sessionToken,
-            scanId: scan.scanId,
-            learnerId: row.learner_id,
-            status: "saved",
-            receiptId,
-          });
-          ch.sendScore({ token: sessionToken, receiptId, ...acceptedSummary });
-          setFeed((prev) => [{
-            learnerId: row.learner_id,
-            name: row.learner_name ?? row.learner_id,
-            when: Date.now(),
-            raw: acceptedSummary.raw,
-            total: acceptedSummary.total,
-            pct: acceptedSummary.pct,
-            review: "Needs review",
-          }, ...prev].slice(0, 20));
-        };
-        void (async () => {
-          try {
-            const scoredRow = scoredCheckedRow(row, acceptedSummary);
-            const receipt = await commitCheckedResult(scoredRow);
-            if (receipt.ok) finish(receipt.receiptId, scoredRow);
-            else {
-              fail("The PC scored this scan but the database did not confirm a durable save. It remains queued on the phone.");
-            }
-          } catch {
-            fail("The durable save failed unexpectedly. The scan remains queued on the phone and can be retried.");
-          } finally {
-            releaseProcessing();
-          }
-        })();
-      },
+    if (!teacherUserId || inbox.teacher_user_id !== teacherUserId || inbox.assessment_id !== assessmentId) return;
+    const scan = inbox.payload as ScanBroadcast;
+    const validation = validateScanBroadcast(scan, {
+      sessionId: inbox.session_id,
+      assessmentId,
     });
-    return () => { closed = true; ch.close(); };
-  }, [session, auth.teacherUserId, assessmentId, onRows]);
+    if (!validation.ok || scan.scanId !== inbox.message_id) {
+      await completePhoneSubmission({ sessionId: inbox.session_id, messageId: inbox.message_id, rejectionCode: "pc_validation_failed" });
+      return;
+    }
+    const learnerKey = learnerSubmissionKey(scan.learnerId, scan.version);
+    const committedScanId = committedLearnerScansRef.current.get(learnerKey);
+    if (committedScanId && committedScanId !== scan.scanId) {
+      await completePhoneSubmission({ sessionId: inbox.session_id, messageId: scan.scanId, rejectionCode: "duplicate_requires_review" });
+      return;
+    }
+    if (processingScanIdsRef.current.has(scan.scanId)) return;
+    const processingLearnerScan = processingLearnersRef.current.get(learnerKey);
+    if (processingLearnerScan && processingLearnerScan !== scan.scanId) return;
+    processingScanIdsRef.current.add(scan.scanId);
+    processingLearnersRef.current.set(learnerKey, scan.scanId);
+    const releaseProcessing = () => {
+      processingScanIdsRef.current.delete(scan.scanId);
+      if (processingLearnersRef.current.get(learnerKey) === scan.scanId) {
+        processingLearnersRef.current.delete(learnerKey);
+      }
+    };
+    try {
+      const row = checkedRowFromScan(scan, {
+        assessmentId,
+        teacherUserId,
+        schoolId: inbox.school_id,
+        sessionId: inbox.session_id,
+      });
+      const summary = onRows?.([row], false)?.find((candidate) => candidate.scanId === scan.scanId);
+      if (!summary) {
+        await completePhoneSubmission({ sessionId: inbox.session_id, messageId: scan.scanId, rejectionCode: "learner_or_version_invalid" });
+        return;
+      }
+      const scoredRow = scoredCheckedRow(row, summary);
+      const receipt = await commitCheckedResult(scoredRow);
+      if (!receipt.ok) return; // durable inbox row remains pending for reconnect recovery
+      const merged = onRows?.([scoredRow], true) ?? [];
+      if (!merged.some((candidate) => candidate.scanId === scan.scanId)) return;
+      const completed = await completePhoneSubmission({
+        sessionId: inbox.session_id,
+        messageId: scan.scanId,
+        resultReceiptId: receipt.receiptId,
+        score: summary,
+      });
+      if (!completed) return;
+      committedLearnerScansRef.current.set(learnerKey, scan.scanId);
+      setFeed((prev) => [{
+        learnerId: row.learner_id,
+        name: row.learner_name ?? row.learner_id,
+        when: Date.now(),
+        raw: summary.raw,
+        total: summary.total,
+        pct: summary.pct,
+        review: "Needs review",
+      }, ...prev].slice(0, 20));
+    } catch {
+      // The immutable inbox row intentionally remains `received`; focus/reload
+      // will fetch and retry it without trusting a delayed client message.
+    } finally {
+      releaseProcessing();
+    }
+  }, [assessmentId, auth.teacherUserId, onRows]);
+
+  useEffect(() => {
+    if (!configured || !auth.teacherUserId) return;
+    const teacherUserId = auth.teacherUserId;
+    let active = true;
+    const refetch = async () => {
+      const rows = await fetchPhoneSubmissions(teacherUserId, assessmentId);
+      if (!active) return;
+      for (const row of rows) {
+        if (!active) break;
+        await processPhoneSubmission(row);
+      }
+    };
+    void refetch();
+    const unsub = subscribePhoneSubmissions(teacherUserId, assessmentId, (row) => {
+      if (active) void processPhoneSubmission(row);
+    });
+    const onFocus = () => { if (document.visibilityState === "visible") void refetch(); };
+    window.addEventListener("focus", onFocus);
+    document.addEventListener("visibilitychange", onFocus);
+    return () => {
+      active = false;
+      unsub();
+      window.removeEventListener("focus", onFocus);
+      document.removeEventListener("visibilitychange", onFocus);
+    };
+  }, [assessmentId, auth.teacherUserId, configured, processPhoneSubmission]);
 
   const start = useCallback(async () => {
     if (!auth.teacherUserId) {
@@ -324,7 +299,12 @@ export function UsePhoneScannerPanel({
     setCreating(true);
     let created: Awaited<ReturnType<typeof createPairingSession>>;
     try {
-      created = await createPairingSession({ teacherUserId: auth.teacherUserId, assessmentId });
+      created = await createPairingSession({
+        assessmentId,
+        learnerIds,
+        allowedVersions,
+        itemCount,
+      });
     } catch {
       setAuthErr("Could not create a session. Check your connection and try again.");
       return;
@@ -338,10 +318,10 @@ export function UsePhoneScannerPanel({
     } catch {
       /* ignore */
     }
-    const url = buildPairingUrl(pairingOrigin, created.sessionId, created.token, assessmentId);
-    setSession({ id: created.sessionId, url, expiresAtMs: created.expiresAtMs, token: created.token });
+    const url = buildPairingUrl(pairingOrigin, created.sessionId, created.token);
+    setSession({ id: created.sessionId, url, expiresAtMs: created.expiresAtMs });
     setPhone("active");
-  }, [auth.teacherUserId, assessmentId, pairingOrigin, pairingOriginValid, savedPhoneOrigin, savedPhoneOriginIsLoopback]);
+  }, [allowedVersions, assessmentId, auth.teacherUserId, itemCount, learnerIds, pairingOrigin, pairingOriginValid, savedPhoneOrigin, savedPhoneOriginIsLoopback]);
 
   // Auto-generate the pairing QR as soon as auth has settled, so it's visible
   // immediately (no extra click). Signed-out teachers get local PC pairing;
@@ -483,7 +463,9 @@ export function UsePhoneScannerPanel({
             <div className={"mt-1 text-sm font-bold " + (expired ? "text-red-600" : "text-slate-700")}>
               {expired ? "Expired" : `Expires in ${mm}:${ss}`}
             </div>
-            <div className="mt-1 break-all text-[10px] text-slate-400">{session.url}</div>
+            <div className="mt-1 text-[10px] font-bold text-emerald-700">
+              {phone === "paired" ? "One-time QR consumed" : "One-time QR · do not share"}
+            </div>
             <div className="mt-1 text-[10px] font-bold text-emerald-700">Phone address: {pairingOrigin}</div>
             <div className="mt-1 text-[10px] font-bold text-indigo-700">
               Durable cloud session · submissions require teacher review

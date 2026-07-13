@@ -1,16 +1,26 @@
 // Phone scanner page (deep-linked from the PC pairing QR):
-//   /smartscan/mobile/:sessionId?t=RAW_TOKEN&a=ASSESSMENT_ID
+//   /smartscan/mobile/:sessionId?t=ONE_TIME_PAIRING_SECRET
 // The phone is intentionally NOT a second dashboard. It is a temporary camera
-// companion. The signed-in PC remains the system of record: it verifies the
-// pairing token, writes the scan, scores against the local answer key, then
-// broadcasts the score back to this phone.
+// companion. The one-time secret is exchanged for a short-lived capability and
+// stripped from the URL. The database inbox is durable before the PC processes
+// the scan, and the phone polls only its capability-scoped status RPC.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useParams, useSearchParams } from "react-router-dom";
+import { useParams } from "react-router-dom";
 import { classifyMediaError, isSecureLike } from "../lib/camera";
 import { isSupabaseConfigured } from "../lib/supabase/client";
 import { type ScanDetection, type ScoreBroadcast } from "../lib/sync/pairing";
-import { joinScanChannel, type ScanChannel } from "../lib/sync/realtimeSmartScan";
+import { claimSession, getPhoneSubmissionStatus, submitPhoneScan } from "../lib/sync/smartscanSync";
+import {
+  buildPhoneSubmissionEnvelope,
+  clearPhoneCapability,
+  loadPhoneCapability,
+  nextPhoneSequence,
+  safePhoneError,
+  savePhoneCapability,
+  stripPairingSecretFromUrl,
+  type PhoneCapability,
+} from "../lib/sync/realtime-security";
 import { CHOICES } from "../lib/scanner/omr-template";
 import { BLANK_REVIEW_CONFIDENCE, REVIEW_CONFIDENCE } from "../lib/scanner/omr-score";
 import { buildConsensusScan, type FillAccum } from "../lib/scanner/mobile-consensus";
@@ -83,12 +93,18 @@ async function readNativeQr(source: CanvasImageSource): Promise<string | null> {
 
 export default function SmartScanMobilePage() {
   const { sessionId = "" } = useParams();
-  const [params] = useSearchParams();
-  const token = params.get("t") ?? "";
-  const assessmentId = params.get("a") ?? "";
+  const pairingTokenRef = useRef(
+    typeof window === "undefined" ? "" : new URLSearchParams(window.location.search).get("t") ?? "",
+  );
+  const [capability, setCapability] = useState<PhoneCapability | null>(() => {
+    if (typeof window === "undefined" || !sessionId) return null;
+    return loadPhoneCapability(window.sessionStorage, sessionId);
+  });
+  const [pairingPending, setPairingPending] = useState(!capability);
+  const assessmentId = capability?.assessmentId ?? "";
   // Field-test override: append &engine=sync to the pairing URL to force the
   // main-thread fallback pipeline, so testers can verify both paths.
-  const forceSyncEngine = params.get("engine") === "sync";
+  const forceSyncEngine = typeof window !== "undefined" && new URLSearchParams(window.location.search).get("engine") === "sync";
   const configured = isSupabaseConfigured();
 
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -98,7 +114,6 @@ export default function SmartScanMobilePage() {
   const rafRef = useRef<number | null>(null);
   const cameraRunRef = useRef(0);
   const loopRef = useRef<() => void>(() => {});
-  const channelRef = useRef<ScanChannel | null>(null);
   const accumRef = useRef<FillAccum | null>(null);
   const stabilityRef = useRef<FrameStabilityState | null>(null);
   const lastAnalyzeRef = useRef(0);
@@ -156,7 +171,56 @@ export default function SmartScanMobilePage() {
     pendingScanRef.current = pendingScan;
   }, [pendingScan]);
 
-  const linkOk = Boolean(configured && sessionId && token && assessmentId);
+  // Consume the QR secret once. A short-lived scoped capability is kept only in
+  // sessionStorage so a same-tab reconnect can recover; the pairing token is
+  // immediately removed from the address bar and is never persisted.
+  useEffect(() => {
+    if (!configured || !sessionId) return;
+    if (capability) {
+      if (window.location.search) stripPairingSecretFromUrl(window.location, window.history);
+      return;
+    }
+    const pairingToken = pairingTokenRef.current;
+    if (!pairingToken) {
+      setPairingPending(false);
+      setError("This pairing credential is missing or expired. Generate a new QR on the teacher PC.");
+      return;
+    }
+    pairingTokenRef.current = "";
+    stripPairingSecretFromUrl(window.location, window.history);
+    let active = true;
+    void claimSession(sessionId, pairingToken, navigator.userAgent.slice(0, 160)).then((result) => {
+      if (!active) return;
+      setPairingPending(false);
+      if (!result.ok) {
+        setError("This pairing QR is invalid, expired, revoked, or already used. Generate a new QR on the teacher PC.");
+        return;
+      }
+      savePhoneCapability(window.sessionStorage, result.capability);
+      setCapability(result.capability);
+      setError("");
+    });
+    return () => { active = false; };
+  }, [capability, configured, sessionId]);
+
+  useEffect(() => {
+    if (!sessionId || !assessmentId) return;
+    let active = true;
+    queueMicrotask(() => {
+      if (!active) return;
+      try {
+        const restored = parseHeldScans(localStorage.getItem(outboxKey), sessionId, assessmentId);
+        outboxRef.current = restored;
+        setOutbox(restored);
+      } catch {
+        outboxRef.current = [];
+        setOutbox([]);
+      }
+    });
+    return () => { active = false; };
+  }, [assessmentId, outboxKey, sessionId]);
+
+  const linkOk = Boolean(configured && sessionId && capability && assessmentId);
   const canUseLiveCamera = useMemo(
     () => typeof window !== "undefined" && isSecureLike(window, window.location.hostname),
     [],
@@ -189,59 +253,6 @@ export default function SmartScanMobilePage() {
       setTorchAvailable(false);
     }
   }, []);
-
-  useEffect(() => {
-    if (!linkOk) return;
-    const ch = joinScanChannel(sessionId, {
-      onAck: (ack) => {
-        if (ack.token !== token) return;
-        const pending = pendingScanRef.current;
-        const isCurrent = !pending || ack.scanId === pending.scanId;
-        const isHeld = outboxRef.current.some((held) => held.scanId === ack.scanId);
-        if (!isHeld && pending?.scanId !== ack.scanId) return;
-        if (ack.status === "saved") {
-          replaceOutbox(acknowledgeHeldScan(outboxRef.current, ack.scanId));
-          if (!committedScanIdsRef.current.has(ack.scanId)) {
-            committedScanIdsRef.current.add(ack.scanId);
-            setSentCount((count) => count + 1);
-          }
-        }
-        if (!isCurrent) return;
-        setLastSent(ack.learnerId);
-        if (ack.status === "failed") {
-          setSyncState("failed");
-          setError(ack.reason || "The PC rejected this scan. Review the pairing and try again.");
-          return;
-        }
-        if (ack.status === "saved") {
-          setLastReceiptId(ack.receiptId);
-        }
-        setSyncState((prev) => {
-          if (prev === "scored") return prev;
-          return ack.status;
-        });
-      },
-      onScore: (s) => {
-        if (s.token !== token) return;
-        const pending = pendingScanRef.current;
-        if (pending && s.scanId !== pending.scanId) return;
-        setLastScore(s);
-        setSyncState((previous) => previous === "saved" ? "scored" : previous);
-      },
-    });
-    channelRef.current = ch;
-    const device = navigator.userAgent.slice(0, 60);
-    const hello = () => ch.sendHello(device, token);
-    hello();
-    const t1 = setTimeout(hello, 1200);
-    const t2 = setTimeout(hello, 3000);
-    return () => {
-      clearTimeout(t1);
-      clearTimeout(t2);
-      ch.close();
-      channelRef.current = null;
-    };
-  }, [linkOk, replaceOutbox, sessionId, token]);
 
   useEffect(() => closeCamera, [closeCamera]);
 
@@ -331,10 +342,12 @@ export default function SmartScanMobilePage() {
 
   const sendHeld = useCallback(
     async (held: HeldScan): Promise<boolean> => {
-      const ch = channelRef.current;
-      if (!ch) return false;
-      return ch.sendScan({
-        token,
+      if (!capability) return false;
+      const envelope = await buildPhoneSubmissionEnvelope({
+        capability,
+        sequenceNumber: held.sequenceNumber,
+        issuedAt: new Date(held.issuedAt),
+        scan: {
         scanId: held.scanId,
         sessionId: held.sessionId,
         assessmentId: held.assessmentId,
@@ -344,10 +357,23 @@ export default function SmartScanMobilePage() {
         detected: held.detected,
         confidence: held.confidence,
         capturedAt: held.capturedAt,
-        deviceName: navigator.userAgent.slice(0, 60),
+          deviceName: navigator.userAgent.slice(0, 160),
+        },
       });
+      const result = await submitPhoneScan(envelope);
+      if (!result.ok) return false;
+      replaceOutbox(acknowledgeHeldScan(outboxRef.current, held.scanId));
+      if (!committedScanIdsRef.current.has(held.scanId)) {
+        committedScanIdsRef.current.add(held.scanId);
+        setSentCount((count) => count + 1);
+      }
+      if (pendingScanRef.current?.scanId === held.scanId) {
+        setLastSent(held.learnerId);
+        setSyncState("pc_received");
+      }
+      return true;
     },
-    [token],
+    [capability, replaceOutbox],
   );
 
   const submitScan = useCallback(
@@ -372,10 +398,17 @@ export default function SmartScanMobilePage() {
         detected: scan.detected,
         confidence: scan.confidence,
         capturedAt: scan.capturedAt,
+        sequenceNumber: capability ? nextPhoneSequence(window.sessionStorage, capability) : 0,
+        issuedAt: new Date().toISOString(),
       };
-      // Persist before transport. A Realtime send acknowledgement is not a
-      // durable receipt, so this entry remains until the PC echoes `saved` with
-      // this exact scan id and a receipt id.
+      if (!capability || held.sequenceNumber < 1) {
+        submittingRef.current = false;
+        setSyncState("failed");
+        setError("The secure phone capability is unavailable or expired. Generate a new pairing QR.");
+        return;
+      }
+      // Persist before transport. The local copy remains until the database
+      // returns the immutable inbox receipt for this exact message and digest.
       replaceOutbox(upsertHeldScan(outboxRef.current, held));
       let ok: boolean;
       try {
@@ -387,22 +420,18 @@ export default function SmartScanMobilePage() {
       }
       if (!ok) {
         setSyncState("failed");
-        setError("Not connected to the PC yet. The scan is saved on this phone and will auto-send when the PC session is reachable.");
+        setError("The secure inbox did not accept this scan. It remains queued while the active pairing can retry.");
         setStage("done");
         closeCamera();
         return;
       }
-      setSyncState((previous) =>
-        previous === "pc_received" || previous === "saved" || previous === "scored"
-          ? previous
-          : "sent",
-      );
+      setSyncState((previous) => previous === "scored" ? previous : "pc_received");
       setLastSent(scan.learnerId);
       setError("");
       setStage("done");
       closeCamera();
     },
-    [assessmentId, closeCamera, replaceOutbox, sendHeld, sessionId],
+    [assessmentId, capability, closeCamera, replaceOutbox, sendHeld, sessionId],
   );
 
   // Auto-retry the outbox every few seconds while anything is held. Successes
@@ -428,7 +457,7 @@ export default function SmartScanMobilePage() {
       if (cancelled) return;
       if (transportAccepted && pendingScanRef.current) {
         setSyncState((state) =>
-          state === "pc_received" || state === "saved" || state === "scored" ? state : "sent",
+          state === "saved" || state === "scored" ? state : "pc_received",
         );
       }
     };
@@ -439,6 +468,43 @@ export default function SmartScanMobilePage() {
       clearInterval(t);
     };
   }, [outbox, sendHeld]);
+
+  // Reconnect/status recovery always comes from the authoritative inbox row.
+  // Exact polling is capability scoped; no transient channel payload is used.
+  useEffect(() => {
+    const scanId = pendingScan?.scanId;
+    if (!capability || !scanId || syncState === "scored" || syncState === "failed") return;
+    let cancelled = false;
+    const poll = async () => {
+      const status = await getPhoneSubmissionStatus(capability, scanId);
+      if (cancelled || !status) {
+        if (!cancelled && Date.now() >= capability.capabilityExpiresAtMs) {
+          clearPhoneCapability(window.sessionStorage, capability.sessionId);
+          setCapability(null);
+          setSyncState("failed");
+          setError("This secure pairing capability expired. The PC can still recover any inbox receipt already stored.");
+        }
+        return;
+      }
+      if (status.status === "received") {
+        setSyncState("pc_received");
+        return;
+      }
+      if (status.status === "rejected") {
+        setSyncState("failed");
+        setError(safePhoneError(status.rejectionCode));
+        return;
+      }
+      if (status.resultReceiptId && status.score) {
+        setLastReceiptId(status.resultReceiptId);
+        setLastScore(status.score);
+        setSyncState("scored");
+      }
+    };
+    void poll();
+    const timer = setInterval(() => void poll(), 2000);
+    return () => { cancelled = true; clearInterval(timer); };
+  }, [capability, pendingScan?.scanId, syncState]);
 
   const handleStableScan = useCallback(
     (scan: MobileScan) => {
@@ -745,8 +811,10 @@ export default function SmartScanMobilePage() {
 
       {!configured ? (
         <Info>Realtime sync is not enabled on this build. Ask your admin to configure Supabase.</Info>
-      ) : !sessionId || !token || !assessmentId ? (
-        <Info>Invalid pairing link: session, token, or assessment identity is missing. Generate a new phone scanner QR on the PC.</Info>
+      ) : pairingPending ? (
+        <Info>Securely claiming this one-time pairing session…</Info>
+      ) : !sessionId || !capability || !assessmentId ? (
+        <Info>Invalid or expired secure pairing. Generate a new phone scanner QR on the PC.</Info>
       ) : (
         <>
           {(stage === "ready" || stage === "live") ? (

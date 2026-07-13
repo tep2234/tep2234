@@ -1,15 +1,29 @@
 \set ON_ERROR_STOP on
 
 insert into auth.users (id)
-values ('66666666-6666-4666-8666-666666666666');
+values ('66666666-6666-4666-8666-666666666666')
+on conflict (id) do nothing;
+
+insert into public.smartscan_assessment_scopes (
+  id, teacher_user_id, school_id, assessment_id
+) values (
+  '67666666-6666-4666-8666-666666666666',
+  '66666666-6666-4666-8666-666666666666',
+  '66666666-6666-4666-8666-666666666666',
+  'CONCURRENCY-A1'
+);
 
 insert into public.smartscan_sessions (
-  id, teacher_user_id, assessment_id, session_token_hash, status, expires_at
+  id, teacher_user_id, school_id, assessment_id, assessment_scope_id,
+  allowed_versions, item_count, status, expires_at
 ) values (
   '77777777-7777-4777-8777-777777777777',
   '66666666-6666-4666-8666-666666666666',
+  '66666666-6666-4666-8666-666666666666',
   'CONCURRENCY-A1',
-  repeat('b', 64),
+  '67666666-6666-4666-8666-666666666666',
+  array['A']::text[],
+  1,
   'paired',
   now() + interval '15 minutes'
 );

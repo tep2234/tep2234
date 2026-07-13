@@ -19,6 +19,8 @@ function held(scanId: string, capturedAt: number): HeldScan {
     detected: [{ item: 1, answer: "B", status: "selected", confidence: 0.9 }],
     confidence: 0.9,
     capturedAt,
+    sequenceNumber: capturedAt,
+    issuedAt: new Date(capturedAt).toISOString(),
   };
 }
 

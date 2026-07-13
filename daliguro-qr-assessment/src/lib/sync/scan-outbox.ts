@@ -10,6 +10,8 @@ export interface HeldScan {
   detected: ScanDetection[];
   confidence: number;
   capturedAt: number;
+  sequenceNumber: number;
+  issuedAt: string;
 }
 
 export interface SafeScanDiagnostic {
@@ -56,7 +58,7 @@ export function upsertHeldScan(scans: HeldScan[], scan: HeldScan): HeldScan[] {
   const next = existingIndex >= 0
     ? scans.map((item, index) => (index === existingIndex ? scan : item))
     : scans.concat(scan);
-  return next.slice().sort((a, b) => a.capturedAt - b.capturedAt);
+  return next.slice().sort((a, b) => a.sequenceNumber - b.sequenceNumber);
 }
 
 export function acknowledgeHeldScan(scans: HeldScan[], scanId: string): HeldScan[] {
@@ -78,15 +80,17 @@ export function parseHeldScans(raw: string | null, sessionId: string, assessment
           typeof scan.learnerId === "string" && typeof scan.version === "string" &&
           Array.isArray(scan.detected) && scan.detected.length > 0 &&
           !!scan.answerMap && typeof scan.answerMap === "object" &&
-          Number.isFinite(scan.confidence) && Number.isFinite(scan.capturedAt)
+          Number.isFinite(scan.confidence) && Number.isFinite(scan.capturedAt) &&
+          Number.isSafeInteger(scan.sequenceNumber) && (scan.sequenceNumber as number) > 0 &&
+          typeof scan.issuedAt === "string" && Number.isFinite(Date.parse(scan.issuedAt))
         );
         if (!shapeValid) return false;
         return validateScanBroadcast(
-          { token: "persisted-outbox", ...(scan as HeldScan) },
+          scan as HeldScan,
           { sessionId, assessmentId },
         ).ok;
       })
-      .sort((a, b) => a.capturedAt - b.capturedAt);
+      .sort((a, b) => a.sequenceNumber - b.sequenceNumber);
   } catch {
     return [];
   }
