@@ -97,7 +97,7 @@ export function AnswerSheet({
   const [qrUrl, setQrUrl] = useState("");
   useEffect(() => {
     let on = true;
-    QRCode.toDataURL(payloadText, { width: 512, margin: 1, errorCorrectionLevel: "M" })
+    QRCode.toDataURL(payloadText, { width: 768, margin: 2, errorCorrectionLevel: "Q" })
       .then((u) => on && setQrUrl(u))
       .catch(() => on && setQrUrl(""));
     return () => {

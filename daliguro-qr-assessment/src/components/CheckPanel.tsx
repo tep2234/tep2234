@@ -1,10 +1,10 @@
 // SmartScan panel — scan → verify → review → save pipeline.
-// Batch mode: clean, high-confidence scans save automatically; doubtful scans
-// are stored as "needs review" for the Review tab. Manual checking and QR
-// paste remain as fallbacks. Results are self-contained: scored under the
+// Phase 1 safety mode: every scan is verified by a teacher before it is saved;
+// doubtful phone scans are stored as "needs review" for the Review tab. Manual
+// checking and QR paste remain as fallbacks. Results are self-contained: scored under the
 // QR's OWN assessment, never whatever happens to be active.
 
-import { useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { PanelProps } from "./panel-types";
 import type {
   Assessment,
@@ -16,23 +16,34 @@ import type {
   VersionKey,
 } from "../lib/types";
 import { isObjective } from "../lib/items";
-import { emptyInput, type CheckingInput } from "../lib/scoring";
+import { pendingReviewResults } from "../lib/result-trust";
+import { emptyInput, masteryBand, type CheckingInput } from "../lib/scoring";
 import { parseQrPayload } from "../lib/qr-parse";
 import { saveEvidence } from "../lib/offline-store";
 import { ActiveGate } from "./ActiveGate";
 import { omrItemsOf } from "../lib/scanner/omr-template";
-import type { ReviewSummary } from "../lib/scanner/omr-score";
-import { upsertScanResult } from "../lib/scanner/scan-save";
+import {
+  CALIBRATION_EXPECTED,
+  certificationGuidance,
+  evaluateCertification,
+  type CertificationReport,
+} from "../lib/scanner/calibration";
+import { upsertScanResult, upsertSyncedResult } from "../lib/scanner/scan-save";
+import type { ReviewDecisions } from "../lib/scanner/omr-score";
+import { mapSyncedRow } from "../lib/scanner/synced-row";
+import type { CheckedResultRow, ScoredSummary } from "../lib/sync/pairing";
 import { AnswerSheetScanner, type ScanResult } from "./scanner/AnswerSheetScanner";
 import { ScanReviewPanel } from "./scanner/ScanReviewPanel";
+import { UsePhoneScannerPanel } from "./smartscan/UsePhoneScannerPanel";
 import { CheckForm } from "./ManualCheck";
 import { Button, Empty } from "./ui";
 
 type CheckMode = "scan" | "manual" | "paste";
 
-// Auto-accept threshold: at or above this trust score (and with no unclear or
-// multiple marks) a batch scan saves without review.
+// Trust display threshold only. Phase 1 requires teacher review even above it.
 const AUTO_ACCEPT = 0.8;
+const MIN_PRODUCTION_QUALITY = 55;
+const calibrationKey = (assessmentId: string) => `daliguro_scanner_certification_${assessmentId}`;
 
 interface ScanLogEntry {
   id: number;
@@ -41,8 +52,22 @@ interface ScanLogEntry {
   tone: "ok" | "warn" | "err";
 }
 
+interface SavedScanNotice {
+  id: number;
+  learnerName: string;
+  raw: number;
+  total: number;
+  pct: number;
+  reviewStatus: ReviewStatus;
+  confidence: number | null;
+  quality?: number | null;
+  qualityIssues?: string[];
+  version: string;
+  source: "scanner" | "phone";
+}
+
 export default function CheckPanel(props: PanelProps) {
-  const { state, setState, activeId, setActiveId } = props;
+  const { state, setState, activeId, setActiveId, navigate } = props;
   return (
     <ActiveGate
       assessments={state.assessments}
@@ -51,7 +76,14 @@ export default function CheckPanel(props: PanelProps) {
       title="SmartScan"
     >
       {(active) => (
-        <CheckEditor active={active} state={state} setState={setState} setActiveId={setActiveId} />
+        <CheckEditor
+          key={active.id}
+          active={active}
+          state={state}
+          setState={setState}
+          setActiveId={setActiveId}
+          navigate={navigate}
+        />
       )}
     </ActiveGate>
   );
@@ -86,14 +118,6 @@ function inputFromResult(result: Result | undefined): CheckingInput {
   return input;
 }
 
-function responsesFrom(summary: ReviewSummary): Record<string, string> {
-  const responses: Record<string, string> = {};
-  summary.rows.forEach((r) => {
-    responses[r.item.id] = r.detected ?? "";
-  });
-  return responses;
-}
-
 function trustTone(confidence: number): string {
   if (confidence >= AUTO_ACCEPT) return "border-emerald-300 bg-emerald-50 text-emerald-800";
   if (confidence >= 0.6) return "border-amber-300 bg-amber-50 text-amber-800";
@@ -105,11 +129,13 @@ function CheckEditor({
   state,
   setState,
   setActiveId,
+  navigate,
 }: {
   active: Assessment;
   state: QrAssessmentState;
   setState: PanelProps["setState"];
   setActiveId: PanelProps["setActiveId"];
+  navigate?: PanelProps["navigate"];
 }) {
   const items: Item[] = state.items
     .filter((i) => i.assessmentId === active.id)
@@ -124,6 +150,30 @@ function CheckEditor({
   const [scanResult, setScanResult] = useState<ScanResult | null>(null);
   const [batch, setBatch] = useState(true);
   const [scanLog, setScanLog] = useState<ScanLogEntry[]>([]);
+  const [lastSaved, setLastSaved] = useState<SavedScanNotice | null>(null);
+  const [calibrationMode, setCalibrationMode] = useState(false);
+  const [certification, setCertification] = useState<CertificationReport | null>(() => {
+    try {
+      const raw = localStorage.getItem(calibrationKey(active.id));
+      return raw ? JSON.parse(raw) as CertificationReport : null;
+    } catch {
+      return null;
+    }
+  });
+  const stateRef = useRef(state);
+
+  useEffect(() => {
+    stateRef.current = state;
+  }, [state]);
+
+  function saveCertification(report: CertificationReport) {
+    setCertification(report);
+    try {
+      localStorage.setItem(calibrationKey(active.id), JSON.stringify(report));
+    } catch {
+      /* local certification is a UI gate; storage failure should not crash scanning */
+    }
+  }
 
   function log(name: string, text: string, tone: ScanLogEntry["tone"]) {
     setScanLog((prev) => [{ id: Date.now() + Math.random(), name, text, tone }, ...prev].slice(0, 12));
@@ -134,10 +184,12 @@ function CheckEditor({
   function persistScan(
     result: ScanResult,
     responses: Record<string, string>,
+    decisions: ReviewDecisions,
     reviewStatus: ReviewStatus,
   ): { raw: number; total: number; pct: number } | null {
+    const current = stateRef.current;
     const existing = findResult(
-      state.results,
+      current.results,
       result.assessment.id,
       result.learner.id,
       result.version,
@@ -150,45 +202,62 @@ function CheckEditor({
       if (!reason || !reason.trim()) return null;
       auditReason = reason.trim();
     }
-    const saved = upsertScanResult(state, result, responses, reviewStatus, auditReason);
-    setState((prev) => {
-      // Recompute against the freshest state so batch saves never clobber.
-      const next = upsertScanResult(prev, result, responses, reviewStatus, auditReason);
-      return { ...prev, results: next.results };
-    });
+    const actorId = result.assessment.teacherName || "local-teacher";
+    const saved = upsertScanResult(current, result, responses, decisions, reviewStatus, auditReason, actorId);
+    // Advance the mutable latest-state reference immediately so rapid batch
+    // captures cannot race a React render or generate different audit ids.
+    const nextState = { ...current, results: saved.results };
+    stateRef.current = nextState;
+    setState(nextState);
     if (result.evidence) void saveEvidence(saved.id, result.evidence);
+    setLastSaved({
+      id: Date.now(),
+      learnerName: result.learner.fullName,
+      raw: saved.raw,
+      total: saved.total,
+      pct: saved.pct,
+      reviewStatus,
+      confidence: result.confidence,
+      quality: result.quality?.score ?? null,
+      qualityIssues: result.quality?.issues ?? [],
+      version: result.version,
+      source: "scanner",
+    });
     return { raw: saved.raw, total: saved.total, pct: saved.pct };
   }
 
-  // Route a completed scan: batch mode auto-saves clean scans and queues
-  // doubtful ones; otherwise (or on duplicates) open the review panel.
+  // Phase 1 safety policy: every production scan requires a teacher decision.
+  // Quality failures are rejected; readable scans open the review panel rather
+  // than being silently accepted in batch mode.
   function handleScanResult(r: ScanResult) {
-    const existing = findResult(state.results, r.assessment.id, r.learner.id, r.version);
-    if (!batch || existing) {
-      setScanResult(r);
+    if (calibrationMode || !certification || certification.verdict === "Failed") {
+      const report = evaluateCertification(r);
+      saveCertification(report);
+      setCalibrationMode(false);
+      setScanResult(null);
+      log(
+        "Scanner Certification",
+        `${report.verdict} · ${report.score}/100 · ${report.status}`,
+        report.verdict === "Passed" ? "ok" : report.verdict === "Conditional Pass" ? "warn" : "err",
+      );
       return;
     }
-    const responses = responsesFrom(r.summary);
-    if (r.summary.needsReview || r.confidence < AUTO_ACCEPT) {
-      const saved = persistScan(r, responses, "needs_review");
-      if (saved) {
-        log(
-          r.learner.fullName,
-          `→ Review queue (trust ${Math.round(r.confidence * 100)}%, ` +
-            `${r.summary.unclearCount + r.summary.multipleCount} doubtful item(s))`,
-          "warn",
-        );
-      }
-    } else {
-      const saved = persistScan(r, responses, "auto");
-      if (saved) {
-        log(r.learner.fullName, `${saved.raw}/${saved.total} (${saved.pct}%) · auto-accepted`, "ok");
-      }
+    if (r.quality.label === "Retake" || r.quality.score < MIN_PRODUCTION_QUALITY) {
+      setScanFeedback(
+        `Rescan required: capture quality ${r.quality.score}/100 (${r.quality.issues.join(", ") || "not reliable"}).`,
+      );
+      log(r.learner.fullName, `rescan required · quality ${r.quality.score}/100`, "err");
+      return;
     }
+    setScanResult(r);
   }
 
-  function saveReviewedScan(result: ScanResult, responses: Record<string, string>) {
-    const saved = persistScan(result, responses, "reviewed");
+  function saveReviewedScan(
+    result: ScanResult,
+    responses: Record<string, string>,
+    decisions: ReviewDecisions,
+  ) {
+    const saved = persistScan(result, responses, decisions, "reviewed");
     if (!saved) return;
     setScanResult(null);
     log(result.learner.fullName, `${saved.raw}/${saved.total} (${saved.pct}%) · reviewed & saved`, "ok");
@@ -198,6 +267,129 @@ function CheckEditor({
       );
     }
   }
+
+  // Merge checked-result rows synced from a paired phone into local state. The
+  // phone sends raw detected answers; we score them against THIS device's answer
+  // key so they flow into Results / Review / Analysis exactly like a PC scan.
+  const handleSyncedRows = useCallback(
+    (rows: CheckedResultRow[], persist = true): ScoredSummary[] => {
+      if (rows.length === 0) return [];
+      const current = stateRef.current;
+      const aItems = current.items
+        .filter((i) => i.assessmentId === active.id)
+        .sort((a, b) => a.itemNumber - b.itemNumber);
+      const knownLearnerIds = new Set(current.learners.map((learnerRow) => learnerRow.id));
+      const omrItemIds = new Set(omrItemsOf(aItems).map((item) => item.id));
+      // Score each row against the current answer key (pure) for the phone reply.
+      const scored: ScoredSummary[] = [];
+      const confirmations: SavedScanNotice[] = [];
+      const forceReview = true;
+      let working = current;
+      for (const row of rows) {
+        // Terminal ledger rows retain raw detector evidence by design. They
+        // are lifecycle notifications, not inputs to be rescored or reopened.
+        if (row.review_status !== "needs_review") continue;
+        const mapped = mapSyncedRow(row, {
+          assessment: active,
+          items: aItems,
+          knownLearnerIds,
+          forceReview,
+        });
+        if (!mapped.ok) {
+          log(row.learner_name || row.learner_id || "Unknown sheet", `rejected · ${mapped.message}`, "err");
+          continue;
+        }
+        const input = mapped.input;
+        const outcome = upsertSyncedResult(working, input);
+        if (outcome.disposition === "conflict") {
+          const message = outcome.reason === "scan_id_payload_mismatch"
+            ? "the submission id was reused with different answers"
+            : "a result already exists; choose how to handle the rescan before replacing it";
+          log(row.learner_name || row.learner_id, `rejected · ${message}`, "err");
+          continue;
+        }
+        working = { ...working, results: outcome.results };
+        const r = outcome.results.find(
+          (x) => input.scanId ? x.sourceScanId === input.scanId : x.id === outcome.id,
+        );
+        if (!r) continue;
+        const omrScores = r.itemScores.filter((score) => omrItemIds.has(score.itemId));
+        const resolvedOmrScores = omrScores.filter((score) => !score.unresolved);
+        const correct = resolvedOmrScores.filter((score) => score.correct).length;
+        const blank = resolvedOmrScores.filter((score) => score.blank).length;
+        const wrong = resolvedOmrScores.filter((score) => !score.correct && !score.blank).length;
+        scored.push({
+          scanId: input.scanId ?? row.scan_id ?? "",
+          learnerId: r.learnerId,
+          raw: outcome.raw,
+          total: outcome.total,
+          pct: outcome.pct,
+          correct,
+          wrong,
+          blank,
+          mastery: masteryBand(outcome.pct),
+        });
+        confirmations.push({
+          id: Date.now() + Math.random(),
+          learnerName:
+            row.learner_name ||
+            current.learners.find((learnerRow) => learnerRow.id === input.learnerId)?.fullName ||
+            input.learnerId,
+          raw: outcome.raw,
+          total: outcome.total,
+          pct: outcome.pct,
+          reviewStatus: "needs_review",
+          confidence: input.confidence,
+          quality: input.confidence == null ? null : Math.round(input.confidence * 100),
+          qualityIssues: ["Phase 1 safety policy: teacher review required"],
+          version: input.version,
+          source: "phone",
+        });
+      }
+      // Live phone broadcasts first call this bridge in preview mode. Scoring
+      // may be returned to the durable commit boundary, but no grade-visible
+      // state or success notice exists until the server receipt is confirmed.
+      if (!persist) return scored;
+
+      // Merge into live state (recompute against freshest state so batch scans
+      // never clobber each other).
+      setState((prev) => {
+        const pItems = prev.items
+          .filter((i) => i.assessmentId === active.id)
+          .sort((a, b) => a.itemNumber - b.itemNumber);
+        const knownPrevLearnerIds = new Set(prev.learners.map((learnerRow) => learnerRow.id));
+        let next = prev;
+        const mustReview = true;
+        for (const row of rows) {
+          if (row.review_status !== "needs_review") continue;
+          const mapped = mapSyncedRow(row, {
+            assessment: active,
+            items: pItems,
+            knownLearnerIds: knownPrevLearnerIds,
+            forceReview: mustReview,
+          });
+          if (mapped.ok) {
+            const outcome = upsertSyncedResult(next, mapped.input);
+            if (outcome.disposition !== "conflict") {
+              next = { ...next, results: outcome.results };
+            }
+          }
+        }
+        return next;
+      });
+      const latest = confirmations[confirmations.length - 1];
+      if (latest) {
+        setLastSaved(latest);
+        log(
+          latest.learnerName,
+          `${latest.raw}/${latest.total} (${latest.pct}%) · submitted from phone`,
+          latest.reviewStatus === "needs_review" ? "warn" : "ok",
+        );
+      }
+      return scored;
+    },
+    [active, setState],
+  );
 
   const activeVersion = active.versions.includes(version)
     ? version
@@ -263,9 +455,8 @@ function CheckEditor({
 
   const existing = findResult(state.results, active.id, learnerId, activeVersion);
   const initialInput = inputFromResult(existing);
-  const pendingCount = state.results.filter(
-    (r) => r.assessmentId === active.id && r.reviewStatus === "needs_review",
-  ).length;
+  const pendingCount = pendingReviewResults(state.results)
+    .filter((result) => result.assessmentId === active.id).length;
 
   return (
     <section>
@@ -308,7 +499,7 @@ function CheckEditor({
         {mode === "scan" ? (
           <label className="ml-auto flex items-center gap-2 text-xs font-bold text-slate-600">
             <input type="checkbox" checked={batch} onChange={(e) => setBatch(e.target.checked)} />
-            Batch mode: auto-save clean scans
+            Batch workflow: review every scan
           </label>
         ) : null}
       </div>
@@ -316,7 +507,7 @@ function CheckEditor({
       <p className="mt-2 text-xs text-slate-500">
         {mode === "scan"
           ? batch
-            ? "Batch: scan sheet after sheet. High-confidence scans save automatically; doubtful ones go to the Review tab. Duplicates always open for confirmation."
+            ? "Batch safety mode: each sheet opens for teacher verification before saving; doubtful items remain highlighted."
             : "Single: each scan opens for review before saving."
           : mode === "manual"
             ? "Manual (fallback): choose the learner and version below, then mark answers by hand."
@@ -332,6 +523,11 @@ function CheckEditor({
                 ? "Needs review — confirm the flagged items below"
                 : "High confidence — verify and save"}
             </div>
+            <ScanQualityCard
+              score={scanResult.quality.score}
+              label={scanResult.quality.label}
+              issues={scanResult.quality.issues}
+            />
             <ScanReviewPanel
               learner={scanResult.learner}
               version={scanResult.version}
@@ -351,12 +547,45 @@ function CheckEditor({
                   scanResult.version,
                 ),
               )}
-              onSave={(_learner, _version, responses) => saveReviewedScan(scanResult, responses)}
+              onSave={(_learner, _version, responses, decisions) =>
+                saveReviewedScan(scanResult, responses, decisions)}
               onRescan={() => setScanResult(null)}
             />
           </>
         ) : (
           <>
+            <CalibrationPanel
+              report={certification}
+              activeTitle={active.title}
+              calibrationMode={calibrationMode || !certification || certification.verdict === "Failed"}
+              onStart={() => {
+                setCalibrationMode(true);
+                setScanFeedback("Calibration mode active. Scan the calibration sheet with the known pattern shown below.");
+              }}
+              onReset={() => {
+                setCertification(null);
+                setCalibrationMode(true);
+                try {
+                  localStorage.removeItem(calibrationKey(active.id));
+                } catch {
+                  /* ignore */
+                }
+              }}
+            />
+            {scanFeedback ? (
+              <div
+                className={
+                  "mt-3 rounded-lg border p-2 text-sm font-semibold " +
+                  (scanFeedback.startsWith("Rescan")
+                    ? "border-red-300 bg-red-50 text-red-700"
+                    : "border-indigo-200 bg-indigo-50 text-indigo-800")
+                }
+              >
+                {scanFeedback}
+              </div>
+            ) : null}
+            <UsePhoneScannerPanel assessmentId={active.id} onSyncedRows={handleSyncedRows} />
+            {lastSaved ? <SubmittedToSystemCard saved={lastSaved} navigate={navigate} /> : null}
             <AnswerSheetScanner
               state={state}
               activeId={active.id}
@@ -498,6 +727,7 @@ function CheckEditor({
               learner={learner}
               version={activeVersion}
               initialInput={initialInput}
+              existingResult={existing}
               alreadySaved={Boolean(existing)}
               dirty={dirty}
               onDirty={setDirty}
@@ -509,6 +739,191 @@ function CheckEditor({
         </>
       ) : null}
     </section>
+  );
+}
+
+function SubmittedToSystemCard({
+  saved,
+  navigate,
+}: {
+  saved: SavedScanNotice;
+  navigate?: PanelProps["navigate"];
+}) {
+  const needsReview = saved.reviewStatus === "needs_review";
+  const tone = needsReview
+    ? "border-amber-300 bg-amber-50 text-amber-900"
+    : "border-emerald-300 bg-emerald-50 text-emerald-900";
+  const source = saved.source === "phone" ? "phone scanner" : "SmartScan camera";
+  return (
+    <div className={"mt-4 rounded-xl border p-4 " + tone}>
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <div className="text-sm font-extrabold">
+            {needsReview ? "Submitted to Review Queue" : "Submitted to System"}
+          </div>
+          <div className="mt-1 text-lg font-black text-slate-950">{saved.learnerName}</div>
+          <div className="text-xs font-semibold">
+            Version {saved.version} · {source}
+            {saved.confidence === null ? "" : ` · ${Math.round(saved.confidence * 100)}% scan confidence`}
+            {saved.quality == null ? "" : ` · quality ${saved.quality}/100`}
+          </div>
+          {saved.qualityIssues && saved.qualityIssues.length > 0 ? (
+            <div className="mt-1 text-xs font-bold">
+              Check: {saved.qualityIssues.join(", ")}
+            </div>
+          ) : null}
+          <div className="mt-2 text-xs font-bold">
+            {needsReview
+              ? "Saved safely, but excluded from scoring reports until every flagged item is explicitly resolved."
+              : "Reports, Results, Item Analysis, and Remediation now use this reviewed result."}
+          </div>
+        </div>
+        <div className="text-right">
+          <div className="text-3xl font-black text-indigo-700">
+            {saved.raw}/{saved.total}
+          </div>
+          <div className="text-sm font-extrabold text-slate-700">{saved.pct}%</div>
+        </div>
+      </div>
+      <div className="mt-3 flex flex-wrap gap-2">
+        <Button variant="small" onClick={() => navigate?.("results")}>View Results</Button>
+        <Button variant="small" onClick={() => navigate?.("reports")}>View Reports</Button>
+        <Button variant="small" onClick={() => navigate?.("item-analysis")}>View Analysis</Button>
+        {needsReview ? <Button variant="small" onClick={() => navigate?.("review")}>Open Review Queue</Button> : null}
+      </div>
+    </div>
+  );
+}
+
+function CalibrationPanel({
+  report,
+  activeTitle,
+  calibrationMode,
+  onStart,
+  onReset,
+}: {
+  report: CertificationReport | null;
+  activeTitle: string;
+  calibrationMode: boolean;
+  onStart: () => void;
+  onReset: () => void;
+}) {
+  const verdict = report?.verdict ?? "Failed";
+  const tone =
+    report?.verdict === "Passed"
+      ? "border-emerald-300 bg-emerald-50 text-emerald-900"
+      : report?.verdict === "Conditional Pass"
+        ? "border-amber-300 bg-amber-50 text-amber-900"
+        : "border-red-300 bg-red-50 text-red-800";
+  return (
+    <div className={"mt-4 rounded-xl border p-4 " + tone}>
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <div className="text-xs font-black uppercase tracking-wide opacity-75">Scanner Calibration and Certification</div>
+          <div className="mt-1 text-xl font-black">
+            {report ? `${report.verdict} · ${report.score}/100` : "Certification Required"}
+          </div>
+          <div className="mt-1 text-sm font-bold">{certificationGuidance(report)}</div>
+          <div className="mt-1 text-xs font-semibold">
+            {activeTitle} · production auto-scoring is {report && report.verdict !== "Failed" ? "available for trusted scans" : "locked until calibration passes"}.
+          </div>
+        </div>
+        <div className="flex flex-wrap gap-2">
+          <Button variant="small" onClick={onStart}>
+            {calibrationMode ? "Calibration Active" : "Scan Calibration"}
+          </Button>
+          <Button variant="small" onClick={onReset}>Reset Certification</Button>
+        </div>
+      </div>
+
+      <div className="mt-3 rounded-lg border border-white/60 bg-white/70 p-3 text-slate-800">
+        <div className="text-xs font-black uppercase tracking-wide text-slate-500">Calibration sheet pattern</div>
+        <p className="mt-1 text-xs font-semibold text-slate-600">
+          Print or use one normal answer sheet for this assessment. Shade the first {CALIBRATION_EXPECTED.length} items exactly as shown; leave remaining items blank.
+        </p>
+        <div className="mt-2 flex flex-wrap gap-1">
+          {CALIBRATION_EXPECTED.map((answer, index) => (
+            <span key={index} className="rounded-lg border border-slate-200 bg-white px-2 py-1 text-xs font-black text-slate-700">
+              {index + 1}: {answer}
+            </span>
+          ))}
+        </div>
+      </div>
+
+      {report ? (
+        <div className="mt-3 grid gap-3 lg:grid-cols-[1fr_1fr]">
+          <div className="rounded-lg border border-white/60 bg-white/70 p-3">
+            <div className="text-xs font-black uppercase tracking-wide text-slate-500">Certification status</div>
+            <div className="mt-1 text-lg font-black text-slate-900">{report.status}</div>
+            <div className="mt-2 grid gap-1 text-xs font-semibold text-slate-700">
+              {report.blockers.length > 0 ? report.blockers.map((b) => <div key={b}>Rescan: {b}</div>) : null}
+              {report.warnings.length > 0 ? report.warnings.map((w) => <div key={w}>Check: {w}</div>) : null}
+              {report.blockers.length === 0 && report.warnings.length === 0 ? <div>All certification checks passed.</div> : null}
+            </div>
+          </div>
+          <div className="rounded-lg border border-white/60 bg-white/70 p-3">
+            <div className="text-xs font-black uppercase tracking-wide text-slate-500">Known answer readback</div>
+            <div className="mt-2 grid grid-cols-2 gap-1 text-xs">
+              {report.read.map((row) => (
+                <div key={row.item} className={row.passed ? "font-bold text-emerald-700" : "font-bold text-red-700"}>
+                  {row.item}: expected {row.expected}, read {row.detected ?? "blank"} ({Math.round(row.confidence * 100)}%)
+                </div>
+              ))}
+            </div>
+          </div>
+          <div className="rounded-lg border border-white/60 bg-white/70 p-3 lg:col-span-2">
+            <div className="grid gap-2 md:grid-cols-3">
+              {report.metrics.map((metric) => (
+                <div key={metric.label} className="rounded-lg border border-slate-200 bg-white p-2">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-xs font-black text-slate-600">{metric.label}</span>
+                    <span className={metric.ok ? "text-xs font-black text-emerald-700" : "text-xs font-black text-red-700"}>
+                      {metric.score}
+                    </span>
+                  </div>
+                  <div className="mt-1 text-[11px] font-semibold text-slate-500">{metric.detail}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      ) : null}
+      {!report || verdict === "Failed" || calibrationMode ? (
+        <div className="mt-3 rounded-lg border border-white/70 bg-white/70 p-2 text-xs font-bold text-slate-700">
+          Real class scanning is locked for trusted auto-scoring until this certification is Passed or Conditional Pass.
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function ScanQualityCard({
+  score,
+  label,
+  issues,
+}: {
+  score: number;
+  label: string;
+  issues: string[];
+}) {
+  const cls =
+    score >= 88
+      ? "border-emerald-300 bg-emerald-50 text-emerald-800"
+      : score >= 74
+        ? "border-indigo-300 bg-indigo-50 text-indigo-800"
+        : score >= 55
+          ? "border-amber-300 bg-amber-50 text-amber-900"
+          : "border-red-300 bg-red-50 text-red-700";
+  return (
+    <div className={"mt-2 rounded-lg border p-3 text-sm " + cls}>
+      <div className="flex items-center justify-between gap-3">
+        <div className="font-extrabold">Capture Quality: {label}</div>
+        <div className="text-lg font-black">{score}/100</div>
+      </div>
+      <div className="mt-1 text-xs font-semibold">
+        {issues.length > 0 ? issues.join(" · ") : "QR, corner targets, focus, and marks are clean."}
+      </div>
+    </div>
   );
 }
 

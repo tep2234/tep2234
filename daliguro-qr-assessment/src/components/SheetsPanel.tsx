@@ -17,7 +17,7 @@ import { AnswerSheet } from "./AnswerSheet";
 import { Button, Empty } from "./ui";
 
 export default function SheetsPanel(props: PanelProps) {
-  const { state, setState, activeId, setActiveId } = props;
+  const { state, setState, activeId, setActiveId, navigate } = props;
 
   return (
     <ActiveGate
@@ -26,7 +26,14 @@ export default function SheetsPanel(props: PanelProps) {
       setActiveId={setActiveId}
       title="QR Answer Sheets"
     >
-      {(active) => <SheetGenerator active={active} state={state} setState={setState} />}
+      {(active) => (
+        <SheetGenerator
+          active={active}
+          state={state}
+          setState={setState}
+          navigate={navigate}
+        />
+      )}
     </ActiveGate>
   );
 }
@@ -42,12 +49,16 @@ function distinctSections(learners: Learner[]): string[] {
 function SheetGenerator({
   active,
   state,
+  setState,
+  navigate,
 }: {
   active: Assessment;
   state: QrAssessmentState;
   setState: PanelProps["setState"];
+  navigate: PanelProps["navigate"];
 }) {
   const items: Item[] = state.items.filter((i) => i.assessmentId === active.id);
+  const unmappedItems = state.items.filter((i) => i.assessmentId !== active.id);
   const sections = distinctSections(state.learners);
 
   const [version, setVersion] = useState<TestVersion>(active.versions[0] ?? "A");
@@ -60,18 +71,72 @@ function SheetGenerator({
     ? version
     : active.versions[0] ?? "A";
 
+  function attachUnmappedItems() {
+    if (unmappedItems.length === 0) return;
+    const ok = window.confirm(
+      "Attach " +
+        unmappedItems.length +
+        " item(s) to " +
+        active.title +
+        "? Use this only when the questions were imported but mapped to the wrong assessment.",
+    );
+    if (!ok) return;
+    setState((prev) => ({
+      ...prev,
+      items: prev.items.map((item) =>
+        item.assessmentId === active.id ? item : { ...item, assessmentId: active.id },
+      ),
+      answerKeys: mergeAnswerKeysForRemappedItems(prev, active.id),
+    }));
+  }
+
+  function mergeAnswerKeysForRemappedItems(prev: QrAssessmentState, targetAssessmentId: string) {
+    const next = { ...prev.answerKeys };
+    const targetKeys = { ...(next[targetAssessmentId] ?? {}) };
+    const sourceIds = Array.from(
+      new Set(prev.items.filter((item) => item.assessmentId !== targetAssessmentId).map((item) => item.assessmentId)),
+    );
+
+    sourceIds.forEach((sourceId) => {
+      const sourceKeys = next[sourceId] ?? {};
+      active.versions.forEach((versionKey) => {
+        targetKeys[versionKey] = {
+          ...(sourceKeys[versionKey] ?? {}),
+          ...(targetKeys[versionKey] ?? {}),
+        };
+      });
+    });
+    next[targetAssessmentId] = targetKeys;
+    return next;
+  }
+
   // Guard: this phase needs items and learners.
   if (items.length === 0) {
     return (
       <PanelHeader title="QR Answer Sheets" subtitle={active.title}>
-        <Empty text="This assessment has no items. Add items in the Items tab first." />
+        <PipelineGate
+          active={active}
+          itemCount={items.length}
+          learnerCount={state.learners.length}
+          globalItemCount={state.items.length}
+          onOpenItems={() => navigate?.("items")}
+          onOpenLearners={() => navigate?.("learners")}
+          onFixMapping={unmappedItems.length > 0 ? attachUnmappedItems : undefined}
+        />
       </PanelHeader>
     );
   }
   if (state.learners.length === 0) {
     return (
       <PanelHeader title="QR Answer Sheets" subtitle={active.title}>
-        <Empty text="No learners yet. Add learners in the Learners tab first." />
+        <PipelineGate
+          active={active}
+          itemCount={items.length}
+          learnerCount={state.learners.length}
+          globalItemCount={state.items.length}
+          onOpenItems={() => navigate?.("items")}
+          onOpenLearners={() => navigate?.("learners")}
+        />
       </PanelHeader>
     );
   }
@@ -278,5 +343,77 @@ function PanelHeader({
       <p className="mt-1 text-slate-500">{subtitle}</p>
       {children}
     </section>
+  );
+}
+
+function PipelineGate({
+  active,
+  itemCount,
+  learnerCount,
+  globalItemCount,
+  onOpenItems,
+  onOpenLearners,
+  onFixMapping,
+}: {
+  active: Assessment;
+  itemCount: number;
+  learnerCount: number;
+  globalItemCount: number;
+  onOpenItems: () => void;
+  onOpenLearners: () => void;
+  onFixMapping?: () => void;
+}) {
+  const itemReady = itemCount > 0;
+  const learnerReady = learnerCount > 0;
+  return (
+    <div className="mt-4 rounded-xl border border-amber-200 bg-amber-50 p-4 text-slate-800">
+      <div className="text-lg font-extrabold text-amber-900">QR sheets are not ready yet</div>
+      <p className="mt-1 text-sm text-amber-900/80">
+        Active assessment: <b>{active.title}</b>. QR sheets need both imported questions and learners.
+      </p>
+
+      <div className="mt-3 grid gap-2 md:grid-cols-2">
+        <PipelineStep
+          label="Questions / items"
+          value={itemReady ? itemCount + " item(s) mapped" : "Missing for this assessment"}
+          ready={itemReady}
+        />
+        <PipelineStep
+          label="Learners"
+          value={learnerReady ? learnerCount + " learner(s) loaded" : "Missing"}
+          ready={learnerReady}
+        />
+      </div>
+
+      <div className="mt-3 flex flex-wrap gap-2">
+        {!itemReady ? <Button onClick={onOpenItems}>Open Items / Import Questions</Button> : null}
+        {!learnerReady ? <Button variant="ghost" onClick={onOpenLearners}>Open Learners</Button> : null}
+        {!itemReady && onFixMapping ? (
+          <Button variant="small" onClick={onFixMapping}>
+            Fix item mapping ({globalItemCount} found)
+          </Button>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+function PipelineStep({
+  label,
+  value,
+  ready,
+}: {
+  label: string;
+  value: string;
+  ready: boolean;
+}) {
+  return (
+    <div className={"rounded-lg border bg-white p-3 " + (ready ? "border-emerald-200" : "border-amber-200")}>
+      <div className="text-xs font-black uppercase tracking-wide text-slate-500">{label}</div>
+      <div className={"mt-1 font-extrabold " + (ready ? "text-emerald-700" : "text-amber-800")}>
+        {ready ? "Ready: " : "Action needed: "}
+        {value}
+      </div>
+    </div>
   );
 }

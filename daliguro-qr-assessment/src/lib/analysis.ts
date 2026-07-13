@@ -22,6 +22,7 @@ function competencyOf(item: Item): string {
 
 // Was a single item score a "correct" outcome?
 function isScoreCorrect(score: ItemScore): boolean {
+  if (score.unresolved) return false;
   if (score.blank) return false;
   if (score.manual) return score.awarded >= score.points && score.points > 0;
   return score.correct;
@@ -55,6 +56,7 @@ export function analyzeItems(items: Item[], results: Result[]): ItemAnalysisRow[
   const scoresByItem = new Map<string, ItemScore[]>();
   results.forEach((r) => {
     r.itemScores.forEach((s) => {
+      if (s.unresolved) return;
       const list = scoresByItem.get(s.itemId) ?? [];
       list.push(s);
       scoresByItem.set(s.itemId, list);
@@ -128,7 +130,7 @@ export function commonWrongAnswers(
     const tally = new Map<string, number>();
     results.forEach((r) => {
       const score = r.itemScores.find((s) => s.itemId === item.id);
-      if (!score || score.manual || score.blank || isScoreCorrect(score)) return;
+      if (!score || score.unresolved || score.manual || score.blank || isScoreCorrect(score)) return;
       const answer = r.answers.find((a) => a.itemId === item.id);
       const text = answer ? answer.response.trim() : "";
       if (text === "") return;
@@ -165,6 +167,7 @@ export function competencyMastery(
 
   results.forEach((r) => {
     r.itemScores.forEach((s) => {
+      if (s.unresolved) return;
       const item = itemsById.get(s.itemId);
       if (!item) return;
       const comp = competencyOf(item);
@@ -217,6 +220,7 @@ export interface RemediationGroup {
 function weakCompetenciesFor(result: Result, itemsById: Map<string, Item>): string[] {
   const groups = new Map<string, { possible: number; earned: number }>();
   result.itemScores.forEach((s) => {
+    if (s.unresolved) return;
     const item = itemsById.get(s.itemId);
     if (!item) return;
     const comp = competencyOf(item);

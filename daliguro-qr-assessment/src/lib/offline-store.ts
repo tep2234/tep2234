@@ -5,8 +5,8 @@
 // later be replaced by Supabase without touching the UI.
 // ============================================================
 
-import type { Item, QrAssessmentState, Result } from "./types";
-import { emptyState, REVIEW_STATUSES } from "./types";
+import type { Item, QrAssessmentState, Result, ScanItemMeta } from "./types";
+import { emptyState, REVIEW_STATUSES, SCAN_ITEM_STATUSES } from "./types";
 import { masteryBand } from "./scoring";
 
 const DB_NAME = "daliguro_qr_db";
@@ -106,7 +106,6 @@ function lsSave(state: QrAssessmentState): void {
 function normalizeItem(item: Item): Item {
   return {
     ...item,
-    topic: typeof item.topic === "string" ? item.topic : "",
     cognitiveLevel: item.cognitiveLevel ?? "",
   };
 }
@@ -115,17 +114,79 @@ function isReviewStatus(v: unknown): v is Result["reviewStatus"] {
   return typeof v === "string" && (REVIEW_STATUSES as readonly string[]).includes(v);
 }
 
+function normalizeScanItems(value: unknown): ScanItemMeta[] | null {
+  if (!Array.isArray(value)) return null;
+  const letters = new Set(["A", "B", "C", "D", "E"]);
+  return value.map((candidate, index) => {
+    const fallback: ScanItemMeta = {
+      itemNumber: index + 1,
+      detected: null,
+      status: "unclear",
+      confidence: 0,
+      fill: [],
+    };
+    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return fallback;
+    const row = candidate as Partial<ScanItemMeta>;
+    if (row.itemNumber !== index + 1) return fallback;
+    if (typeof row.status !== "string" || !SCAN_ITEM_STATUSES.includes(row.status as ScanItemMeta["status"])) {
+      return fallback;
+    }
+    if (typeof row.confidence !== "number" || !Number.isFinite(row.confidence) || row.confidence < 0 || row.confidence > 1) {
+      return fallback;
+    }
+    if (row.detected !== null && row.detected !== undefined && (typeof row.detected !== "string" || !letters.has(row.detected))) {
+      return fallback;
+    }
+    if (row.fill !== undefined && (!Array.isArray(row.fill) || row.fill.length > 5 || row.fill.some((amount) => !Number.isFinite(amount) || amount < 0 || amount > 1))) {
+      return fallback;
+    }
+    const choices = row.unreadableChoices;
+    if (
+      choices !== undefined &&
+      (!Array.isArray(choices) ||
+        choices.length > 5 ||
+        choices.some((choice) => !Number.isInteger(choice) || choice < 0 || choice > 4) ||
+        new Set(choices).size !== choices.length)
+    ) return fallback;
+    if (row.status === "unreadable" && (!Array.isArray(choices) || choices.length === 0)) return fallback;
+    return {
+      itemNumber: row.itemNumber,
+      detected: row.detected ?? null,
+      status: row.status as ScanItemMeta["status"],
+      confidence: row.confidence,
+      ...(row.fill !== undefined ? { fill: row.fill } : {}),
+      ...(choices !== undefined ? { unreadableChoices: choices } : {}),
+    };
+  });
+}
+
 function normalizeResult(result: Result): Result {
+  const scanItems = normalizeScanItems(result.scanItems);
   return {
     ...result,
     masteryStatus: masteryBand(result.percentage),
     source: result.source === "scan" ? "scan" : "manual",
     scanConfidence:
       typeof result.scanConfidence === "number" ? result.scanConfidence : null,
-    // Pre-SmartScan results were checked by the teacher → "reviewed".
-    reviewStatus: isReviewStatus(result.reviewStatus) ? result.reviewStatus : "reviewed",
+    scanQuality:
+      typeof result.scanQuality === "number"
+        ? result.scanQuality
+        : typeof result.scanConfidence === "number"
+          ? Math.round(result.scanConfidence * 100)
+          : null,
+    // Pre-SmartScan records omitted this field and were teacher-checked. A
+    // present-but-invalid value is corruption and must fail closed into review.
+    reviewStatus: isReviewStatus(result.reviewStatus)
+      ? result.reviewStatus
+      : result.reviewStatus === undefined
+        ? "reviewed"
+        : "needs_review",
     finalizedAt: typeof result.finalizedAt === "number" ? result.finalizedAt : null,
-    scanItems: Array.isArray(result.scanItems) ? result.scanItems : null,
+    scanItems,
+    ...(typeof result.sourceScanId === "string" ? { sourceScanId: result.sourceScanId } : {}),
+    ...(typeof result.sourceScanFingerprint === "string"
+      ? { sourceScanFingerprint: result.sourceScanFingerprint }
+      : {}),
     auditLog: Array.isArray(result.auditLog) ? result.auditLog : [],
   };
 }
@@ -162,6 +223,9 @@ export async function loadState(): Promise<QrAssessmentState> {
 }
 
 export async function saveState(state: QrAssessmentState): Promise<void> {
+  // Keep a synchronous mirror so a fast refresh immediately after encoding or
+  // importing data still has a recoverable copy even before IndexedDB finishes.
+  lsSave(state);
   if (hasIndexedDB()) {
     try {
       await idbSet(STATE_KEY, state);

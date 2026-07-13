@@ -47,6 +47,19 @@ describe("parseItemsCsv", () => {
     expect(res.items[0].answers.A).toBe("B");
   });
 
+  it("accepts Excel-friendly template headers", () => {
+    const csv = [
+      "Item No.,Type,Question,Choice A,Choice B,Choice C,Choice D,Correct Answer,Learning Target,Explanation",
+      "1,Multiple Choice,Best answer?,Alpha,Beta,Gamma,Delta,C,Functions,Choice C is the intended key.",
+    ].join("\n");
+    const res = parseItemsCsv(csv);
+    expect(res.errors).toEqual([]);
+    expect(res.items[0].choices).toBe(4);
+    expect(res.items[0].answers.A).toBeUndefined();
+    expect(res.items[0].correctAnswer).toBe("C");
+    expect(res.items[0].explanation).toBe("Choice C is the intended key.");
+  });
+
   it("supports identification items with accepted answers", () => {
     const csv = [
       "itemNo,type,question,correctAnswer,acceptedAnswers,points",

@@ -5,6 +5,7 @@
 import { useState } from "react";
 import type { PanelProps } from "./panel-types";
 import type {
+  AuditEntry,
   Assessment,
   Item,
   Learner,
@@ -20,7 +21,14 @@ import {
   type CheckingInput,
   type ScoreSummary,
 } from "../lib/scoring";
-import { uid } from "../lib/ids";
+import { uid, uuidV4 } from "../lib/ids";
+import { manualFallbackBlocked } from "../lib/result-trust";
+import { omrItemsOf } from "../lib/scanner/omr-template";
+import {
+  enqueueCompletedReview,
+  flushReviewAuditOutbox,
+} from "../lib/sync/review-audit-outbox";
+import type { RemoteReviewDecision } from "../lib/sync/smartscanSync";
 import { Button } from "./ui";
 
 function findResult(
@@ -44,6 +52,7 @@ export function CheckForm({
   learner,
   version,
   initialInput,
+  existingResult,
   alreadySaved,
   dirty,
   onDirty,
@@ -55,6 +64,7 @@ export function CheckForm({
   learner: Learner;
   version: TestVersion;
   initialInput: CheckingInput;
+  existingResult?: Result;
   alreadySaved: boolean;
   dirty: boolean;
   onDirty: (value: boolean) => void;
@@ -62,6 +72,7 @@ export function CheckForm({
 }) {
   const [input, setInput] = useState<CheckingInput>(() => initialInput);
   const summary = computeScores(items, versionKey, input);
+  const blockedByScanReview = manualFallbackBlocked(existingResult);
 
   function mutate(next: CheckingInput) {
     setInput(next);
@@ -93,18 +104,118 @@ export function CheckForm({
   }
 
   function save() {
+    if (blockedByScanReview) {
+      window.alert(
+        "This scan contains unreadable or uncertain camera evidence. Resolve every highlighted item in the Review Queue before using manual fallback.",
+      );
+      return;
+    }
+    const changedItems = existingResult
+      ? items.filter((item) => {
+          const original = existingResult.answers.find((answer) => answer.itemId === item.id)?.response ?? "";
+          const originalScore = existingResult.itemScores.find((score) => score.itemId === item.id)?.awarded ?? 0;
+          const nextScore = summary.itemScores.find((score) => score.itemId === item.id)?.awarded ?? 0;
+          return original !== (input.responses[item.id] ?? "") || originalScore !== nextScore;
+        })
+      : [];
+    let editReason: string | undefined;
+    if (existingResult && (existingResult.finalizedAt || changedItems.length > 0)) {
+      const prompt = existingResult.finalizedAt
+        ? "This result is FINALIZED (locked). Enter a reason to change it, or Cancel:"
+        : "Enter a reason for changing this saved answer, or Cancel:";
+      const reason = window.prompt(prompt);
+      if (!reason || !reason.trim()) return;
+      editReason = reason.trim();
+    }
     const answers = items.map((i) => ({
       itemId: i.id,
       response: input.responses[i.id] ?? "",
     }));
     const now = Date.now();
+    const omrItems = omrItemsOf(items);
+    const omrRowByItemId = new Map(omrItems.map((item, index) => [item.id, index + 1]));
+    const correctionEventIds = new Map(changedItems.map((item) => [item.id, uuidV4()]));
+    const remoteDecisions: RemoteReviewDecision[] = existingResult?.sourceScanId
+      ? changedItems.flatMap((item) => {
+          const rowNumber = omrRowByItemId.get(item.id);
+          if (rowNumber == null) return [];
+          const originalAudit = existingResult.auditLog.find(
+            (entry) => entry.itemId === item.id && entry.originalStatus !== undefined,
+          );
+          const scanItem = (existingResult.scanItems ?? []).find(
+            (candidate) => candidate.itemNumber === rowNumber,
+          );
+          const originalStatus = originalAudit?.originalStatus ?? scanItem?.status;
+          if (!originalStatus) return [];
+          return [{
+            eventId: correctionEventIds.get(item.id) ?? uuidV4(),
+            omrRowNumber: rowNumber,
+            itemId: item.id,
+            itemNumber: item.itemNumber,
+            originalStatus,
+            originalValue:
+              originalAudit?.originalValue ??
+              scanItem?.detected ??
+              existingResult.answers.find((answer) => answer.itemId === item.id)?.response ??
+              "",
+            correctedValue: input.responses[item.id] ?? "",
+            source: "manual_check" as const,
+            reason: editReason ?? "Teacher corrected an OMR answer during manual completion.",
+          }];
+        })
+      : [];
     setState((prev) => {
       const existing = findResult(prev.results, active.id, learner.id, version);
+      if (manualFallbackBlocked(existing)) return prev;
+      const actorId = active.teacherName || "local-teacher";
+      const scanId = existing ? existing.sourceScanId ?? existing.id : null;
+      const answerAudits: AuditEntry[] = existing
+        ? changedItems.map((item) => {
+            const rowNumber = omrRowByItemId.get(item.id);
+            const scanItem = rowNumber == null
+              ? undefined
+              : (existing.scanItems ?? []).find((candidate) => candidate.itemNumber === rowNumber);
+            return {
+              eventId: correctionEventIds.get(item.id) ?? uuidV4(),
+              at: now,
+              action: "Answer manually corrected",
+              reason: editReason ?? "Teacher corrected a saved answer through manual fallback.",
+              itemId: item.id,
+              itemNumber: item.itemNumber,
+              originalStatus: scanItem?.status,
+              originalValue:
+                isManual(item.type)
+                  ? String(existing.itemScores.find((score) => score.itemId === item.id)?.awarded ?? 0)
+                  : scanItem?.detected ??
+                    existing.answers.find((answer) => answer.itemId === item.id)?.response ??
+                    "",
+              correctedValue: isManual(item.type)
+                ? String(summary.itemScores.find((score) => score.itemId === item.id)?.awarded ?? 0)
+                : input.responses[item.id] ?? "",
+              actorId,
+              source: "manual_check" as const,
+              scanId,
+            };
+          })
+        : [];
+      const changedByRow = new Map(
+        changedItems.flatMap((item) => {
+          const rowNumber = omrRowByItemId.get(item.id);
+          return rowNumber == null ? [] : [[rowNumber, input.responses[item.id] ?? ""] as const];
+        }),
+      );
+      const updatedScanItems = existing?.scanItems?.map((scanItem) => {
+        if (!changedByRow.has(scanItem.itemNumber)) return scanItem;
+        const correctedValue = changedByRow.get(scanItem.itemNumber) ?? "";
+        return {
+          ...scanItem,
+          detected: correctedValue || null,
+          status: correctedValue ? "selected" as const : "blank" as const,
+          confidence: 1,
+          unreadableChoices: [],
+        };
+      }) ?? null;
       if (existing?.finalizedAt) {
-        const reason = window.prompt(
-          "This result is FINALIZED (locked). Enter a reason to change it, or Cancel:",
-        );
-        if (!reason || !reason.trim()) return prev;
         const result: Result = {
           ...existing,
           answers,
@@ -113,12 +224,16 @@ export function CheckForm({
           totalScore: summary.totalScore,
           percentage: summary.percentage,
           masteryStatus: summary.masteryStatus,
-          source: "manual",
+          source: existing.source,
           reviewStatus: "finalized",
-          auditLog: existing.auditLog.concat({
+          scanItems: updatedScanItems,
+          auditLog: existing.auditLog.concat(answerAudits, {
             at: now,
             action: "Edited after finalization",
-            reason: reason.trim(),
+            reason: editReason,
+            actorId,
+            source: "manual_check" as const,
+            scanId,
           }),
           updatedAt: now,
         };
@@ -136,14 +251,21 @@ export function CheckForm({
         percentage: summary.percentage,
         masteryStatus: summary.masteryStatus,
         reviewed: true,
-        source: "manual",
-        scanConfidence: null,
+        source: existing?.source ?? "manual",
+        scanConfidence: existing?.scanConfidence ?? null,
+        scanQuality: existing?.scanQuality ?? null,
         reviewStatus: "reviewed",
         finalizedAt: null,
-        scanItems: null,
-        auditLog: (existing ? existing.auditLog : []).concat({
+        scanItems: updatedScanItems,
+        sourceScanId: existing?.sourceScanId,
+        sourceScanFingerprint: existing?.sourceScanFingerprint,
+        auditLog: (existing ? existing.auditLog : []).concat(answerAudits, {
           at: now,
           action: existing ? "Manually re-checked" : "Manually checked",
+          ...(editReason ? { reason: editReason } : {}),
+          actorId,
+          source: "manual_check" as const,
+          scanId,
         }),
         createdAt: existing ? existing.createdAt : now,
         updatedAt: now,
@@ -153,6 +275,18 @@ export function CheckForm({
         : prev.results.concat(result);
       return { ...prev, results };
     });
+    if (
+      existingResult?.sourceScanId &&
+      existingResult.sourceScanFingerprint &&
+      existingResult.reviewStatus === "needs_review"
+    ) {
+      enqueueCompletedReview(existingResult.sourceScanId, remoteDecisions, {
+        eventId: uuidV4(),
+        decision: "reviewed",
+        reason: "Teacher completed the remaining manual-scoring items after camera review.",
+      });
+      void flushReviewAuditOutbox();
+    }
     onDirty(false);
     window.alert(
       "Saved: " +
@@ -171,8 +305,16 @@ export function CheckForm({
         <Button variant="smallDanger" onClick={resetAll}>
           Reset all answers
         </Button>
-        <Button onClick={save}>💾 Save Score</Button>
+        <Button onClick={save} disabled={blockedByScanReview} aria-disabled={blockedByScanReview}>
+          {blockedByScanReview ? "Resolve scan in Review Queue" : "💾 Save Score"}
+        </Button>
       </div>
+
+      {blockedByScanReview ? (
+        <div className="mt-3 rounded-lg border border-red-300 bg-red-50 p-3 text-sm font-bold text-red-800" role="alert">
+          Manual fallback cannot replace unreadable scan evidence. Open the Review Queue and explicitly resolve each affected item first.
+        </div>
+      ) : null}
 
       <SummaryCard summary={summary} dirty={dirty} saved={alreadySaved} />
 

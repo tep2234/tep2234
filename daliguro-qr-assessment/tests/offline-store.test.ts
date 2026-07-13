@@ -83,6 +83,7 @@ describe("exportBackup / importBackup", () => {
       reviewed: false,
       source: "manual",
       scanConfidence: null,
+      scanQuality: null,
       reviewStatus: "reviewed",
       finalizedAt: null,
       scanItems: null,
@@ -121,6 +122,34 @@ describe("exportBackup / importBackup", () => {
     expect(restored.results[0].source).toBe("manual");
     expect(restored.results[0].scanConfidence).toBeNull();
     expect(restored.results[0].auditLog).toEqual([]);
+  });
+
+  it("quarantines a present invalid lifecycle value instead of trusting it", () => {
+    const state = emptyState();
+    state.results.push({
+      id: "r-invalid",
+      assessmentId: "a1",
+      learnerId: "L1",
+      version: "A",
+      answers: [],
+      itemScores: [],
+      rawScore: 0,
+      totalScore: 1,
+      percentage: 0,
+      masteryStatus: "Critical Support",
+      reviewed: true,
+      source: "scan",
+      scanConfidence: 1,
+      scanQuality: 100,
+      reviewStatus: "silently_accepted" as never,
+      finalizedAt: null,
+      scanItems: [],
+      auditLog: [],
+      createdAt: 1,
+      updatedAt: 1,
+    });
+    const restored = importBackup(JSON.stringify(state));
+    expect(restored.results[0].reviewStatus).toBe("needs_review");
   });
 
   it("normalizes a backup missing fields rather than throwing", () => {

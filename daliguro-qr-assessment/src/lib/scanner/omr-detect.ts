@@ -3,6 +3,7 @@
 // -> sample each bubble's inner disc darkness -> classify per item.
 
 import type { Choice, OmrTemplate, Point } from "./omr-template";
+import type { ScanItemStatus } from "../types";
 import { CHOICES } from "./omr-template";
 
 export interface GrayImage {
@@ -17,7 +18,7 @@ export interface RgbaImage {
   height: number;
 }
 
-export type ItemStatus = "selected" | "blank" | "unclear" | "multiple";
+export type ItemStatus = ScanItemStatus;
 
 export interface ItemReading {
   item: number;
@@ -25,12 +26,15 @@ export interface ItemReading {
   status: ItemStatus;
   confidence: number; // 0..1
   fill: number[]; // darkness ratio 0..1 per choice A..E
+  unreadableChoices?: number[];
 }
 
 // The shade-one VERSION row, read as a second identity layer.
 export interface VersionReading {
   detected: string | null; // "A".."D" or null when nothing is clearly shaded
   fill: number[];
+  status: "selected" | "blank" | "unclear" | "multiple";
+  confidence: number;
 }
 
 export interface SheetReading {
@@ -41,6 +45,13 @@ export interface SheetReading {
   sharpness: number; // higher = sharper
   version: VersionReading;
   items: ItemReading[];
+  // Canonical answer-area diagnostics used by independent capture gates.
+  // These are derived from local paper/background and expected print outlines,
+  // not from the mix of marked and unmarked answers.
+  shadowLevel?: number; // 0..100, higher means less even illumination
+  glareLevel?: number; // percentage of answer bubbles with washed-out bright regions
+  printContrast?: number; // 0..1 median expected bubble-outline contrast
+  obscuredBubbleCount?: number;
 }
 
 // Adaptive contrast thresholds. markScore = (localBg - innerBrightness) / localBg,
@@ -48,6 +59,8 @@ export interface SheetReading {
 const MARK_HI = 0.25; // clearly shaded (inner 25%+ darker than surrounding paper)
 const MARK_LO = 0.12; // clearly empty (below = no mark; paper noise is 5–10%)
 const MARGIN = 0.08; // gap needed between top choice and runner-up
+const STRONG_MARGIN = 0.13; // clean separation needed for faint marks
+export const MIN_VERSION_CONFIDENCE = 0.75;
 
 // --- grayscale ---------------------------------------------------------
 export function toGray(img: RgbaImage): GrayImage {
@@ -126,18 +139,98 @@ export function otsuThreshold(g: GrayImage): number {
   return Math.round((lo + hi) / 2);
 }
 
+interface MarkerCandidate {
+  x: number;
+  y: number;
+  area: number;
+  size: number;
+}
+
+function dist(a: Point, b: Point): number {
+  return Math.hypot(a.x - b.x, a.y - b.y);
+}
+
+function quadArea(q: Point[]): number {
+  let area = 0;
+  for (let i = 0; i < q.length; i += 1) {
+    const a = q[i];
+    const b = q[(i + 1) % q.length];
+    area += a.x * b.y - b.x * a.y;
+  }
+  return Math.abs(area) / 2;
+}
+
+function orderQuad(points: MarkerCandidate[]): MarkerCandidate[] | null {
+  const tl = points.reduce((a, b) => (b.x + b.y < a.x + a.y ? b : a));
+  const br = points.reduce((a, b) => (b.x + b.y > a.x + a.y ? b : a));
+  const tr = points.reduce((a, b) => (b.x - b.y > a.x - a.y ? b : a));
+  const bl = points.reduce((a, b) => (b.x - b.y < a.x - a.y ? b : a));
+  const ordered = [tl, tr, br, bl];
+  const uniq = new Set(ordered.map((c) => Math.round(c.x) + "," + Math.round(c.y)));
+  return uniq.size === 4 ? ordered : null;
+}
+
+function bestMarkerQuad(blobs: MarkerCandidate[], w: number, h: number): MarkerCandidate[] | null {
+  if (blobs.length < 4) return null;
+  const candidates = blobs
+    .slice()
+    .sort((a, b) => b.area - a.area)
+    .slice(0, 28);
+  let best: { quad: MarkerCandidate[]; score: number } | null = null;
+  const minSpan = Math.min(w, h) * 0.35;
+  const minPageArea = w * h * 0.08;
+
+  for (let a = 0; a < candidates.length - 3; a += 1) {
+    for (let b = a + 1; b < candidates.length - 2; b += 1) {
+      for (let c = b + 1; c < candidates.length - 1; c += 1) {
+        for (let d = c + 1; d < candidates.length; d += 1) {
+          const quad = orderQuad([candidates[a], candidates[b], candidates[c], candidates[d]]);
+          if (!quad) continue;
+          const [tl, tr, br, bl] = quad;
+          const topW = dist(tl, tr);
+          const bottomW = dist(bl, br);
+          const leftH = dist(tl, bl);
+          const rightH = dist(tr, br);
+          const pageArea = quadArea(quad);
+          if (topW < minSpan || bottomW < minSpan || leftH < minSpan || rightH < minSpan) continue;
+          if (pageArea < minPageArea) continue;
+          const areas = quad.map((p) => p.area);
+          const areaRatio = Math.max(...areas) / Math.max(1, Math.min(...areas));
+          if (areaRatio > 10) continue;
+          const avgW = (topW + bottomW) / 2;
+          const avgH = (leftH + rightH) / 2;
+          const aspect = avgH / Math.max(avgW, 1);
+          if (aspect < 0.95 || aspect > 2.2) continue;
+          const parallelBalance =
+            Math.abs(topW - bottomW) / Math.max(topW, bottomW) +
+            Math.abs(leftH - rightH) / Math.max(leftH, rightH);
+          const sizeBalance = areaRatio - 1;
+          const score = pageArea - parallelBalance * pageArea * 0.18 - sizeBalance * pageArea * 0.04;
+          if (!best || score > best.score) best = { quad, score };
+        }
+      }
+    }
+  }
+  return best?.quad ?? null;
+}
+
 // Find the 4 corner markers ANYWHERE in the frame (the sheet need not fill it).
-// Markers are the solid, square-ish, similarly-sized dark blobs; we keep all
-// such blobs then take the 4 corner-most by (x±y) extremes.
+// The phone photo can include table texture, skew, shadows, and Safari's camera
+// crop. We first collect square marker-like dark components, then choose the
+// most A4-page-like set of four instead of blindly using image extremes.
 export function findCornerMarkers(g: GrayImage): Point[] | null {
   const { width: w, height: h, data } = g;
   const n = w * h;
-  const thr = otsuThreshold(g);
+  const mean = meanGray(g);
+  const thr = Math.min(otsuThreshold(g), mean - 18);
   const visited = new Uint8Array(n);
-  const minArea = n * 0.0003;
-  const maxArea = n * 0.05;
+  const minDim = Math.min(w, h);
+  const minSide = Math.max(10, minDim * 0.025);
+  const maxSide = Math.max(minSide + 1, minDim * 0.14);
+  const minArea = minSide * minSide * 0.28;
+  const maxArea = maxSide * maxSide * 1.35;
   const stack: number[] = [];
-  const blobs: { x: number; y: number; area: number }[] = [];
+  const blobs: MarkerCandidate[] = [];
 
   for (let start = 0; start < n; start += 1) {
     if (visited[start] || data[start] >= thr) continue;
@@ -184,26 +277,19 @@ export function findCornerMarkers(g: GrayImage): Point[] | null {
         stack.push(idx + w);
       }
     }
-    if (overflow || count < minArea) continue;
+    if (overflow || count < minArea || count > maxArea) continue;
     const bw = maxx - minx + 1;
     const bh = maxy - miny + 1;
     const fill = count / (bw * bh);
     const aspect = bw / bh;
-    if (fill < 0.55 || aspect < 0.5 || aspect > 2.0) continue;
-    blobs.push({ x: sx / count, y: sy / count, area: count });
+    const side = Math.max(bw, bh);
+    if (side < minSide || side > maxSide) continue;
+    if (fill < 0.28 || aspect < 0.55 || aspect > 1.8) continue;
+    blobs.push({ x: sx / count, y: sy / count, area: count, size: side });
   }
 
-  if (blobs.length < 4) return null;
-  const tl = blobs.reduce((a, b) => (b.x + b.y < a.x + a.y ? b : a));
-  const br = blobs.reduce((a, b) => (b.x + b.y > a.x + a.y ? b : a));
-  const tr = blobs.reduce((a, b) => (b.x - b.y > a.x - a.y ? b : a));
-  const bl = blobs.reduce((a, b) => (b.x - b.y < a.x - a.y ? b : a));
-  const corners = [tl, tr, br, bl];
-  const uniq = new Set(corners.map((c) => Math.round(c.x) + "," + Math.round(c.y)));
-  if (uniq.size < 4) return null;
-  const areas = corners.map((c) => c.area);
-  if (Math.max(...areas) / Math.min(...areas) > 6) return null; // markers ~equal size
-  return corners.map((c) => ({ x: c.x, y: c.y }));
+  const corners = bestMarkerQuad(blobs, w, h);
+  return corners ? corners.map((c) => ({ x: c.x, y: c.y })) : null;
 }
 
 // --- homography (maps `from` quad -> `to` quad) -------------------------
@@ -270,7 +356,13 @@ function sample(g: GrayImage, x: number, y: number): number {
 // Returns 0 (empty) to 1 (fully filled), independent of ambient brightness.
 // innerR samples the mark; the ring between r*0.85 and r*1.35 samples paper background
 // (r*0.85 skips the printed ink outline; r*1.35 stays clear of adjacent bubbles).
-function bubbleAdaptive(g: GrayImage, h: number[], cx: number, cy: number, r: number): number {
+interface BubbleFeature {
+  darkness: number;
+  background: number;
+  outlineContrast: number;
+}
+
+function bubbleFeature(g: GrayImage, h: number[], cx: number, cy: number, r: number): BubbleFeature {
   const innerR = r * 0.55;
   const outMinR2 = (r * 0.85) * (r * 0.85);
   const outMaxR = r * 1.35;
@@ -296,7 +388,68 @@ function bubbleAdaptive(g: GrayImage, h: number[], cx: number, cy: number, r: nu
   const inner = innerN > 0 ? innerSum / innerN : 255;
   const outer = outerN > 0 ? outerSum / outerN : 200;
   const bg = Math.max(outer, 40); // floor prevents near-zero division in deep shadow
-  return Math.max(0, (bg - inner) / bg);
+  // The sheet always prints a bubble outline. Sampling the darkest of three
+  // nearby radii tolerates small scale/focus errors while still detecting an
+  // outline erased by glare or very weak printing.
+  let outlineSum = 0;
+  const outlineSamples = 32;
+  for (let i = 0; i < outlineSamples; i += 1) {
+    const angle = (i / outlineSamples) * Math.PI * 2;
+    let darkest = 255;
+    for (const radiusScale of [0.9, 1, 1.1]) {
+      const p = applyHomography(
+        h,
+        cx + Math.cos(angle) * r * radiusScale,
+        cy + Math.sin(angle) * r * radiusScale,
+      );
+      darkest = Math.min(darkest, sample(g, p.x, p.y));
+    }
+    outlineSum += darkest;
+  }
+  const outline = outlineSum / outlineSamples;
+  return {
+    darkness: Math.max(0, (bg - inner) / bg),
+    background: outer,
+    outlineContrast: clamp01((bg - outline) / bg),
+  };
+}
+
+function percentile(values: number[], fraction: number): number {
+  if (values.length === 0) return 0;
+  const sorted = values.slice().sort((a, b) => a - b);
+  const index = Math.max(0, Math.min(sorted.length - 1, Math.round((sorted.length - 1) * fraction)));
+  return sorted[index];
+}
+
+function isBubbleUnreadable(feature: BubbleFeature): boolean {
+  // A missing outline means there is no trustworthy visual evidence that the
+  // expected answer region was actually visible. Bright glare and deep local
+  // obstruction receive a slightly wider threshold.
+  return (
+    feature.outlineContrast < 0.045 ||
+    ((feature.background >= 248 || feature.background <= 65) && feature.outlineContrast < 0.08)
+  );
+}
+
+function captureMetrics(features: BubbleFeature[]): {
+  shadowLevel: number;
+  glareLevel: number;
+  printContrast: number;
+  obscuredBubbleCount: number;
+} {
+  if (features.length === 0) {
+    return { shadowLevel: 100, glareLevel: 100, printContrast: 0, obscuredBubbleCount: 0 };
+  }
+  const backgrounds = features.map((feature) => feature.background);
+  const spread = percentile(backgrounds, 0.9) - percentile(backgrounds, 0.1);
+  const shadowLevel = Math.round(Math.max(0, Math.min(100, (spread / 255) * 180)));
+  const washedOut = features.filter(
+    (feature) => feature.background >= 248 && feature.outlineContrast < 0.08,
+  ).length;
+  const glareLevel = Math.round((washedOut / features.length) * 100);
+  const printContrast = Math.round(percentile(features.map((feature) => feature.outlineContrast), 0.5) * 1000) / 1000;
+  const obscuredBubbleCount = features.filter(isBubbleUnreadable).length;
+  return { shadowLevel, glareLevel, printContrast, obscuredBubbleCount };
 }
 
 export function classifyItem(
@@ -328,7 +481,18 @@ export function classifyItem(
     const confidence = clamp01((MARK_LO - top.v) / MARK_LO + 0.35);
     return { item, detected: null, status: "blank", confidence, fill };
   }
-  // faint mark between empty and shaded — flag for teacher review.
+  // Faint mark between empty and shaded. It may be a light pencil answer, but
+  // in real phone photos faint print, shadows, and paper texture can imitate a
+  // weak fill. Keep the best guess, but route it through review unless it is
+  // unusually isolated from the runner-up.
+  if (top.v - second.v >= STRONG_MARGIN && top.v >= MARK_LO + 0.08) {
+    const confidence = clamp01(0.54 + (top.v - second.v));
+    return { item, detected: CHOICES[top.i], status: "selected", confidence, fill };
+  }
+  if (top.v - second.v >= MARGIN) {
+    const confidence = clamp01(0.36 + (top.v - second.v));
+    return { item, detected: CHOICES[top.i], status: "unclear", confidence, fill };
+  }
   return { item, detected: CHOICES[top.i], status: "unclear", confidence: 0.32, fill };
 }
 
@@ -336,32 +500,67 @@ function clamp01(v: number): number {
   return v < 0 ? 0 : v > 1 ? 1 : v;
 }
 
+// Strict no-missed-number guarantee: return EXACTLY items 1..total in order.
+// Any index the detector failed to produce is inserted as an explicit
+// "unclear" (Needs Review) placeholder — never silently dropped. This is the
+// contract the scan result relies on: a 40-item sheet always yields 40 entries.
+export function ensureCompleteItems(items: ItemReading[], total: number): ItemReading[] {
+  const byItem = new Map<number, ItemReading>();
+  for (const r of items) byItem.set(r.item, r);
+  const out: ItemReading[] = [];
+  for (let n = 1; n <= total; n += 1) {
+    out.push(
+      byItem.get(n) ?? {
+        item: n,
+        detected: null,
+        status: "unclear",
+        confidence: 0,
+        fill: NO_FILL(),
+      },
+    );
+  }
+  return out;
+}
+
 // Read the shade-one VERSION bubbles using an existing homography.
 function readVersionMarks(g: GrayImage, h: number[], template: OmrTemplate): VersionReading {
   const fill = template.versionBubbles.map((b) =>
-    bubbleAdaptive(g, h, b.cx, b.cy, b.r),
+    bubbleFeature(g, h, b.cx, b.cy, b.r).darkness,
   );
   const order = fill.map((v, i) => ({ v, i })).sort((a, b) => b.v - a.v);
   const top = order[0];
   const second = order[1] ?? { v: 0, i: -1 };
-  if (!top || top.v < MARK_HI || top.v - second.v < MARGIN) {
-    return { detected: null, fill };
+  if (!top || top.v < MARK_LO) {
+    return { detected: null, fill, status: "blank", confidence: top ? clamp01(1 - top.v / MARK_LO) : 0 };
   }
-  return { detected: template.versionBubbles[top.i].version, fill };
+  if (fill.filter((value) => value > MARK_HI).length >= 2) {
+    return { detected: null, fill, status: "multiple", confidence: 0.2 };
+  }
+  if (top.v < MARK_HI || top.v - second.v < MARGIN) {
+    return { detected: null, fill, status: "unclear", confidence: 0.35 };
+  }
+  const confidence = clamp01(Math.min(top.v / 0.45, (top.v - second.v) / 0.2));
+  if (confidence < MIN_VERSION_CONFIDENCE) {
+    return { detected: null, fill, status: "unclear", confidence };
+  }
+  return { detected: template.versionBubbles[top.i].version, fill, status: "selected", confidence };
 }
 
 const NO_FILL = () => new Array<number>(CHOICES.length).fill(0);
 
 // Read a whole sheet. `validChoicesByItem` limits which choices count per item
-// (e.g. a 4-option MC ignores E).
+// (e.g. a 4-option MC ignores E). Pass `precomputedCorners` when the caller
+// already ran findCornerMarkers on this frame — marker search is the most
+// expensive step, so live scanning must not pay for it twice.
 export function readSheet(
   g: GrayImage,
   template: OmrTemplate,
   validChoicesByItem: Record<number, number> = {},
+  precomputedCorners?: Point[] | null,
 ): SheetReading {
   const brightness = meanGray(g);
   const sharpness = sharpnessOf(g);
-  const corners = findCornerMarkers(g);
+  const corners = precomputedCorners !== undefined ? precomputedCorners : findCornerMarkers(g);
   if (!corners) {
     return {
       aligned: false,
@@ -369,26 +568,53 @@ export function readSheet(
       corners: null,
       brightness,
       sharpness,
-      version: { detected: null, fill: [] },
+      version: { detected: null, fill: [], status: "blank", confidence: 0 },
       items: [],
+      shadowLevel: 100,
+      glareLevel: 100,
+      printContrast: 0,
     };
   }
   const h = solveHomography(template.markerCenters, corners);
 
   // Gather darkness per item/choice.
   const fillByItem = new Map<number, number[]>();
+  const features: BubbleFeature[] = [];
+  const featuresByItem = new Map<number, BubbleFeature[]>();
   for (const b of template.bubbles) {
     if (!fillByItem.has(b.item)) fillByItem.set(b.item, NO_FILL());
-    fillByItem.get(b.item)![b.choiceIndex] = bubbleAdaptive(g, h, b.cx, b.cy, b.r);
+    const feature = bubbleFeature(g, h, b.cx, b.cy, b.r);
+    features.push(feature);
+    if (!featuresByItem.has(b.item)) featuresByItem.set(b.item, []);
+    featuresByItem.get(b.item)![b.choiceIndex] = feature;
+    fillByItem.get(b.item)![b.choiceIndex] = feature.darkness;
   }
+  const metrics = captureMetrics(features);
+  const localizedVisibilityComparable = metrics.printContrast >= 0.12;
 
   const items: ItemReading[] = [];
   for (let n = 1; n <= template.items; n += 1) {
     const fill = fillByItem.get(n) ?? NO_FILL();
-    items.push(classifyItem(n, fill, validChoicesByItem[n] ?? CHOICES.length));
+    const validChoices = validChoicesByItem[n] ?? CHOICES.length;
+    const classified = classifyItem(n, fill, validChoices);
+    const unreadableChoices = localizedVisibilityComparable
+      ? (featuresByItem.get(n) ?? [])
+          .slice(0, validChoices)
+          .flatMap((feature, index) => feature && isBubbleUnreadable(feature) ? [index] : [])
+      : [];
+    items.push(
+      unreadableChoices.length > 0
+        ? {
+            ...classified,
+            status: "unreadable",
+            confidence: Math.min(classified.confidence, 0.15),
+            unreadableChoices,
+          }
+        : classified,
+    );
   }
 
   const version = readVersionMarks(g, h, template);
 
-  return { aligned: true, markersFound: 4, corners, brightness, sharpness, version, items };
+  return { aligned: true, markersFound: 4, corners, brightness, sharpness, version, items, ...metrics };
 }

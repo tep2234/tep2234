@@ -19,17 +19,11 @@ export function Chip({ ok, okText, badText }: { ok: boolean; okText: string; bad
 export function Recovery({
   resolution,
   state,
-  manualLearnerId,
-  onManualLearnerId,
-  onConfirmManual,
   onSwitchActive,
   onDismiss,
 }: {
   resolution: ScanResolution;
   state: QrAssessmentState;
-  manualLearnerId: string;
-  onManualLearnerId: (id: string) => void;
-  onConfirmManual: () => void;
   onSwitchActive: (id: string) => void;
   onDismiss: () => void;
 }) {
@@ -48,7 +42,7 @@ export function Recovery({
   } else if (r.status === "LEARNER_NOT_FOUND") {
     title = "QR read — learner not loaded on this device";
     body =
-      "The assessment is here, but the learner on the sheet isn't (the sheet may be from a different data set). Reprint sheets from this device's data, import the matching backup, or pick the learner manually below.";
+      "The assessment is here, but the learner on the sheet isn't. Reprint sheets from this device's data, import the matching backup, or use SmartScan → Manual checking with an explicit learner selection.";
   } else if (r.status === "ASSESSMENT_NOT_ACTIVE") {
     title = "QR read — switch to its assessment";
     body = "This sheet is for an assessment that's loaded but not active.";
@@ -67,28 +61,6 @@ export function Recovery({
         ) : null}
         <Button variant="ghost" onClick={onDismiss}>Scan another</Button>
       </div>
-
-      {r.status === "LEARNER_NOT_FOUND" ? (
-        <div className="mt-3 rounded-lg border border-slate-200 bg-white p-2">
-          <div className="text-xs font-bold text-slate-600">Manual fallback (use with care):</div>
-          <div className="mt-1 flex flex-wrap items-center gap-2">
-            <select
-              value={manualLearnerId}
-              onChange={(e) => onManualLearnerId(e.target.value)}
-              className="rounded-lg border border-slate-200 bg-white px-2 py-1 text-sm"
-            >
-              <option value="">— pick learner —</option>
-              {state.learners.map((l) => (
-                <option key={l.id} value={l.id}>
-                  {l.fullName}
-                  {l.section ? " (" + l.section + ")" : ""}
-                </option>
-              ))}
-            </select>
-            <Button variant="small" onClick={onConfirmManual}>Use this learner</Button>
-          </div>
-        </div>
-      ) : null}
 
       <button className="mt-2 text-xs font-bold text-indigo-700" onClick={() => setShowTech((s) => !s)}>
         {showTech ? "Hide" : "Show"} technical details

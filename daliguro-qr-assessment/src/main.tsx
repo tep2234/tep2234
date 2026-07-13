@@ -1,11 +1,20 @@
 import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
+import { BrowserRouter, Route, Routes } from 'react-router-dom'
 import './index.css'
 import App from './App.tsx'
+import SmartScanMobilePage from './pages/SmartScanMobilePage.tsx'
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
-    <App />
+    <BrowserRouter>
+      <Routes>
+        {/* Phone scanner deep link (paired from the PC). */}
+        <Route path="/smartscan/mobile/:sessionId" element={<SmartScanMobilePage />} />
+        {/* Everything else is the desktop dashboard. */}
+        <Route path="*" element={<App />} />
+      </Routes>
+    </BrowserRouter>
   </StrictMode>,
 )
 

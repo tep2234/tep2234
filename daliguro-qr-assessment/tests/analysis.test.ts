@@ -24,7 +24,6 @@ function item(overrides: Partial<Item> = {}): Item {
     acceptedAnswers: [],
     points: 1,
     competency: "",
-    topic: "",
     difficulty: "Average",
     cognitiveLevel: "",
     choices: 4,
@@ -144,6 +143,14 @@ describe("analyzeItems", () => {
       expect(r.percentCorrect).toBe(0);
       expect(Number.isNaN(r.percentCorrect)).toBe(false);
     });
+  });
+
+  it("excludes unresolved scan evidence from attempts, errors, and blanks", () => {
+    const rows = analyzeItems(items, [
+      result({ itemScores: [score({ itemId: "i1", unresolved: true, unresolvedStatus: "unreadable" })] }),
+    ]);
+    const row = rows.find((candidate) => candidate.item.id === "i1")!;
+    expect(row).toMatchObject({ attempts: 0, correct: 0, incorrect: 0, blank: 0, percentCorrect: 0 });
   });
 
   it("mostMissed/leastMissed/blankHeavy rank and slice correctly", () => {

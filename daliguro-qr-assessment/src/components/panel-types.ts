@@ -8,4 +8,5 @@ export interface PanelProps {
   setState: Dispatch<SetStateAction<QrAssessmentState>>;
   activeId: string | null;
   setActiveId: Dispatch<SetStateAction<string | null>>;
+  navigate?: (tab: string) => void;
 }

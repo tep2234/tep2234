@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { Learner } from "../src/lib/types";
-import { buildQrPayload, buildSecurityToken, qrText } from "../src/lib/qr";
+import { buildQrPayload, buildSecurityToken, payloadChecksum, qrText } from "../src/lib/qr";
+import { decodeQrPayload } from "../src/lib/qr-parse";
 
 const ANSWER_KEY_FIELDS = [
   "correctAnswer",
@@ -65,17 +66,19 @@ describe("buildQrPayload", () => {
     });
   });
 
-  it("carries a deterministic checksum over the identity triple", () => {
+  it("binds the checksum to the complete per-sheet identity envelope", () => {
     const a = buildQrPayload("a1", learner(), "A", 10);
     const b = buildQrPayload("a1", learner(), "A", 10);
-    expect(a.checksum).toBe(b.checksum);
+    expect(a.checksum).toBe(payloadChecksum(a.assessmentId, a.learnerId, a.version, a.securityToken, a.n));
+    expect(a.securityToken).not.toBe(b.securityToken);
+    expect(a.checksum).not.toBe(b.checksum);
     expect(a.checksum).not.toBe(buildQrPayload("a1", learner(), "B", 10).checksum);
   });
 
-  it("round-trips through JSON exactly as a plain identity object", () => {
+  it("round-trips through compact QR text back to a plain identity object", () => {
     const payload = buildQrPayload("a1", learner(), "A", 20);
-    const parsed = JSON.parse(qrText(payload));
-    expect(parsed).toEqual(payload);
+    const parsed = decodeQrPayload(qrText(payload));
+    expect(parsed).toEqual({ ok: true, payload });
   });
 });
 
