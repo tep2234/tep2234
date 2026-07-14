@@ -1,15 +1,26 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { emptyState } from "../src/lib/types";
 import {
+  clearAllLocalData,
   clearState,
   exportBackup,
+  getEvidence,
   importBackup,
   loadState,
+  LocalDataClearError,
+  saveEvidence,
   saveState,
 } from "../src/lib/offline-store";
 
 beforeEach(async () => {
+  localStorage.clear();
+  sessionStorage.clear();
   await clearState();
+});
+
+afterEach(() => {
+  vi.restoreAllMocks();
+  vi.unstubAllGlobals();
 });
 
 describe("offline-store (IndexedDB path via fake-indexeddb)", () => {
@@ -63,6 +74,65 @@ describe("offline-store (IndexedDB path via fake-indexeddb)", () => {
     await saveState(partial);
     const loaded = await loadState();
     expect(loaded).toEqual(emptyState());
+  });
+});
+
+describe("clearAllLocalData", () => {
+  it("purges every DALIguro-owned local artifact but preserves unrelated origin data", async () => {
+    const state = emptyState();
+    state.learners.push({
+      id: "L1",
+      lrn: "1",
+      fullName: "Ana",
+      sex: "F",
+      gradeLevel: "Grade 7",
+      section: "Rizal",
+    });
+    await saveState(state);
+    await saveEvidence("result-1", "data:image/jpeg;base64,evidence");
+
+    localStorage.setItem("daliguro_qr_active_assessment_id", "assessment-1");
+    localStorage.setItem("daliguro_phone_scanner_origin", "https://phone.example");
+    localStorage.setItem("daliguro_scanner_certification_assessment-1", "certification");
+    localStorage.setItem("daliguro_report_meta_assessment-1", "report metadata");
+    localStorage.setItem("smartscan_outbox_session-1", "queued scan");
+    localStorage.setItem("daliguro_future_artifact", "future app data");
+    localStorage.setItem("unrelated_app_preference", "keep me");
+    sessionStorage.setItem("smartscan_temporary_frame", "temporary scan data");
+    sessionStorage.setItem("unrelated_session", "keep me too");
+
+    const cacheNames = new Set(["daliguro-qr-v2", "unrelated-cache"]);
+    vi.stubGlobal("caches", {
+      keys: vi.fn(async () => Array.from(cacheNames)),
+      delete: vi.fn(async (name: string) => cacheNames.delete(name)),
+    });
+
+    expect(await getEvidence("result-1")).toContain("evidence");
+    await clearAllLocalData();
+
+    expect(await loadState()).toEqual(emptyState());
+    expect(await getEvidence("result-1")).toBeNull();
+    expect(Object.keys(localStorage).filter((key) => /^(daliguro_|smartscan_)/.test(key))).toEqual([]);
+    expect(Object.keys(sessionStorage).filter((key) => /^(daliguro_|smartscan_)/.test(key))).toEqual([]);
+    expect(localStorage.getItem("unrelated_app_preference")).toBe("keep me");
+    expect(sessionStorage.getItem("unrelated_session")).toBe("keep me too");
+    expect(cacheNames).toEqual(new Set(["unrelated-cache"]));
+  });
+
+  it("rejects with the failed area when a browser refuses deletion", async () => {
+    localStorage.setItem("daliguro_blocked_artifact", "must not be reported as deleted");
+    const originalRemoveItem = Storage.prototype.removeItem;
+    vi.spyOn(Storage.prototype, "removeItem").mockImplementation(function (this: Storage, key: string) {
+      if (this === localStorage && key === "daliguro_blocked_artifact") {
+        throw new DOMException("Storage is blocked", "SecurityError");
+      }
+      return originalRemoveItem.call(this, key);
+    });
+
+    const result = clearAllLocalData();
+    await expect(result).rejects.toBeInstanceOf(LocalDataClearError);
+    await expect(result).rejects.toMatchObject({ failedAreas: ["local browser storage"] });
+    expect(localStorage.getItem("daliguro_blocked_artifact")).toBe("must not be reported as deleted");
   });
 });
 
