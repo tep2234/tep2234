@@ -24,6 +24,7 @@ export function subscribePhoneSubmissions(
   teacherUserId: string,
   assessmentId: string,
   onChange: (row: PhoneInboxRow) => void,
+  onSubscribed?: () => void,
 ): Unsubscribe {
   const sb = getSupabaseClient();
   if (!sb) return NOOP;
@@ -42,7 +43,9 @@ export function subscribePhoneSubmissions(
         if (row?.assessment_id === assessmentId && row.status === "received") onChange(row);
       },
     )
-    .subscribe();
+    .subscribe((status) => {
+      if (status === "SUBSCRIBED") onSubscribed?.();
+    });
   return () => { void sb.removeChannel(channel); };
 }
 

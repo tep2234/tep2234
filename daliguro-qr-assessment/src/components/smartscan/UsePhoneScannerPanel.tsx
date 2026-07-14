@@ -272,15 +272,28 @@ export function UsePhoneScannerPanel({
       }
     };
     void refetch();
-    const unsub = subscribePhoneSubmissions(teacherUserId, assessmentId, (row) => {
-      if (active) void processPhoneSubmission(row);
-    });
+    const unsub = subscribePhoneSubmissions(
+      teacherUserId,
+      assessmentId,
+      (row) => {
+        if (active) void processPhoneSubmission(row);
+      },
+      // Supabase can report SUBSCRIBED while a cold local Realtime tenant is
+      // still bringing logical replication online. Reconcile from durable
+      // storage after readiness so channel timing never becomes correctness.
+      () => { if (active) void refetch(); },
+    );
+    // Realtime remains an optimization. Periodic reconciliation closes the
+    // fetch/subscribe race and recovers missed notifications without requiring
+    // the teacher to focus or reload the page.
+    const reconcileTimer = setInterval(() => { if (active) void refetch(); }, 4_000);
     const onFocus = () => { if (document.visibilityState === "visible") void refetch(); };
     window.addEventListener("focus", onFocus);
     document.addEventListener("visibilitychange", onFocus);
     return () => {
       active = false;
       unsub();
+      clearInterval(reconcileTimer);
       window.removeEventListener("focus", onFocus);
       document.removeEventListener("visibilitychange", onFocus);
     };
