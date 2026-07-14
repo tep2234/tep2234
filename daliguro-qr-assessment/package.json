@@ -12,6 +12,7 @@
     "preview": "vite preview",
     "preview:https": "HTTPS=true vite preview",
     "test": "vitest run",
+    "test:browser": "playwright test",
     "test:db": "bash scripts/test-postgres-migrations.sh"
   },
   "dependencies": {
@@ -25,6 +26,7 @@
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
+    "@playwright/test": "^1.61.1",
     "@tailwindcss/postcss": "^4.3.1",
     "@tailwindcss/vite": "^4.3.1",
     "@types/node": "^24.12.3",
@@ -41,6 +43,7 @@
     "globals": "^17.6.0",
     "jsdom": "^29.1.1",
     "postcss": "^8.5.15",
+    "sharp": "^0.35.3",
     "tailwindcss": "^4.3.1",
     "typescript": "~6.0.2",
     "typescript-eslint": "^8.59.2",
