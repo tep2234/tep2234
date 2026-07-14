@@ -35,6 +35,11 @@ import {
   ScannerGeneration,
 } from "../lib/scanner/image-ingestion";
 import {
+  CameraLifecycleMachine,
+  stopCameraStreamOnce,
+  type CameraLifecycleOutcome,
+} from "../lib/scanner/camera-lifecycle";
+import {
   analyzeFrameData,
   type FrameAnalysis,
   type FrameResult,
@@ -122,6 +127,7 @@ export default function SmartScanMobilePage() {
   const photoInputRef = useRef<HTMLInputElement>(null);
   const galleryInputRef = useRef<HTMLInputElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
+  const trackEndedCleanupRef = useRef<(() => void) | null>(null);
   const rafRef = useRef<number | null>(null);
   const cameraRunRef = useRef(0);
   const loopRef = useRef<() => void>(() => {});
@@ -139,6 +145,10 @@ export default function SmartScanMobilePage() {
   const pendingScanRef = useRef<CapturedMobileScan | null>(null);
   const committedScanIdsRef = useRef(new Set<string>());
   const galleryGenerationRef = useRef(new ScannerGeneration());
+  const lifecycleRef = useRef(new CameraLifecycleMachine((snapshot) => {
+    if (import.meta.env.DEV) console.info("[camera-lifecycle]", { cameraLifecycleOutcome: snapshot.outcome });
+  }));
+  const startCameraRef = useRef<(recovering?: boolean) => void>(() => {});
 
   const [stage, setStage] = useState<Flow>("ready");
   const [error, setError] = useState("");
@@ -238,11 +248,13 @@ export default function SmartScanMobilePage() {
     [],
   );
 
-  const closeCamera = useCallback(() => {
+  const releaseCamera = useCallback(() => {
     cameraRunRef.current += 1;
     if (rafRef.current !== null) cancelAnimationFrame(rafRef.current);
     rafRef.current = null;
-    streamRef.current?.getTracks().forEach((track) => track.stop());
+    trackEndedCleanupRef.current?.();
+    trackEndedCleanupRef.current = null;
+    if (streamRef.current) stopCameraStreamOnce(streamRef.current);
     streamRef.current = null;
     accumRef.current = null;
     stabilityRef.current = null;
@@ -251,6 +263,12 @@ export default function SmartScanMobilePage() {
     setTorchAvailable(false);
     setTorchOn(false);
   }, []);
+
+  const closeCamera = useCallback(() => {
+    const stoppedGeneration = lifecycleRef.current.stop();
+    releaseCamera();
+    lifecycleRef.current.stopped(stoppedGeneration);
+  }, [releaseCamera]);
 
   // Toggle the camera flashlight (Android Chrome and other torch-capable
   // devices). Low light is the #1 real-world scan failure; this fixes it at
@@ -699,18 +717,23 @@ export default function SmartScanMobilePage() {
     loopRef.current = loop;
   }, [loop]);
 
-  async function startLiveCamera() {
+  async function startLiveCamera(recovering = false) {
     if (!linkOk) return;
     galleryGenerationRef.current.cancel();
+    const lifecycleGeneration = recovering
+      ? lifecycleRef.current.recover()
+      : lifecycleRef.current.request();
+    if (lifecycleGeneration === null) return;
     setError("");
     setCameraMessage("");
     setLastFrame(null);
     if (!canUseLiveCamera || !navigator.mediaDevices?.getUserMedia) {
+      lifecycleRef.current.fail(lifecycleGeneration, "start-failed");
       setCameraMessage("Live camera requires HTTPS and browser camera access. Take a photo or choose an existing image instead.");
       photoInputRef.current?.click();
       return;
     }
-    closeCamera();
+    releaseCamera();
     const runId = cameraRunRef.current;
     setBusy(true);
     try {
@@ -730,19 +753,27 @@ export default function SmartScanMobilePage() {
           throw err;
         });
       if (runId !== cameraRunRef.current) {
-        stream.getTracks().forEach((track) => track.stop());
+        stopCameraStreamOnce(stream);
+        return;
+      }
+      if (!lifecycleRef.current.starting(lifecycleGeneration)) {
+        stopCameraStreamOnce(stream);
         return;
       }
       streamRef.current = stream;
       const video = videoRef.current;
       if (!video) {
-        stream.getTracks().forEach((track) => track.stop());
+        lifecycleRef.current.fail(lifecycleGeneration, "start-failed");
+        stopCameraStreamOnce(stream);
         streamRef.current = null;
         return;
       }
       video.srcObject = stream;
       await video.play();
-      if (runId !== cameraRunRef.current) return;
+      if (runId !== cameraRunRef.current || !lifecycleRef.current.isCurrent(lifecycleGeneration)) {
+        stopCameraStreamOnce(stream);
+        return;
+      }
       // Optional camera upgrades: continuous autofocus keeps a handheld sheet
       // sharp, and torch support unlocks the flashlight button in low light.
       // Both are best-effort — unsupported devices just skip them.
@@ -756,16 +787,80 @@ export default function SmartScanMobilePage() {
       } catch {
         /* best-effort enhancements only */
       }
+      if (!lifecycleRef.current.activate(lifecycleGeneration)) {
+        releaseCamera();
+        return;
+      }
+      const activeTrack = stream.getVideoTracks()[0];
+      if (activeTrack) {
+        const onEnded = () => {
+          if (lifecycleRef.current.snapshot().state !== "ACTIVE") return;
+          lifecycleRef.current.suspend("track-ended");
+          releaseCamera();
+          setStage("ready");
+          if (document.visibilityState === "visible") {
+            startCameraRef.current(true);
+          }
+        };
+        activeTrack.addEventListener("ended", onEnded, { once: true });
+        trackEndedCleanupRef.current = () => activeTrack.removeEventListener("ended", onEnded);
+      }
       setStage("live");
       rafRef.current = requestAnimationFrame(() => loopRef.current());
     } catch (err) {
-      closeCamera();
+      if (lifecycleRef.current.isCurrent(lifecycleGeneration)) {
+        lifecycleRef.current.fail(
+          lifecycleGeneration,
+          err instanceof DOMException && (err.name === "NotAllowedError" || err.name === "PermissionDeniedError")
+            ? "permission-denied"
+            : "start-failed",
+        );
+      }
+      releaseCamera();
       const outcome = classifyMediaError(err, true);
       setCameraMessage(outcome.message);
     } finally {
-      setBusy(false);
+      if (lifecycleRef.current.isCurrent(lifecycleGeneration)) setBusy(false);
     }
   }
+
+  useEffect(() => {
+    startCameraRef.current = (recovering = false) => { void startLiveCamera(recovering); };
+  });
+
+  useEffect(() => {
+    const suspend = (outcome: Extract<CameraLifecycleOutcome, "page-hidden" | "focus-lost" | "device-change">) => {
+      const state = lifecycleRef.current.snapshot().state;
+      const canSuspend = outcome === "page-hidden"
+        ? ["REQUESTING_PERMISSION", "STARTING", "ACTIVE"].includes(state)
+        : state === "ACTIVE";
+      if (!canSuspend) return;
+      if (!lifecycleRef.current.suspend(outcome)) return;
+      releaseCamera();
+      setStage("ready");
+    };
+    const recover = () => {
+      if (document.visibilityState !== "visible") return;
+      startCameraRef.current(true);
+    };
+    const onVisibility = () => document.visibilityState === "hidden" ? suspend("page-hidden") : recover();
+    const onBlur = () => suspend("focus-lost");
+    const onFocus = () => recover();
+    const onDeviceChange = () => {
+      suspend("device-change");
+      recover();
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    window.addEventListener("blur", onBlur);
+    window.addEventListener("focus", onFocus);
+    navigator.mediaDevices?.addEventListener?.("devicechange", onDeviceChange);
+    return () => {
+      document.removeEventListener("visibilitychange", onVisibility);
+      window.removeEventListener("blur", onBlur);
+      window.removeEventListener("focus", onFocus);
+      navigator.mediaDevices?.removeEventListener?.("devicechange", onDeviceChange);
+    };
+  }, [releaseCamera]);
 
   async function readPhoto(file: File, captureSource: CapturedMobileScan["captureSource"]) {
     // Gallery/capture decoding owns the canvas until it completes. Invalidate
