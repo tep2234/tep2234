@@ -29,6 +29,7 @@ import {
   REQUIRED_STABLE_FRAMES,
   type FrameStabilityState,
 } from "../lib/scanner/frame-stability";
+import { verifyFinalMobileCapture } from "../lib/scanner/final-capture";
 import {
   analyzeFrameData,
   type FrameAnalysis,
@@ -55,6 +56,7 @@ type CapturedMobileScan = MobileScan & { scanId: string; capturedAt: number };
 // denoises the read while still locking fast (~3 good frames).
 const CONSENSUS_FRAMES = REQUIRED_STABLE_FRAMES;
 const FRAME_W = 1300;
+const FINAL_CAPTURE_W = 2200;
 const COOLDOWN_MS = 2500;
 // Throttle the heavy analysis so the RAF loop yields the main thread to touch
 // events — keeps buttons responsive on phones instead of janky/laggy.
@@ -256,11 +258,11 @@ export default function SmartScanMobilePage() {
 
   useEffect(() => closeCamera, [closeCamera]);
 
-  const grabFrame = useCallback((): ImageData | null => {
+  const grabFrame = useCallback((maximumWidth = FRAME_W): ImageData | null => {
     const video = videoRef.current;
     const canvas = canvasRef.current;
     if (!video || !canvas || video.readyState < 2 || !video.videoWidth || !video.videoHeight) return null;
-    const scale = Math.min(1, FRAME_W / video.videoWidth);
+    const scale = Math.min(1, maximumWidth / video.videoWidth);
     canvas.width = Math.round(video.videoWidth * scale);
     canvas.height = Math.round(video.videoHeight * scale);
     const ctx = canvas.getContext("2d", { willReadFrequently: true });
@@ -604,11 +606,65 @@ export default function SmartScanMobilePage() {
         setStableCount(stability.state?.consecutive ?? 0);
         if (stability.ready && active.n >= CONSENSUS_FRAMES) {
           const consensus = buildConsensusScan(active);
+          const expectation = stability.state
+            ? { identity: genuineQr, state: stability.state }
+            : null;
+          const finalFrame = grabFrame(FINAL_CAPTURE_W);
+          const capturedAt = Date.now();
+          if (!expectation || !finalFrame) {
+            stabilityRef.current = null;
+            accumRef.current = null;
+            setStableCount(0);
+            setLastFrame({
+              ...result,
+              scan: null,
+              status: "final_capture_rejected",
+              message: "The final still could not be captured. Hold the sheet still and try again.",
+            });
+            if (runIsActive()) {
+              rafRef.current = requestAnimationFrame(() => void loopRef.current());
+            }
+            return;
+          }
+          // The exact high-resolution still entering review is independently
+          // decoded and analyzed. Never reuse preview identity for this step.
+          const finalNativeQr = canvasRef.current
+            ? await readNativeQr(canvasRef.current)
+            : null;
+          if (!runIsActive()) return;
+          const finalAnalysis = await analyzeAsync(finalFrame, finalNativeQr, true);
+          if (!runIsActive()) return;
+          const verified = verifyFinalMobileCapture(
+            expectation,
+            consensus,
+            finalAnalysis,
+            capturedAt,
+          );
           cooldownUntilRef.current = Date.now() + COOLDOWN_MS;
           accumRef.current = null;
           stabilityRef.current = null;
           setStableCount(0);
-          handleStableScan(consensus);
+          if (!verified.ok) {
+            setLastFrame({
+              ...finalAnalysis.result,
+              scan: null,
+              status: "final_capture_rejected",
+              message: verified.message,
+            });
+            if (runIsActive()) {
+              rafRef.current = requestAnimationFrame(() => void loopRef.current());
+            }
+            return;
+          }
+          setLastFrame({
+            ...finalAnalysis.result,
+            scan: verified.scan,
+            status: verified.scan.hasDoubt ? "review" : "ready",
+            message: verified.evidenceDisagreed
+              ? "Final still disagreed with preview evidence. Teacher review is required."
+              : finalAnalysis.result.message,
+          });
+          handleStableScan(verified.scan);
           return;
         }
       } else {

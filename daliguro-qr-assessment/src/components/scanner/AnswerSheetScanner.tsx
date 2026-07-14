@@ -26,6 +26,10 @@ import {
   REQUIRED_STABLE_FRAMES,
   type FrameStabilityState,
 } from "../../lib/scanner/frame-stability";
+import {
+  type StableCaptureExpectation,
+  verifyFinalCaptureStability,
+} from "../../lib/scanner/final-capture";
 import { resolveScanIdentity, type ScanResolution } from "../../lib/scanner/resolve";
 import { processStillImage, type ScanResult } from "../../lib/scanner/still-pipeline";
 import { Button } from "../ui";
@@ -46,11 +50,6 @@ const LIVE_W = 900;
 const HOLD_MS = 1100; // stable-good time before auto-capture
 const COOLDOWN_MS = 3500; // pause after a capture before the next auto fire
 const SAME_SHEET_MS = 8000; // extra wait before re-capturing the SAME learner
-
-interface StableCaptureExpectation {
-  identity: string;
-  state: FrameStabilityState;
-}
 
 function quickBrightness(data: Uint8ClampedArray | number[]): number {
   let sum = 0;
@@ -198,25 +197,15 @@ export function AnswerSheetScanner({
         const identity = readQrSmart(img, true)?.data ?? null;
         const brightness = Math.round(quickBrightness(img.data));
         const sharpness = sharpnessOf(gray);
-        if (!geometry || identity !== expected.identity) {
-          setStabilityMessage("The sheet or QR moved during capture. Hold the same sheet still and try again.");
-          return false;
-        }
-        const finalObservation = advanceFrameStability(expected.state, {
+        const finalObservation = verifyFinalCaptureStability(expected, {
           identity,
           geometry,
           luminance: brightness,
           sharpness,
           observedAt: Date.now(),
-          freshIdentity: true,
         });
-        if (
-          !finalObservation.ready ||
-          brightness < 70 ||
-          brightness > 245 ||
-          sharpness < 2.4
-        ) {
-          setStabilityMessage("Movement, focus, or lighting changed during capture. Hold still for four new stable frames.");
+        if (!finalObservation.ok) {
+          setStabilityMessage(finalObservation.message);
           return false;
         }
       }
