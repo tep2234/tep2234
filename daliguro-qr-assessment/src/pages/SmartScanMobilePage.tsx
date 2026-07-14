@@ -31,6 +31,10 @@ import {
 } from "../lib/scanner/frame-stability";
 import { verifyFinalMobileCapture } from "../lib/scanner/final-capture";
 import {
+  ingestGalleryImage,
+  ScannerGeneration,
+} from "../lib/scanner/image-ingestion";
+import {
   analyzeFrameData,
   type FrameAnalysis,
   type FrameResult,
@@ -50,7 +54,11 @@ import { Button } from "../components/ui";
 type Flow = "ready" | "live" | "review" | "done";
 type SyncState = "idle" | "pending" | "sent" | "pc_received" | "saved" | "scored" | "failed";
 type SignalTone = "good" | "warn" | "bad";
-type CapturedMobileScan = MobileScan & { scanId: string; capturedAt: number };
+type CapturedMobileScan = MobileScan & {
+  scanId: string;
+  capturedAt: number;
+  captureSource: "gallery" | "camera-final" | "manual-capture";
+};
 
 // Number of aligned frames averaged before we trust a reading. A short burst
 // denoises the read while still locking fast (~3 good frames).
@@ -111,7 +119,8 @@ export default function SmartScanMobilePage() {
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const fileRef = useRef<HTMLInputElement>(null);
+  const photoInputRef = useRef<HTMLInputElement>(null);
+  const galleryInputRef = useRef<HTMLInputElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const rafRef = useRef<number | null>(null);
   const cameraRunRef = useRef(0);
@@ -129,6 +138,7 @@ export default function SmartScanMobilePage() {
   const retryingRef = useRef(false);
   const pendingScanRef = useRef<CapturedMobileScan | null>(null);
   const committedScanIdsRef = useRef(new Set<string>());
+  const galleryGenerationRef = useRef(new ScannerGeneration());
 
   const [stage, setStage] = useState<Flow>("ready");
   const [error, setError] = useState("");
@@ -256,7 +266,13 @@ export default function SmartScanMobilePage() {
     }
   }, []);
 
-  useEffect(() => closeCamera, [closeCamera]);
+  useEffect(() => {
+    const galleryGeneration = galleryGenerationRef.current;
+    return () => {
+      galleryGeneration.cancel();
+      closeCamera();
+    };
+  }, [closeCamera]);
 
   const grabFrame = useCallback((maximumWidth = FRAME_W): ImageData | null => {
     const video = videoRef.current;
@@ -509,11 +525,12 @@ export default function SmartScanMobilePage() {
   }, [capability, pendingScan?.scanId, syncState]);
 
   const handleStableScan = useCallback(
-    (scan: MobileScan) => {
+    (scan: MobileScan, captureSource: CapturedMobileScan["captureSource"] = "camera-final") => {
       const captured: CapturedMobileScan = {
         ...scan,
         scanId: generateScanId(),
         capturedAt: Date.now(),
+        captureSource,
       };
       setPendingScan(captured);
       pendingScanRef.current = captured;
@@ -684,12 +701,13 @@ export default function SmartScanMobilePage() {
 
   async function startLiveCamera() {
     if (!linkOk) return;
+    galleryGenerationRef.current.cancel();
     setError("");
     setCameraMessage("");
     setLastFrame(null);
     if (!canUseLiveCamera || !navigator.mediaDevices?.getUserMedia) {
-      setCameraMessage("Live camera requires HTTPS and browser camera access. Use Scan photo as fallback.");
-      fileRef.current?.click();
+      setCameraMessage("Live camera requires HTTPS and browser camera access. Take a photo or choose an existing image instead.");
+      photoInputRef.current?.click();
       return;
     }
     closeCamera();
@@ -749,61 +767,49 @@ export default function SmartScanMobilePage() {
     }
   }
 
-  function readPhoto(file: File) {
+  async function readPhoto(file: File, captureSource: CapturedMobileScan["captureSource"]) {
     // Gallery/capture decoding owns the canvas until it completes. Invalidate
     // any in-flight live analysis first so the two paths cannot corrupt pixels.
     closeCamera();
+    const request = galleryGenerationRef.current.begin();
     setStage("ready");
     setBusy(true);
     setError("");
     setLastScore(null);
-    const im = new Image();
-    im.onload = async () => {
-      const canvas = canvasRef.current;
-      const ctx = canvas?.getContext("2d", { willReadFrequently: true });
-      if (!canvas || !ctx) {
-        setBusy(false);
-        return;
-      }
-      const decodeAt = async (maxW: number, thoroughQr: boolean) => {
-        const scale = Math.min(1, maxW / im.naturalWidth);
-        canvas.width = Math.round(im.naturalWidth * scale);
-        canvas.height = Math.round(im.naturalHeight * scale);
-        ctx.drawImage(im, 0, 0, canvas.width, canvas.height);
-        const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
-        const nativeQr = await readNativeQr(canvas);
-        const analysis = await analyzeAsync(img, nativeQr, thoroughQr);
-        return analysis.result;
-      };
-      // Small-and-cheap first: QR decoders work best at 1–2K, and most photos
-      // resolve on the first pass in well under a second. Escalate resolution
-      // and the expensive multi-pass recovery ONLY while nothing is found —
-      // the old big-first thorough ladder made every photo pay worst-case time.
-      let result = await decodeAt(1600, false);
-      for (const [maxW, thoroughQr] of [[2200, false], [2800, true], [1300, true]] as const) {
-        if (result.scan || result.status !== "searching") break;
-        result = await decodeAt(maxW, thoroughQr);
-      }
-      URL.revokeObjectURL(im.src);
-      setLastFrame(result);
+    const canvas = canvasRef.current;
+    if (!canvas) {
       setBusy(false);
-      if (!result.scan) {
-        setError(result.message);
-        return;
-      }
-      handleStableScan(result.scan);
-    };
-    im.onerror = () => {
+      setError("[IMAGE_DECODE_FAILED] The image-processing canvas is unavailable.");
+      return;
+    }
+    const ingested = await ingestGalleryImage(file, canvas, request.signal);
+    if (!galleryGenerationRef.current.isCurrent(request.generation)) return;
+    if (!ingested.ok) {
       setBusy(false);
-      setError("Could not open that photo.");
-    };
-    im.src = URL.createObjectURL(file);
+      setError(`[${ingested.code}] ${ingested.message}`);
+      return;
+    }
+    const analysisStartedAt = performance.now();
+    const analysis = await analyzeAsync(ingested.image, null, true);
+    if (import.meta.env.DEV) {
+      console.info("[scanner-analysis]", {
+        analysisDurationMs: Math.round((performance.now() - analysisStartedAt) * 100) / 100,
+      });
+    }
+    if (!galleryGenerationRef.current.isCurrent(request.generation)) return;
+    setLastFrame(analysis.result);
+    setBusy(false);
+    if (!analysis.result.scan) {
+      setError(analysis.result.message);
+      return;
+    }
+    handleStableScan(analysis.result.scan, captureSource);
   }
 
-  function onPhoto(e: React.ChangeEvent<HTMLInputElement>) {
+  function onPhoto(e: React.ChangeEvent<HTMLInputElement>, captureSource: CapturedMobileScan["captureSource"]) {
     const file = e.target.files?.[0];
     e.target.value = "";
-    if (file) readPhoto(file);
+    if (file) void readPhoto(file, captureSource);
   }
 
   function resetForNext() {
@@ -913,15 +919,19 @@ export default function SmartScanMobilePage() {
                 <Button onClick={() => void startLiveCamera()} disabled={busy || stage === "live"}>
                   {stage === "live" ? "Scanning…" : "Start live camera"}
                 </Button>
-                <Button variant="ghost" onClick={() => fileRef.current?.click()} disabled={busy}>
-                  Scan photo
+                <Button variant="ghost" onClick={() => photoInputRef.current?.click()} disabled={busy}>
+                  Take Photo
+                </Button>
+                <Button variant="ghost" onClick={() => galleryInputRef.current?.click()} disabled={busy}>
+                  Choose Existing Image
                 </Button>
                 {stage === "live" ? (
                   <Button variant="smallDanger" onClick={() => { closeCamera(); setStage("ready"); }}>
                     Stop camera
                   </Button>
                 ) : null}
-                <input ref={fileRef} type="file" accept="image/*" capture="environment" hidden onChange={onPhoto} />
+                <input ref={photoInputRef} type="file" accept="image/jpeg,image/png,.jpg,.jpeg,.png" capture="environment" hidden onChange={(event) => onPhoto(event, "manual-capture")} />
+                <input ref={galleryInputRef} type="file" accept="image/jpeg,image/png,.jpg,.jpeg,.png" hidden onChange={(event) => onPhoto(event, "gallery")} />
               </div>
               {lastFrame?.message ? (
                 <div className="mt-2 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-xs font-bold text-slate-700" role="status" aria-live="polite">
@@ -942,6 +952,7 @@ export default function SmartScanMobilePage() {
               <div className="text-sm font-extrabold">Confirm detected answers</div>
               <div className="mt-1 grid grid-cols-2 gap-1 text-[11px] text-slate-600">
                 <span>Learner: <b className="text-slate-900">{pendingScan.learnerId}</b></span>
+                <span>Source: <b className="text-slate-900">{pendingScan.captureSource}</b></span>
                 <span>Version: <b className="text-slate-900">{pendingScan.version || "—"}</b></span>
                 <span>Assessment: <b className="text-slate-900">{assessmentId || "—"}</b></span>
                 <span>Items: <b className="text-slate-900">{pendingScan.detected.length}/{pendingScan.totalItems}</b></span>

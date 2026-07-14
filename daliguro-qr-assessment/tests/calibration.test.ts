@@ -88,6 +88,7 @@ function makeResult(overrides: Partial<SheetReading> = {}, readings?: ItemReadin
     summary,
     reading,
     source: "qr",
+    captureSource: "gallery",
     confidence,
     quality: scanQuality({
       confidence,

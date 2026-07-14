@@ -6,6 +6,7 @@ import type { Item, Learner, TestVersion, VersionKey } from "../../lib/types";
 import { masteryColor } from "../../lib/scoring";
 import { CHOICES } from "../../lib/scanner/omr-template";
 import type { ItemStatus } from "../../lib/scanner/omr-detect";
+import type { CaptureProvenance } from "../../lib/scanner/still-pipeline";
 import {
   REVIEW_CONFIDENCE,
   buildReview,
@@ -37,6 +38,7 @@ export function ScanReviewPanel({
   versionKey,
   readings,
   alreadySaved,
+  captureSource,
   onSave,
   onRescan,
 }: {
@@ -47,6 +49,7 @@ export function ScanReviewPanel({
   versionKey: VersionKey;
   readings: import("../../lib/scanner/omr-detect").ItemReading[];
   alreadySaved: boolean;
+  captureSource?: CaptureProvenance;
   onSave: (
     learner: Learner,
     version: TestVersion,
@@ -84,6 +87,11 @@ export function ScanReviewPanel({
             <div className="text-sm text-slate-500">
               LRN {learner.lrn || "—"} · {assessmentTitle} · Version {version}
             </div>
+            {captureSource ? (
+              <div className="mt-1 text-xs font-bold text-slate-500">
+                Evidence source: {captureSource}
+              </div>
+            ) : null}
           </div>
           <div className="text-right">
             <div className="text-3xl font-extrabold text-indigo-700">

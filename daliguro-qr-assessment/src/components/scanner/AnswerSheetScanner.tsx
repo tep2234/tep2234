@@ -30,8 +30,16 @@ import {
   type StableCaptureExpectation,
   verifyFinalCaptureStability,
 } from "../../lib/scanner/final-capture";
+import {
+  ingestGalleryImage,
+  ScannerGeneration,
+} from "../../lib/scanner/image-ingestion";
 import { resolveScanIdentity, type ScanResolution } from "../../lib/scanner/resolve";
-import { processStillImage, type ScanResult } from "../../lib/scanner/still-pipeline";
+import {
+  processStillImage,
+  type CaptureProvenance,
+  type ScanResult,
+} from "../../lib/scanner/still-pipeline";
 import { Button } from "../ui";
 import { Chip, Recovery } from "./ScanRecovery";
 
@@ -76,7 +84,8 @@ export function AnswerSheetScanner({
   const videoRef = useRef<HTMLVideoElement>(null);
   const liveCanvasRef = useRef<HTMLCanvasElement>(null);
   const capCanvasRef = useRef<HTMLCanvasElement>(null);
-  const fileInputRef = useRef<HTMLInputElement>(null);
+  const photoInputRef = useRef<HTMLInputElement>(null);
+  const galleryInputRef = useRef<HTMLInputElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const rafRef = useRef<number | null>(null);
   const detectorRef = useRef<BarcodeDetectorLike | null>(null);
@@ -85,12 +94,14 @@ export function AnswerSheetScanner({
   const sessionRef = useRef(0);
   const lastImageRef = useRef<ImageData | null>(null);
   const lastEvidenceRef = useRef<string | null>(null);
+  const lastCaptureSourceRef = useRef<CaptureProvenance>("manual-capture");
   // Auto-capture pacing.
   const goodSinceRef = useRef<number | null>(null);
   const stabilityRef = useRef<FrameStabilityState | null>(null);
   const cooldownUntilRef = useRef(0);
   const lastAcceptedRef = useRef<{ learnerId: string; at: number } | null>(null);
   const capturingRef = useRef(false);
+  const galleryGenerationRef = useRef(new ScannerGeneration());
 
   const [phase, setPhase] = useState<Phase>("idle");
   const [camMessage, setCamMessage] = useState("");
@@ -132,8 +143,15 @@ export function AnswerSheetScanner({
   // ---------- core pipeline (used by photo AND live capture) ----------
   // Runs the pure still-image pipeline, then routes its outcome into UI state.
   const runStill = useCallback(
-    (img: ImageData) => {
-      const out = processStillImage(img, state, activeId, lastEvidenceRef.current);
+    (img: ImageData, captureSource: CaptureProvenance, evidence = lastEvidenceRef.current) => {
+      lastCaptureSourceRef.current = captureSource;
+      const analysisStartedAt = performance.now();
+      const out = processStillImage(img, state, activeId, evidence, captureSource);
+      if (import.meta.env.DEV) {
+        console.info("[scanner-analysis]", {
+          analysisDurationMs: Math.round((performance.now() - analysisStartedAt) * 100) / 100,
+        });
+      }
       cooldownUntilRef.current = Date.now() + COOLDOWN_MS;
       if (out.kind === "ready") {
         setImageMsg("");
@@ -210,34 +228,37 @@ export function AnswerSheetScanner({
         }
       }
       lastImageRef.current = img;
-      runStill(img);
+      runStill(img, expected ? "camera-final" : "manual-capture");
       return true;
     } finally {
       capturingRef.current = false;
     }
   }, [grabImageData, runStill]);
 
-  const onPhoto = useCallback(
-    (e: React.ChangeEvent<HTMLInputElement>) => {
+  const onImageFile = useCallback(
+    async (e: React.ChangeEvent<HTMLInputElement>, captureSource: CaptureProvenance) => {
       const file = e.target.files?.[0];
       e.target.value = "";
       if (!file) return;
+      stop();
+      const request = galleryGenerationRef.current.begin();
       setImageMsg("Reading photo…");
-      const im = new Image();
-      im.onload = () => {
-        const data = grabImageData(im, im.naturalWidth, im.naturalHeight);
-        URL.revokeObjectURL(im.src);
-        if (!data) {
-          setImageMsg("Could not read that image.");
-          return;
-        }
-        lastImageRef.current = data;
-        runStill(data);
-      };
-      im.onerror = () => setImageMsg("Could not open that photo. Try another.");
-      im.src = URL.createObjectURL(file);
+      const canvas = capCanvasRef.current;
+      if (!canvas) {
+        setImageMsg("[IMAGE_DECODE_FAILED] The image-processing canvas is unavailable.");
+        return;
+      }
+      const ingested = await ingestGalleryImage(file, canvas, request.signal);
+      if (!galleryGenerationRef.current.isCurrent(request.generation)) return;
+      if (!ingested.ok) {
+        setImageMsg(`[${ingested.code}] ${ingested.message}`);
+        return;
+      }
+      lastEvidenceRef.current = ingested.evidence;
+      lastImageRef.current = ingested.image;
+      runStill(ingested.image, captureSource, ingested.evidence);
     },
-    [grabImageData, runStill],
+    [runStill, stop],
   );
 
   // ---------- live preview loop (status chips + auto-capture) ----------
@@ -374,6 +395,7 @@ export function AnswerSheetScanner({
   }, [loop]);
 
   const start = useCallback(async () => {
+    galleryGenerationRef.current.cancel();
     const session = (sessionRef.current += 1);
     const alive = () => mountedRef.current && session === sessionRef.current;
     setCamMessage("");
@@ -450,9 +472,11 @@ export function AnswerSheetScanner({
   }, [release]);
 
   useEffect(() => {
+    const galleryGeneration = galleryGenerationRef.current;
     mountedRef.current = true;
     return () => {
       mountedRef.current = false;
+      galleryGeneration.cancel();
       sessionRef.current += 1;
       release();
     };
@@ -474,7 +498,8 @@ export function AnswerSheetScanner({
           <span className="rounded-full bg-slate-100 px-2 py-0.5 text-xs text-slate-500">jsQR fallback</span>
         ) : null}
         <div className="ml-auto flex flex-wrap gap-2">
-          <Button onClick={() => fileInputRef.current?.click()}>📷 Scan with camera</Button>
+          <Button onClick={() => photoInputRef.current?.click()}>📷 Take Photo</Button>
+          <Button variant="small" onClick={() => galleryInputRef.current?.click()}>🖼️ Choose Existing Image</Button>
           {live ? (
             <>
               <Button variant="small" onClick={() => { void capture(); }}>📸 Capture now</Button>
@@ -486,11 +511,12 @@ export function AnswerSheetScanner({
             </Button>
           )}
         </div>
-        <input ref={fileInputRef} type="file" accept="image/*" capture="environment" hidden onChange={onPhoto} />
+        <input ref={photoInputRef} type="file" accept="image/jpeg,image/png,.jpg,.jpeg,.png" capture="environment" hidden onChange={(event) => void onImageFile(event, "manual-capture")} />
+        <input ref={galleryInputRef} type="file" accept="image/jpeg,image/png,.jpg,.jpeg,.png" hidden onChange={(event) => void onImageFile(event, "gallery")} />
       </div>
 
       <p className="mt-2 text-xs text-slate-500">
-        <b>📷 Scan with camera</b> photographs one sheet. <b>Live camera</b> auto-captures
+        <b>📷 Take Photo</b> photographs one sheet. <b>🖼️ Choose Existing Image</b> securely scans a saved JPEG or PNG. <b>Live camera</b> auto-captures
         each sheet after ~1 second of steady framing — all four black corners + QR visible,
         flat and well-lit — so you can go through a pile paper after paper.
       </p>
@@ -523,10 +549,10 @@ export function AnswerSheetScanner({
         {!live ? (
           <div className="absolute inset-0 flex items-center justify-center px-4 text-center text-sm text-slate-300">
             {phase === "error"
-              ? "⚠ Live camera unavailable — use 📷 Scan with camera."
+              ? "⚠ Live camera unavailable — take a photo or choose an existing image."
               : phase === "requesting"
                 ? "Waiting for permission… choose Allow."
-                : "Use 📷 Scan with camera, or start the live camera for hands-free batch scanning."}
+                : "Take a photo, choose an existing image, or start the live camera for hands-free batch scanning."}
           </div>
         ) : null}
       </div>
@@ -559,7 +585,7 @@ export function AnswerSheetScanner({
             onSetActive(id);
             const img = lastImageRef.current;
             setRecovery(null);
-            if (img) runStill(img);
+            if (img) runStill(img, lastCaptureSourceRef.current);
           }}
           onDismiss={() => setRecovery(null)}
         />

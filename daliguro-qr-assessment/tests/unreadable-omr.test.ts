@@ -191,6 +191,7 @@ function localUnreadableScan(): ScanResult {
       obscuredBubbleCount: 1,
     },
     source: "qr",
+    captureSource: "gallery",
     confidence: 0.1,
     quality: scanQuality({
       confidence: 0.1,

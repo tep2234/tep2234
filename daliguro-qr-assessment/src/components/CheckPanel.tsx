@@ -539,6 +539,7 @@ function CheckEditor({
                 (state.answerKeys[scanResult.assessment.id] ?? {})[scanResult.version] ?? {}
               }
               readings={scanResult.reading.items}
+              captureSource={scanResult.captureSource}
               alreadySaved={Boolean(
                 findResult(
                   state.results,

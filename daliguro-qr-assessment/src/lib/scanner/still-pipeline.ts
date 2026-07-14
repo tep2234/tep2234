@@ -17,6 +17,8 @@ import {
   type CaptureQualityReasonCode,
 } from "./quality-gates";
 
+export type CaptureProvenance = "gallery" | "camera-final" | "manual-capture";
+
 export interface ScanResult {
   assessment: Assessment;
   learner: Learner;
@@ -24,6 +26,7 @@ export interface ScanResult {
   summary: ReviewSummary;
   reading: SheetReading;
   source: "qr" | "manual";
+  captureSource: CaptureProvenance;
   // Overall trust score for the scan (mean per-item confidence, 0..1).
   confidence: number;
   quality: ScanQuality;
@@ -81,6 +84,7 @@ export function processStillImage(
   state: QrAssessmentState,
   activeId: string | null,
   evidence: string | null,
+  captureSource: CaptureProvenance = "gallery",
 ): StillOutcome {
   const qr = readQrSmart(img, true);
   if (!qr) {
@@ -189,6 +193,7 @@ export function processStillImage(
       summary,
       reading,
       source: "qr",
+      captureSource,
       confidence,
       quality,
       evidence,
