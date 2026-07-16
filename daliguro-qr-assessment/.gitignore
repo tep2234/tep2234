@@ -25,3 +25,6 @@ playwright-report
 *.sln
 *.sw?
 .vercel
+
+# Local dev TLS certificates (mkcert) — never commit private keys
+certs/
