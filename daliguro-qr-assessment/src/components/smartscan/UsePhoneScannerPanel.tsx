@@ -6,7 +6,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import QRCode from "qrcode";
 import { isSupabaseConfigured } from "../../lib/supabase/client";
-import { sendMagicLink, signOut, useSupabaseAuth } from "../../lib/auth/supabaseAuth";
+import { useSupabaseAuth } from "../../lib/auth/supabaseAuth";
 import { buildPairingUrl, checkedRowFromScan, isLoopbackOrigin, normalizePairingOrigin, scoredCheckedRow, secondsLeft, validateScanBroadcast } from "../../lib/sync/pairing";
 import {
   commitCheckedResult,
@@ -15,6 +15,7 @@ import {
   endSession,
   fetchCheckedResults,
   fetchPhoneSubmissions,
+  pairingSessionErrorMessage,
   type SessionRow,
 } from "../../lib/sync/smartscanSync";
 import type { CheckedResultRow, ScanBroadcast, ScoredSummary } from "../../lib/sync/pairing";
@@ -62,9 +63,6 @@ export function UsePhoneScannerPanel({
   const [feed, setFeed] = useState<FeedItem[]>([]);
   const [nowMs, setNowMs] = useState(() => Date.now());
   const [creating, setCreating] = useState(false);
-  const [email, setEmail] = useState("");
-  const [authMessage, setAuthMessage] = useState("");
-  const [sendingLink, setSendingLink] = useState(false);
   const [phoneOriginInput, setPhoneOriginInput] = useState(() => {
     try {
       return localStorage.getItem(PHONE_ORIGIN_KEY) ?? "";
@@ -301,7 +299,7 @@ export function UsePhoneScannerPanel({
 
   const start = useCallback(async () => {
     if (!auth.teacherUserId) {
-      setAuthErr("Teacher sign-in is required before phone scanning so every accepted scan receives a durable server receipt.");
+      setAuthErr(auth.error ?? "Direct pairing is still being prepared. Retry in a moment.");
       return;
     }
     if (!pairingOriginValid) {
@@ -318,13 +316,16 @@ export function UsePhoneScannerPanel({
         allowedVersions,
         itemCount,
       });
-    } catch {
-      setAuthErr("Could not create a session. Check your connection and try again.");
+    } catch (error) {
+      setAuthErr(pairingSessionErrorMessage(error));
       return;
     } finally {
       setCreating(false);
     }
-    if (!created) { setAuthErr("Could not create a session. Check your connection."); return; }
+    if (!created) {
+      setAuthErr("Phone pairing is not configured in this build.");
+      return;
+    }
     try {
       if (savedPhoneOrigin && !savedPhoneOriginIsLoopback) localStorage.setItem(PHONE_ORIGIN_KEY, savedPhoneOrigin);
       if (savedPhoneOriginIsLoopback) localStorage.removeItem(PHONE_ORIGIN_KEY);
@@ -334,12 +335,12 @@ export function UsePhoneScannerPanel({
     const url = buildPairingUrl(pairingOrigin, created.sessionId, created.token);
     setSession({ id: created.sessionId, url, expiresAtMs: created.expiresAtMs });
     setPhone("active");
-  }, [allowedVersions, assessmentId, auth.teacherUserId, itemCount, learnerIds, pairingOrigin, pairingOriginValid, savedPhoneOrigin, savedPhoneOriginIsLoopback]);
+  }, [allowedVersions, assessmentId, auth.error, auth.teacherUserId, itemCount, learnerIds, pairingOrigin, pairingOriginValid, savedPhoneOrigin, savedPhoneOriginIsLoopback]);
 
   // Auto-generate the pairing QR as soon as auth has settled, so it's visible
-  // immediately (no extra click). Signed-out teachers get local PC pairing;
-  // signed-in teachers additionally get cloud persistence. Runs once per mount; ending the
-  // session leaves it ended until the teacher regenerates it.
+  // immediately (no extra click). A browser-scoped anonymous auth session gives
+  // direct users the same RLS isolation and durable receipts without email.
+  // Runs once per mount; ending the session leaves it ended until regenerated.
   const autoStartedRef = useRef(false);
   useEffect(() => {
     if (!configured || auth.loading || !auth.teacherUserId || session || creating || autoStartedRef.current || !pairingOriginValid) return;
@@ -355,23 +356,6 @@ export function UsePhoneScannerPanel({
     setPhoneName("");
   }, [session]);
 
-  const requestSignIn = useCallback(async () => {
-    if (sendingLink) return;
-    setSendingLink(true);
-    setAuthMessage("");
-    try {
-      const redirectTo = `${window.location.origin}${window.location.pathname}`;
-      const result = await sendMagicLink(email, redirectTo);
-      setAuthMessage(
-        result.ok
-          ? "Sign-in link sent. Open it on this computer, then return to SmartScan."
-          : result.error ?? "Could not send the sign-in link.",
-      );
-    } finally {
-      setSendingLink(false);
-    }
-  }, [email, sendingLink]);
-
   if (!configured) {
     return (
       <div className="mt-4 rounded-xl border border-slate-200 bg-slate-50 p-4 text-sm text-slate-600">
@@ -382,7 +366,7 @@ export function UsePhoneScannerPanel({
     );
   }
 
-  if (auth.loading) return <div className="mt-4 text-sm text-slate-500">Checking sign-in…</div>;
+  if (auth.loading) return <div className="mt-4 text-sm text-slate-500">Preparing secure direct pairing…</div>;
 
   const expired = session && left <= 0;
   const mm = Math.floor(left / 60), ss = String(left % 60).padStart(2, "0");
@@ -402,17 +386,11 @@ export function UsePhoneScannerPanel({
         <div className="text-sm font-bold">📱 Use Phone as Scanner</div>
         <div className="flex items-center gap-2 text-xs text-slate-500">
           {auth.teacherUserId ? (
-            <>
-              <span>{auth.email}</span>
-              <button
-                className="font-bold text-indigo-700"
-                onClick={() => void (async () => { await stop(); await signOut(); })()}
-              >
-                sign out
-              </button>
-            </>
+            <span className="rounded-full bg-emerald-50 px-2 py-1 font-bold text-emerald-800">
+              {auth.isAnonymous ? "Direct pairing active" : auth.email ?? "Secure pairing active"}
+            </span>
           ) : (
-            <span className="rounded-full bg-amber-50 px-2 py-1 font-bold text-amber-800">Teacher sign-in required</span>
+            <span className="rounded-full bg-red-50 px-2 py-1 font-bold text-red-700">Direct pairing unavailable</span>
           )}
         </div>
       </div>
@@ -420,28 +398,12 @@ export function UsePhoneScannerPanel({
       {!session ? (
         <div className="mt-3">
           {!auth.teacherUserId ? (
-            <div className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs text-amber-950">
-              <div className="font-extrabold">Sign in on this computer for durable scan receipts</div>
+            <div className="rounded-lg border border-red-200 bg-red-50 p-3 text-xs text-red-950">
+              <div className="font-extrabold">Could not prepare direct phone pairing</div>
               <p className="mt-1">
-                The phone remains a camera companion and does not sign in. The authenticated PC validates, scores,
-                and stores each capture as a non-official submission before the phone removes it from its queue.
+                {auth.error ?? "Check the connection, then reload this page to retry."}
               </p>
-              <form
-                className="mt-2 flex flex-col gap-2 sm:flex-row"
-                onSubmit={(event) => { event.preventDefault(); void requestSignIn(); }}
-              >
-                <input
-                  type="email"
-                  required
-                  value={email}
-                  onChange={(event) => setEmail(event.target.value)}
-                  placeholder="Teacher email"
-                  autoComplete="email"
-                  className="min-w-0 flex-1 rounded-lg border border-amber-200 bg-white px-3 py-2 text-sm text-slate-900"
-                />
-                <Button disabled={sendingLink}>{sendingLink ? "Sending…" : "Send sign-in link"}</Button>
-              </form>
-              {authMessage ? <div className="mt-2 font-semibold" role="status">{authMessage}</div> : null}
+              <Button className="mt-2" onClick={() => window.location.reload()}>Retry direct pairing</Button>
             </div>
           ) : (
             <>

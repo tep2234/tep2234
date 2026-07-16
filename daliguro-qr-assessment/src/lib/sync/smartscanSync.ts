@@ -41,6 +41,34 @@ export interface CreatedSession {
   expiresAtMs: number;
 }
 
+export class PairingSessionError extends Error {
+  readonly code: string;
+
+  constructor(code: string, message: string) {
+    super(message);
+    this.name = "PairingSessionError";
+    this.code = code;
+  }
+}
+
+export function pairingSessionErrorMessage(error: unknown): string {
+  if (error instanceof PairingSessionError) {
+    if (error.code === "PGRST202" || error.code === "42883") {
+      return "Phone pairing is not installed on this Supabase project yet. Apply the reviewed SmartScan realtime migration, then retry.";
+    }
+    if (error.code === "28000" || error.code === "PGRST302") {
+      return "Direct pairing could not obtain a secure browser identity. Enable Anonymous Sign-Ins in Supabase Auth, then reload.";
+    }
+    if (error.code === "42501") {
+      return "This browser is not authorized to create a phone pairing session. Reload to renew direct pairing, then retry.";
+    }
+  }
+  if (error instanceof Error && error.message.includes("Web Crypto unavailable")) {
+    return "Pairing needs a secure page (HTTPS or localhost). Open the teacher app at http://localhost:5173 on this computer, or restart with `npm run dev:https` and use the https:// address on both devices.";
+  }
+  return "Could not reach the phone pairing service. Check the connection and retry.";
+}
+
 // PC creates a pairing session. Only the token HASH is stored; the raw token is
 // returned to the caller to embed in the QR/URL.
 export async function createPairingSession(args: {
@@ -61,7 +89,12 @@ export async function createPairingSession(args: {
     p_item_count: args.itemCount,
   });
   const record = Array.isArray(data) ? data[0] : data;
-  if (error || !record || typeof record.session_id !== "string" || typeof record.expires_at !== "string") return null;
+  if (error) {
+    throw new PairingSessionError(error.code ?? "unknown", error.message);
+  }
+  if (!record || typeof record.session_id !== "string" || typeof record.expires_at !== "string") {
+    throw new PairingSessionError("invalid_response", "Pairing service returned an invalid response.");
+  }
   return {
     sessionId: record.session_id,
     token,
