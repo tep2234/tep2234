@@ -111,6 +111,7 @@ export default function SmartScanMobilePage() {
   const pairingTokenRef = useRef(
     typeof window === "undefined" ? "" : new URLSearchParams(window.location.search).get("t") ?? "",
   );
+  const claimRef = useRef<ReturnType<typeof claimSession> | null>(null);
   const [capability, setCapability] = useState<PhoneCapability | null>(() => {
     if (typeof window === "undefined" || !sessionId) return null;
     return loadPhoneCapability(window.sessionStorage, sessionId);
@@ -195,7 +196,10 @@ export default function SmartScanMobilePage() {
 
   // Consume the QR secret once. A short-lived scoped capability is kept only in
   // sessionStorage so a same-tab reconnect can recover; the pairing token is
-  // immediately removed from the address bar and is never persisted.
+  // immediately removed from the address bar and is never persisted. The claim
+  // promise lives in a ref because the token is single-use: if the effect
+  // re-runs (StrictMode double-invoke, remount), the rerun must adopt the
+  // in-flight claim rather than find the consumed token and report it missing.
   useEffect(() => {
     if (!configured || !sessionId) return;
     if (capability) {
@@ -203,15 +207,18 @@ export default function SmartScanMobilePage() {
       return;
     }
     const pairingToken = pairingTokenRef.current;
-    if (!pairingToken) {
+    if (!pairingToken && !claimRef.current) {
       setPairingPending(false);
       setError("This pairing credential is missing or expired. Generate a new QR on the teacher PC.");
       return;
     }
-    pairingTokenRef.current = "";
-    stripPairingSecretFromUrl(window.location, window.history);
+    if (!claimRef.current) {
+      pairingTokenRef.current = "";
+      stripPairingSecretFromUrl(window.location, window.history);
+      claimRef.current = claimSession(sessionId, pairingToken, navigator.userAgent.slice(0, 160));
+    }
     let active = true;
-    void claimSession(sessionId, pairingToken, navigator.userAgent.slice(0, 160)).then((result) => {
+    void claimRef.current.then((result) => {
       if (!active) return;
       setPairingPending(false);
       if (!result.ok) {
@@ -292,11 +299,15 @@ export default function SmartScanMobilePage() {
     };
   }, [closeCamera]);
 
-  const grabFrame = useCallback((maximumWidth = FRAME_W): ImageData | null => {
+  const grabFrame = useCallback((maximumMinorSide = FRAME_W): ImageData | null => {
     const video = videoRef.current;
     const canvas = canvasRef.current;
     if (!video || !canvas || video.readyState < 2 || !video.videoWidth || !video.videoHeight) return null;
-    const scale = Math.min(1, maximumWidth / video.videoWidth);
+    // Cap the SMALLER side of the frame. Phones deliver landscape or portrait
+    // buffers depending on device and orientation; capping the width alone
+    // crushes a landscape frame's portrait sheet (and its QR) below what jsQR
+    // can decode, which presents as "Find the sheet QR" forever.
+    const scale = Math.min(1, maximumMinorSide / Math.min(video.videoWidth, video.videoHeight));
     canvas.width = Math.round(video.videoWidth * scale);
     canvas.height = Math.round(video.videoHeight * scale);
     const ctx = canvas.getContext("2d", { willReadFrequently: true });
@@ -741,8 +752,10 @@ export default function SmartScanMobilePage() {
         .getUserMedia({
           video: {
             facingMode: { ideal: "environment" },
-            width: { ideal: 1920 },
-            height: { ideal: 1080 },
+            // Ask generously: the sheet QR needs pixels. Capable cameras give
+            // 1440p+; anything else settles on its best supported mode.
+            width: { ideal: 2560 },
+            height: { ideal: 1440 },
           },
           audio: false,
         })
