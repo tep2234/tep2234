@@ -1,6 +1,14 @@
 <!doctype html>
 <html lang="en">
   <head>
+    <!-- React Fast Refresh preamble + app entry in ONE module script.
+         plugin-react does not auto-inject the preamble under this Vite
+         version, and a separate entry <script> races the preamble's
+         top-level await (HTML module scripts don't wait on an earlier
+         script's TLA), which intermittently threw "$RefreshReg$ is not
+         defined" and rendered a blank page in dev. Chaining the entry
+         import after the preamble in the same module makes the order
+         deterministic; the DEV branch compiles away in production. -->
     <script type="module">
       if (import.meta.env.DEV) {
         const { injectIntoGlobalHook } = await import("/@react-refresh");
@@ -8,6 +16,7 @@
         window.$RefreshReg$ = () => {};
         window.$RefreshSig$ = () => (type) => type;
       }
+      await import("/src/main.tsx");
     </script>
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
@@ -24,6 +33,5 @@
   </head>
   <body>
     <div id="root"></div>
-    <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>
