@@ -15,13 +15,9 @@ body {
    chrome (header/nav/controls), so stray UI doesn't land on the paper or
    confuse the scanner's corner-marker detection.
 
-   A4 fit contract: one answer sheet MUST print on exactly one A4 page at 100%
-   scale. The sheet SVG is aspect-locked to the A4 ratio (1000:1414 ≈ 1:1.414),
-   so we constrain its printed WIDTH to the safe content area (194mm); its
-   height then resolves to ~274mm, inside the 281mm safe height (A4 297mm minus
-   two 8mm margins). The trailing `page-break-after` is cleared on the LAST
-   sheet — a forced break after the final sheet is the classic cause of an
-   accidental blank second page in Safari. */
+   Default reports remain A4 portrait. SheetsPanel injects a route-local print
+   @page override for A4 landscape, then groups two independent portrait OMR
+   sheets on each physical page. */
 @page {
   size: A4 portrait;
   margin: 8mm;
@@ -61,7 +57,8 @@ body {
   .no-print {
     display: none !important;
   }
-  /* One answer sheet == one A4 page. */
+  /* Default single-sheet/report fallback. The paired sheet rules below are
+     more specific and take over on the QR Sheets route. */
   .sheet {
     width: 194mm !important;
     max-width: 194mm !important;
@@ -70,20 +67,56 @@ body {
     overflow: hidden;
     box-shadow: none !important;
     border: none !important;
-    page-break-after: always;
-    break-after: page;
     page-break-inside: avoid;
     break-inside: avoid;
-  }
-  /* No forced break after the final sheet -> no accidental blank page. */
-  .sheet:last-child {
-    page-break-after: auto;
-    break-after: auto;
   }
   .sheet > svg {
     display: block;
     width: 100%;
     height: auto;
     max-height: 281mm;
+  }
+
+  /* A4 landscape content area at 8mm margins is 281mm × 194mm. Two 137mm
+     portrait sheets retain the canonical 1000:1414 scanner geometry and leave
+     a 7mm center gutter for a safe cut/fold guide. */
+  .sheet-print-area {
+    width: 281mm !important;
+  }
+  .sheet-pair {
+    position: relative !important;
+    display: grid !important;
+    grid-template-columns: 137mm 137mm !important;
+    column-gap: 7mm !important;
+    width: 281mm !important;
+    height: 194mm !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    page-break-after: always;
+    break-after: page;
+    page-break-inside: avoid;
+    break-inside: avoid;
+  }
+  .sheet-pair:last-child {
+    page-break-after: auto;
+    break-after: auto;
+  }
+  .sheet-pair .sheet {
+    width: 137mm !important;
+    max-width: 137mm !important;
+    height: 194mm !important;
+    margin: 0 !important;
+  }
+  .sheet-pair .sheet > svg {
+    width: 137mm !important;
+    height: auto !important;
+    max-height: 194mm !important;
+  }
+  .sheet-pair-divider {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 140.5mm;
+    border-left: 0.35mm dashed #64748b;
   }
 }

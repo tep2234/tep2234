@@ -164,6 +164,10 @@ function SheetGenerator({
   }
 
   const chosen = filtered.filter((l) => selected.includes(l.id));
+  const printPairs: Learner[][] = [];
+  for (let index = 0; index < chosen.length; index += 2) {
+    printPairs.push(chosen.slice(index, index + 2));
+  }
 
   function printSheets() {
     if (chosen.length === 0) {
@@ -187,7 +191,7 @@ function SheetGenerator({
         <div className="text-right">
           <Button onClick={printSheets}>🖨 Print Selected ({chosen.length})</Button>
           <p className="mt-1 text-xs text-slate-400">
-            Each sheet fits one A4 page at 100%. In the print dialog: A4 · Portrait ·
+            Two learner sheets per A4 landscape page. In the print dialog: A4 · Landscape ·
             Scale 100% · Headers/footers off (or “Save as PDF”).
           </p>
         </div>
@@ -309,18 +313,25 @@ function SheetGenerator({
       </div>
 
       {/* Printable sheets */}
-      <div className="print-area mt-4">
+      <style media="print">{"@page { size: A4 landscape; margin: 8mm; }"}</style>
+      <div className="print-area sheet-print-area mt-4">
         {chosen.length === 0 ? (
           <Empty text="Select learners above to preview their answer sheets." />
         ) : (
-          chosen.map((l) => (
-            <AnswerSheet
-              key={l.id}
-              assessment={active}
-              learner={l}
-              items={items}
-              version={activeVersion}
-            />
+          printPairs.map((pair) => (
+            <div className="sheet-pair relative mb-6 grid gap-4 lg:grid-cols-2" key={pair[0].id}>
+              {pair.map((learner) => (
+                <AnswerSheet
+                  key={learner.id}
+                  assessment={active}
+                  learner={learner}
+                  items={items}
+                  version={activeVersion}
+                />
+              ))}
+              {pair.length === 1 ? <div className="sheet-pair-spacer" aria-hidden="true" /> : null}
+              <div className="sheet-pair-divider" aria-hidden="true" />
+            </div>
           ))
         )}
       </div>
