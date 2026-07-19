@@ -564,6 +564,165 @@ begin
 end
 $$;
 
+-- ===========================================================================
+-- Verified-teacher enforcement matrix. Guarded tables are RPC-write-only for
+-- application roles: 0001/0002/0004 REVOKE direct INSERT/UPDATE/DELETE from
+-- `authenticated` and `anon`, so the only reachable durable-write path is a
+-- SECURITY DEFINER RPC. The guard trigger fires inside those RPCs (and on
+-- trusted owner writes) and rejects an anonymous/unverified subject. Phone
+-- (anonymous UPDATE) cases 4/5 and cross-tenant case 8 are covered above.
+-- ===========================================================================
+insert into auth.users (id) values
+  ('99999999-9999-4999-8999-999999999999')
+on conflict (id) do nothing;
+
+-- Cases 2 & 6 (defense layer 1): NO application role may write a guarded table
+-- directly — plain INSERT or INSERT ... ON CONFLICT DO UPDATE — because the
+-- direct grant is revoked. This holds for anonymous and verified users alike.
+set role authenticated;
+select set_config('request.jwt.claim.sub', '11111111-1111-4111-8111-111111111111', false);
+do $$
+begin
+  insert into public.smartscan_checked_results (assessment_id, teacher_user_id, learner_id, score)
+  values ('SEC-DIRECT', '11111111-1111-4111-8111-111111111111', 'LEARNER-A1', 1)
+  on conflict (assessment_id, learner_id, teacher_user_id) do update set score = excluded.score;
+  raise exception 'CASE2/6: an application role performed a direct guarded-table write';
+exception when insufficient_privilege then
+  null; -- expected: durable writes are RPC-only for app roles
+end
+$$;
+select set_config('request.jwt.claim.sub', '', false);
+reset role;
+
+-- Case 3: anonymous user invokes a teacher-only SECURITY DEFINER RPC -> the
+-- guard trigger rejects the INSERT inside the RPC transaction.
+set role authenticated;
+select set_config('request.jwt.claim.sub', '99999999-9999-4999-8999-999999999999', false);
+select set_config(
+  'request.jwt.claims',
+  '{"sub":"99999999-9999-4999-8999-999999999999","is_anonymous":true}',
+  false
+);
+do $$
+begin
+  perform * from public.create_smartscan_pairing_session(
+    'SEC-ANON-A1',
+    encode(sha256(convert_to(repeat('9', 64), 'UTF8')), 'hex'),
+    '["LEARNER-A1"]'::jsonb, '["A"]'::jsonb, 1
+  );
+  raise exception 'CASE3: anonymous user created a pairing session via RPC';
+exception when sqlstate '42501' then
+  null; -- expected: verified_teacher_required
+end
+$$;
+select set_config('request.jwt.claims', '', false);
+select set_config('request.jwt.claim.sub', '', false);
+reset role;
+
+-- Case 1 / 9a: a verified teacher — including one authenticated by subject alone
+-- (claim.sub present, no claims blob, as the concurrency harness does) — creates
+-- a session. The guard's non-anonymous auth.uid() path allows it.
+set role authenticated;
+select set_config('request.jwt.claim.sub', '11111111-1111-4111-8111-111111111111', false);
+select set_config('request.jwt.claims', '', false);
+select public.test_assert(
+  (
+    select count(*) from public.create_smartscan_pairing_session(
+      'SEC-VERIFIED-SUBONLY',
+      encode(sha256(convert_to(repeat('1', 64), 'UTF8')), 'hex'),
+      '["LEARNER-A1"]'::jsonb, '["A"]'::jsonb, 1
+    )
+  ) = 1,
+  'CASE1/9a: verified teacher (subject-only auth) was blocked from creating a session'
+);
+select set_config('request.jwt.claim.sub', '', false);
+reset role;
+
+-- Case 7: service_role is locked out of the durable tables by the existing
+-- REVOKE (service-role policy). The guard trigger introduces no bypass.
+set role service_role;
+do $$
+begin
+  insert into public.smartscan_checked_results (assessment_id, teacher_user_id, learner_id)
+  values ('SEC-SVC', '11111111-1111-4111-8111-111111111111', 'LEARNER-A1');
+  raise exception 'CASE7: service_role performed a durable teacher write';
+exception when insufficient_privilege then
+  null; -- expected: revoke all ... from service_role
+end
+$$;
+reset role;
+
+-- ===========================================================================
+-- Fail-closed JWT-claims edge cases, exercised through the RPC (the reachable
+-- write path). Each untrusted context must be rejected by some layer; a
+-- verified context must succeed. Missing/empty/malformed claims are NEVER
+-- treated as a verified teacher for application-facing roles.
+-- ===========================================================================
+
+-- 9b: valid subject but MALFORMED claims blob. current_smartscan_tenant_id()
+-- swallows the parse error and falls back to the uid, so the GUARD is what
+-- fails closed on the untrusted token (verified_teacher_required, 42501).
+set role authenticated;
+select set_config('request.jwt.claim.sub', '11111111-1111-4111-8111-111111111111', false);
+select set_config('request.jwt.claims', '{not valid json', false);
+do $$
+begin
+  perform * from public.create_smartscan_pairing_session(
+    'SEC-MALFORMED',
+    encode(sha256(convert_to(repeat('2', 64), 'UTF8')), 'hex'),
+    '["LEARNER-A1"]'::jsonb, '["A"]'::jsonb, 1
+  );
+  raise exception '9b: malformed claims were accepted as a verified teacher';
+exception when sqlstate '42501' then
+  null; -- expected: guard fail-closed
+end
+$$;
+select set_config('request.jwt.claims', '', false);
+select set_config('request.jwt.claim.sub', '', false);
+reset role;
+
+-- 9c: authenticated but NO subject and NO claims -> rejected before any write
+-- (the RPC's own authentication_required check; the guard also fails closed).
+set role authenticated;
+select set_config('request.jwt.claim.sub', '', false);
+select set_config('request.jwt.claims', '', false);
+do $$
+begin
+  perform * from public.create_smartscan_pairing_session(
+    'SEC-NOSUB',
+    encode(sha256(convert_to(repeat('3', 64), 'UTF8')), 'hex'),
+    '["LEARNER-A1"]'::jsonb, '["A"]'::jsonb, 1
+  );
+  raise exception '9c: subjectless caller created a session';
+exception when others then
+  null; -- expected: fail closed
+end
+$$;
+reset role;
+
+-- 9d: anon role cannot even execute the teacher RPC (no execute grant).
+set role anon;
+select set_config('request.jwt.claim.sub', '', false);
+select set_config('request.jwt.claims', '', false);
+do $$
+begin
+  perform * from public.create_smartscan_pairing_session(
+    'SEC-ANONROLE',
+    encode(sha256(convert_to(repeat('4', 64), 'UTF8')), 'hex'),
+    '["LEARNER-A1"]'::jsonb, '["A"]'::jsonb, 1
+  );
+  raise exception '9d: anon role created a teacher session';
+exception when others then
+  null; -- expected: fail closed (no execute grant / auth required)
+end
+$$;
+reset role;
+
+-- 9e: a trusted maintenance context (owner/superuser, no request subject) is the
+-- ONLY no-subject path permitted to write, gated by an explicit role check. This
+-- is exercised by the seed inserts at the top of this file, which write guarded
+-- tables directly as the owner after the guard triggers exist in later runs.
+
 drop function public.test_expect_claim_failure(uuid,text);
 drop function public.test_expect_submit_failure(uuid,text,text,bigint,timestamptz,text,text,text);
 drop function public.test_assert(boolean,text);

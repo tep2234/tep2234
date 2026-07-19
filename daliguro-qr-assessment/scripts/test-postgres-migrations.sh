@@ -31,6 +31,7 @@ docker cp "$repo_root/supabase/migrations/0001_smartscan_sync.sql" "$container:/
 docker cp "$repo_root/supabase/migrations/0002_phase1_scan_integrity.sql" "$container:/tmp/0002.sql"
 docker cp "$repo_root/supabase/migrations/0003_unreadable_review_audit.sql" "$container:/tmp/0003.sql"
 docker cp "$repo_root/supabase/migrations/20260713123518_smartscan_realtime_security.sql" "$container:/tmp/0004.sql"
+docker cp "$repo_root/supabase/migrations/20260719000000_smartscan_verified_teacher_guard.sql" "$container:/tmp/0005.sql"
 docker cp "$repo_root/supabase/tests/unreadable_contract.sql" "$container:/tmp/unreadable_contract.sql"
 docker cp "$repo_root/supabase/tests/realtime_security_contract.sql" "$container:/tmp/realtime_security_contract.sql"
 docker cp "$repo_root/supabase/tests/realtime_concurrency_fixture.sql" "$container:/tmp/realtime_concurrency_fixture.sql"
@@ -40,7 +41,7 @@ docker cp "$repo_root/supabase/tests/realtime_rollback_rehearsal.sql" "$containe
 docker cp "$repo_root/supabase/tests/concurrency_fixture.sql" "$container:/tmp/concurrency_fixture.sql"
 docker cp "$repo_root/supabase/tests/retry_lifecycle_contract.sql" "$container:/tmp/retry_lifecycle_contract.sql"
 
-for sql in /tmp/0000_bootstrap.sql /tmp/0001.sql /tmp/0002.sql /tmp/0003.sql /tmp/0004.sql /tmp/realtime_security_contract.sql /tmp/unreadable_contract.sql /tmp/concurrency_fixture.sql /tmp/realtime_concurrency_fixture.sql; do
+for sql in /tmp/0000_bootstrap.sql /tmp/0001.sql /tmp/0002.sql /tmp/0003.sql /tmp/0004.sql /tmp/0005.sql /tmp/realtime_security_contract.sql /tmp/unreadable_contract.sql /tmp/concurrency_fixture.sql /tmp/realtime_concurrency_fixture.sql; do
   docker exec "$container" psql -v ON_ERROR_STOP=1 -U postgres -d postgres -f "$sql"
 done
 
@@ -50,6 +51,7 @@ for sql in /tmp/0000_bootstrap.sql /tmp/0001.sql /tmp/0002.sql /tmp/0003.sql /tm
   docker exec "$container" psql -v ON_ERROR_STOP=1 -U postgres -d smartscan_upgrade -f "$sql"
 done
 docker exec "$container" psql -v ON_ERROR_STOP=1 --single-transaction -U postgres -d smartscan_upgrade -f /tmp/0004.sql
+docker exec "$container" psql -v ON_ERROR_STOP=1 --single-transaction -U postgres -d smartscan_upgrade -f /tmp/0005.sql
 docker exec "$container" psql -v ON_ERROR_STOP=1 -U postgres -d smartscan_upgrade -f /tmp/realtime_upgrade_contract.sql
 
 # Verify rollback is complete, then prove the same database can recover by
@@ -60,6 +62,7 @@ for sql in /tmp/0000_bootstrap.sql /tmp/0001.sql /tmp/0002.sql /tmp/0003.sql /tm
 done
 docker exec "$container" psql -v ON_ERROR_STOP=1 -U postgres -d smartscan_rollback -f /tmp/realtime_rollback_rehearsal.sql
 docker exec "$container" psql -v ON_ERROR_STOP=1 --single-transaction -U postgres -d smartscan_rollback -f /tmp/0004.sql
+docker exec "$container" psql -v ON_ERROR_STOP=1 --single-transaction -U postgres -d smartscan_rollback -f /tmp/0005.sql
 docker exec "$container" psql -v ON_ERROR_STOP=1 -U postgres -d smartscan_rollback -f /tmp/realtime_upgrade_contract.sql
 
 race_tmp="$(mktemp -d)"
