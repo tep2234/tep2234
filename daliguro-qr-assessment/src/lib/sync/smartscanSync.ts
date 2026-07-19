@@ -154,11 +154,38 @@ export async function endSession(sessionId: string): Promise<void> {
 
 export type PhoneIngressResult =
   | { ok: true; inboxReceiptId: string; receivedAt: string; replayed: boolean }
-  | { ok: false; reason: "offline" | "rejected" };
+  | { ok: false; reason: "offline" | "rejected"; code: string | null; permanent: boolean };
+
+// Envelope-intrinsic rejections that can never succeed on retry of the SAME
+// message: malformed payload, a message_id reused with a different payload, and
+// timestamps or learner/version scope that are fixed at capture time. Every
+// other failure (transport, expired capability, out-of-order sequence) is
+// transient and must stay queued for a later retry rather than being dropped.
+const PERMANENT_PHONE_REJECTIONS = new Set([
+  "invalid_phone_submission",
+  "message_id_payload_mismatch",
+  "message_timestamp_outside_window",
+  "capture_timestamp_outside_window",
+  "submission_scope_mismatch",
+]);
+
+export function classifyPhoneRejection(
+  error: { message?: string } | null,
+): { code: string | null; permanent: boolean } {
+  const message = error?.message?.trim();
+  if (!message) return { code: null, permanent: false };
+  // The RPC raises a stable identifier as the exception message.
+  for (const known of PERMANENT_PHONE_REJECTIONS) {
+    if (message === known || message.includes(known)) {
+      return { code: known, permanent: true };
+    }
+  }
+  return { code: message, permanent: false };
+}
 
 export async function submitPhoneScan(envelope: PhoneSubmissionEnvelope): Promise<PhoneIngressResult> {
   const sb = getSupabaseClient();
-  if (!sb) return { ok: false, reason: "offline" };
+  if (!sb) return { ok: false, reason: "offline", code: null, permanent: false };
   const { data, error } = await sb.rpc("submit_smartscan_phone_scan", {
     p_session_id: envelope.sessionId,
     p_capability: envelope.capability,
@@ -170,7 +197,8 @@ export async function submitPhoneScan(envelope: PhoneSubmissionEnvelope): Promis
   });
   const record = Array.isArray(data) ? data[0] : data;
   if (error || !record || typeof record.inbox_receipt_id !== "string") {
-    return { ok: false, reason: "rejected" };
+    const { code, permanent } = classifyPhoneRejection(error);
+    return { ok: false, reason: "rejected", code, permanent };
   }
   return {
     ok: true,

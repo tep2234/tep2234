@@ -48,10 +48,12 @@ import {
 import {
   acknowledgeHeldScan,
   buildSafeScanDiagnostic,
+  drainHeldScans,
   generateScanId,
   parseHeldScans,
   upsertHeldScan,
   type HeldScan,
+  type SendOutcome,
 } from "../lib/sync/scan-outbox";
 import type { FrameRequest, FrameResponse } from "../lib/scanner/omr-frame-worker";
 import { Button } from "../components/ui";
@@ -106,12 +108,18 @@ async function readNativeQr(source: CanvasImageSource): Promise<string | null> {
   }
 }
 
+function permanentRejectionMessage(code: string | null): string {
+  const detail = code ? ` (${code})` : "";
+  return `This scan was permanently rejected by the secure inbox${detail} and removed from the queue. Re-scan the sheet, and if it keeps failing, generate a new pairing QR.`;
+}
+
 export default function SmartScanMobilePage() {
   const { sessionId = "" } = useParams();
   const pairingTokenRef = useRef(
     typeof window === "undefined" ? "" : new URLSearchParams(window.location.search).get("t") ?? "",
   );
   const claimRef = useRef<ReturnType<typeof claimSession> | null>(null);
+  const initialCameraId = useMemo(() => loadPreferredCameraId(), []);
   const [capability, setCapability] = useState<PhoneCapability | null>(() => {
     if (typeof window === "undefined" || !sessionId) return null;
     return loadPhoneCapability(window.sessionStorage, sessionId);
@@ -388,8 +396,8 @@ export default function SmartScanMobilePage() {
   }, []);
 
   const sendHeld = useCallback(
-    async (held: HeldScan): Promise<boolean> => {
-      if (!capability) return false;
+    async (held: HeldScan): Promise<SendOutcome> => {
+      if (!capability) return { status: "retry" };
       const envelope = await buildPhoneSubmissionEnvelope({
         capability,
         sequenceNumber: held.sequenceNumber,
@@ -404,11 +412,21 @@ export default function SmartScanMobilePage() {
         detected: held.detected,
         confidence: held.confidence,
         capturedAt: held.capturedAt,
+          identitySource: held.identitySource,
           deviceName: navigator.userAgent.slice(0, 160),
         },
       });
       const result = await submitPhoneScan(envelope);
-      if (!result.ok) return false;
+      if (!result.ok) {
+        if (result.permanent) {
+          // Drop the doomed scan so it stops head-of-line blocking the queue.
+          // Retrying the identical envelope would fail forever; the teacher is
+          // told so they can re-scan or re-pair.
+          replaceOutbox(acknowledgeHeldScan(outboxRef.current, held.scanId));
+          return { status: "rejected", code: result.code };
+        }
+        return { status: "retry" };
+      }
       replaceOutbox(acknowledgeHeldScan(outboxRef.current, held.scanId));
       if (!committedScanIdsRef.current.has(held.scanId)) {
         committedScanIdsRef.current.add(held.scanId);
@@ -457,17 +475,21 @@ export default function SmartScanMobilePage() {
       // Persist before transport. The local copy remains until the database
       // returns the immutable inbox receipt for this exact message and digest.
       replaceOutbox(upsertHeldScan(outboxRef.current, held));
-      let ok: boolean;
+      let outcome: SendOutcome;
       try {
-        ok = await sendHeld(held);
+        outcome = await sendHeld(held);
       } catch {
-        ok = false;
+        outcome = { status: "retry" };
       } finally {
         submittingRef.current = false;
       }
-      if (!ok) {
+      if (outcome.status !== "accepted") {
         setSyncState("failed");
-        setError("The secure inbox did not accept this scan. It remains queued while the active pairing can retry.");
+        setError(
+          outcome.status === "rejected"
+            ? permanentRejectionMessage(outcome.code)
+            : "The secure inbox did not accept this scan. It remains queued while the active pairing can retry.",
+        );
         setStage("done");
         closeCamera();
         return;
@@ -490,19 +512,28 @@ export default function SmartScanMobilePage() {
     const tick = async () => {
       if (cancelled || submittingRef.current || retryingRef.current) return;
       retryingRef.current = true;
-      let transportAccepted = false;
-      for (const held of outboxRef.current) {
-        const ok = !cancelled && (await sendHeld(held));
-        if (ok) {
-          transportAccepted = true;
-          if (pendingScanRef.current?.scanId === held.scanId) {
-            setLastSent(held.learnerId);
-          }
-        }
+      // A single rejected/thrown scan must never leave retryingRef stuck true —
+      // that silently disables all further auto-retries for the session. The
+      // drain contains every per-scan failure and the flag is reset in finally
+      // regardless of how the drain exits.
+      let outcome: Awaited<ReturnType<typeof drainHeldScans>>;
+      try {
+        outcome = await drainHeldScans(
+          outboxRef.current,
+          sendHeld,
+          () => cancelled,
+        );
+      } finally {
+        retryingRef.current = false;
       }
-      retryingRef.current = false;
       if (cancelled) return;
-      if (transportAccepted && pendingScanRef.current) {
+      // sendHeld already calls setLastSent for the pending scan on acceptance.
+      const lastRejection = outcome.rejected.at(-1);
+      if (lastRejection) {
+        setSyncState("failed");
+        setError(permanentRejectionMessage(lastRejection.code));
+      }
+      if (outcome.transportAccepted && pendingScanRef.current) {
         setSyncState((state) =>
           state === "saved" || state === "scored" ? state : "pc_received",
         );
