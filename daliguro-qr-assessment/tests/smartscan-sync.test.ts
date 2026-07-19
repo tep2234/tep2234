@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { getSupabaseClient, isSupabaseConfigured } from "../src/lib/supabase/client";
 import {
   claimSession,
+  classifyPhoneRejection,
   createPairingSession,
   endSession,
   fetchCheckedResults,
@@ -56,6 +57,33 @@ describe("pairing session diagnostics", () => {
     expect(
       pairingSessionErrorMessage(new Error("Web Crypto unavailable in this environment")),
     ).toContain("secure page (HTTPS or localhost)");
+  });
+});
+
+describe("phone submission rejection classification", () => {
+  it("treats envelope-intrinsic failures as permanent so they leave the queue", () => {
+    for (const code of [
+      "invalid_phone_submission",
+      "message_id_payload_mismatch",
+      "message_timestamp_outside_window",
+      "capture_timestamp_outside_window",
+      "submission_scope_mismatch",
+    ]) {
+      const verdict = classifyPhoneRejection({ message: code });
+      expect(verdict).toEqual({ code, permanent: true });
+    }
+  });
+
+  it("keeps ordering, capability, and transport failures transient (retryable)", () => {
+    // out_of_order_sequence is a dependency on an earlier scan, not a defect in
+    // this envelope — it must stay queued, never be dropped.
+    expect(classifyPhoneRejection({ message: "out_of_order_sequence" })).toEqual({
+      code: "out_of_order_sequence",
+      permanent: false,
+    });
+    expect(classifyPhoneRejection({ message: "invalid_or_expired_capability" }).permanent).toBe(false);
+    expect(classifyPhoneRejection(null)).toEqual({ code: null, permanent: false });
+    expect(classifyPhoneRejection({ message: "  " })).toEqual({ code: null, permanent: false });
   });
 });
 

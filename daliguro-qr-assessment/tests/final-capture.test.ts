@@ -66,12 +66,14 @@ function scan(answer = "A", confidence = 0.95): MobileScan {
     geometry,
     frameBrightness: 180,
     frameSharpness: 6,
+    frameWidth: 1300,
   };
 }
 
 function analysis(finalScan: MobileScan | null, qrText: string | null = identity): FrameAnalysis {
   return {
     qrText,
+    qrSource: qrText ? "whole-frame" : null,
     result: {
       scan: finalScan,
       status: finalScan ? "ready" : "quality_retake",
@@ -102,6 +104,52 @@ describe("final capture stability boundary", () => {
       geometry,
       luminance: 180,
       sharpness: 1,
+      observedAt: 500,
+    });
+    expect(result).toMatchObject({ ok: false, code: "FINAL_CAPTURE_UNSTABLE" });
+  });
+
+  // Builds a stable preview baseline at a known capture width so the width-aware
+  // path through verifyFinalCaptureStability is exercised end-to-end (not just
+  // advanceFrameStability in isolation).
+  function widthAwareExpectation(previewWidth: number): StableCaptureExpectation {
+    let state: FrameStabilityState | null = null;
+    for (let frame = 1; frame <= 4; frame += 1) {
+      state = advanceFrameStability(state, {
+        identity,
+        geometry,
+        luminance: 180,
+        sharpness: 6,
+        sharpnessWidth: previewWidth,
+        observedAt: frame * 100,
+        freshIdentity: true,
+      }).state;
+    }
+    return { identity, state: state! };
+  }
+
+  it("accepts a high-res final still against a low-res preview baseline (resolution-normalized)", () => {
+    const previewWidth = 1300;
+    const finalWidth = 2200;
+    const result = verifyFinalCaptureStability(widthAwareExpectation(previewWidth), {
+      identity,
+      geometry,
+      luminance: 180,
+      // Same physical sheet reads lower on the higher-res still (~3.5).
+      sharpness: 6 * (previewWidth / finalWidth),
+      sharpnessWidth: finalWidth,
+      observedAt: 500,
+    });
+    expect(result.ok).toBe(true);
+  });
+
+  it("still rejects a genuinely blurred high-res final still through the full path", () => {
+    const result = verifyFinalCaptureStability(widthAwareExpectation(1300), {
+      identity,
+      geometry,
+      luminance: 180,
+      sharpness: 1.8, // genuine defocus; normalized 3.05 vs 6 -> still too far
+      sharpnessWidth: 2200,
       observedAt: 500,
     });
     expect(result).toMatchObject({ ok: false, code: "FINAL_CAPTURE_UNSTABLE" });

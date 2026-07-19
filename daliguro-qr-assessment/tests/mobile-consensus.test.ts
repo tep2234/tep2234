@@ -31,6 +31,7 @@ function baseScan(): MobileScan {
     },
     frameBrightness: 150,
     frameSharpness: 6,
+    frameWidth: 1300,
   };
 }
 

@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
 import { scanQuality } from "../src/lib/scanner/scan-quality";
+import {
+  evaluateQualityGates,
+  QUALITY_GATE_THRESHOLDS,
+} from "../src/lib/scanner/quality-gates";
 
 describe("scanQuality", () => {
   it("rates a clean scan as excellent", () => {
@@ -71,5 +75,42 @@ describe("scanQuality", () => {
     expect(q.autoEligible).toBe(false);
     expect(q.reasonCodes).toContain("BUBBLE_REGION_UNREADABLE");
     expect(q.hardBlockers).not.toContain("BUBBLE_REGION_UNREADABLE");
+  });
+});
+
+describe("absolute sharpness gate is unchanged and resolution-agnostic", () => {
+  // The resolution-normalization fix touches only the RELATIVE frame-stability
+  // ratio. The absolute blur gate must stay at 2.4 and reject genuine blur on
+  // its own — a large capture width can never buy an artificial pass here.
+  const clean = {
+    aligned: true,
+    brightness: 150,
+    shadowLevel: 5,
+    tiltAngle: 1,
+    bubbleDarkness: 0.5,
+    glareLevel: 1,
+  };
+
+  it("keeps the documented 2.4 minimum", () => {
+    expect(QUALITY_GATE_THRESHOLDS.minimumSharpness).toBe(2.4);
+  });
+
+  it("rejects an otherwise-perfect capture just below 2.4", () => {
+    const result = evaluateQualityGates({ ...clean, sharpness: 2.39 });
+    expect(result.disposition).toBe("retake");
+    expect(result.hardBlockers).toContain("IMAGE_TOO_BLURRY");
+  });
+
+  it("accepts the same capture just above 2.4 regardless of resolution", () => {
+    const result = evaluateQualityGates({ ...clean, sharpness: 2.41 });
+    expect(result.reasonCodes).not.toContain("IMAGE_TOO_BLURRY");
+  });
+
+  it("rejects a genuinely blurred final still on its raw sharpness value", () => {
+    // A high-resolution but defocused capture reads low on sharpnessOf(); the
+    // gate sees the raw value, so blur is caught no matter the pixel count.
+    const result = evaluateQualityGates({ ...clean, sharpness: 1.8 });
+    expect(result.disposition).toBe("retake");
+    expect(result.hardBlockers).toContain("IMAGE_TOO_BLURRY");
   });
 });
