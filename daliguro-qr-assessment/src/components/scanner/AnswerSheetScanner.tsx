@@ -234,6 +234,7 @@ export function AnswerSheetScanner({
           geometry,
           luminance: brightness,
           sharpness,
+          sharpnessWidth: img.width,
           observedAt: Date.now(),
         });
         if (!finalObservation.ok) {
@@ -356,6 +357,7 @@ export function AnswerSheetScanner({
           geometry,
           luminance: bright,
           sharpness,
+          sharpnessWidth: frame.width,
           observedAt: now,
           freshIdentity: true,
         });

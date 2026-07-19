@@ -612,6 +612,7 @@ export default function SmartScanMobilePage() {
           geometry: scan.geometry,
           luminance: scan.frameBrightness,
           sharpness: scan.frameSharpness,
+          sharpnessWidth: scan.frameWidth,
           observedAt: now,
           freshIdentity: true,
         }, CONSENSUS_FRAMES);

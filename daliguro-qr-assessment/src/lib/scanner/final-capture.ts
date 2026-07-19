@@ -25,6 +25,9 @@ export interface FinalCaptureObservation {
   geometry: NormalizedSheetGeometry | null;
   luminance: number;
   sharpness: number;
+  // Pixel width the final sharpness was measured at. Lets the stability check
+  // compare a low-res preview baseline against the high-res final still fairly.
+  sharpnessWidth?: number;
   observedAt: number;
 }
 
@@ -70,6 +73,7 @@ export function verifyFinalCaptureStability(
     geometry: observed.geometry,
     luminance: observed.luminance,
     sharpness: observed.sharpness,
+    sharpnessWidth: observed.sharpnessWidth,
     observedAt: observed.observedAt,
     freshIdentity: true,
   });
@@ -139,6 +143,7 @@ export function verifyFinalMobileCapture(
     geometry: finalScan.geometry,
     luminance: finalScan.frameBrightness,
     sharpness: finalScan.frameSharpness,
+    sharpnessWidth: finalScan.frameWidth,
     observedAt: capturedAt,
   });
   if (!stability.ok) return stability;

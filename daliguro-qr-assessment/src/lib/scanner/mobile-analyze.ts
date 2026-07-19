@@ -42,6 +42,9 @@ export interface MobileScan {
   geometry: NormalizedSheetGeometry;
   frameBrightness: number;
   frameSharpness: number;
+  // Pixel width frameSharpness was measured at, so stability checks can compare
+  // a low-res preview baseline against the high-res final still fairly.
+  frameWidth: number;
 }
 
 export interface FrameResult {
@@ -240,6 +243,7 @@ export function analyzeDecodedFrame(img: FrameImage, assessmentId: string, qrTex
     geometry,
     frameBrightness: reading.brightness,
     frameSharpness: reading.sharpness,
+    frameWidth: img.width,
   };
   return {
     scan,

@@ -16,6 +16,11 @@ export interface FrameStabilityState {
   sharpness: number;
   lastLuminance: number;
   lastSharpness: number;
+  // Pixel width the sharpness values were measured at. sharpnessOf() is a
+  // per-pixel gradient, so a still captured at a higher resolution reads lower
+  // for the same physical scene; the width lets us compare across resolutions.
+  sharpnessWidth?: number;
+  lastSharpnessWidth?: number;
   lastObservedAt: number;
   consecutive: number;
 }
@@ -25,6 +30,10 @@ export interface FrameStabilityObservation {
   geometry: NormalizedSheetGeometry;
   luminance: number;
   sharpness: number;
+  // Width (px) the sharpness was measured at. Optional for callers that keep a
+  // single resolution across the sequence; required to compare a low-res live
+  // baseline against a high-res final still without a false "focus changed".
+  sharpnessWidth?: number;
   observedAt: number;
   // A sticky/cached QR is useful for instructions, but it is not identity
   // evidence for an automatic capture decision.
@@ -74,6 +83,27 @@ export function normalizedSheetGeometry(
   };
 }
 
+// sharpnessOf() reports a per-pixel gradient that scales roughly with 1/width,
+// so the same physical sheet reads lower at a higher capture resolution.
+// Rescale a sharpness measured at `fromWidth` onto the `toWidth` basis so the
+// stability ratio compares like with like. When either width is unknown the
+// callers share a single resolution and the raw value is already comparable.
+function sharpnessAtBasis(
+  sharpness: number,
+  fromWidth: number | undefined,
+  toWidth: number | undefined,
+): number {
+  if (
+    !Number.isFinite(fromWidth) ||
+    !Number.isFinite(toWidth) ||
+    (fromWidth as number) <= 0 ||
+    (toWidth as number) <= 0
+  ) {
+    return sharpness;
+  }
+  return sharpness * ((fromWidth as number) / (toWidth as number));
+}
+
 function angleDifference(left: number, right: number): number {
   const delta = Math.abs(left - right) % 360;
   return Math.min(delta, 360 - delta);
@@ -113,6 +143,8 @@ export function advanceFrameStability(
       sharpness: observation.sharpness,
       lastLuminance: observation.luminance,
       lastSharpness: observation.sharpness,
+      sharpnessWidth: observation.sharpnessWidth,
+      lastSharpnessWidth: observation.sharpnessWidth,
       lastObservedAt: observation.observedAt,
       consecutive: 1,
     };
@@ -136,6 +168,8 @@ export function advanceFrameStability(
         sharpness: observation.sharpness,
         lastLuminance: observation.luminance,
         lastSharpness: observation.sharpness,
+        sharpnessWidth: observation.sharpnessWidth,
+        lastSharpnessWidth: observation.sharpnessWidth,
         lastObservedAt: observation.observedAt,
         consecutive: 1,
       },
@@ -147,12 +181,26 @@ export function advanceFrameStability(
     Number.isFinite(observation.luminance) &&
     Math.abs(previous.luminance - observation.luminance) <= MAX_LUMINANCE_CHANGE &&
     Math.abs(previous.lastLuminance - observation.luminance) <= MAX_LUMINANCE_CHANGE;
+  // Rescale the observed sharpness onto each baseline's resolution before
+  // comparing. Without this, a stable sheet fails "focus changed" purely
+  // because the final still is captured at a higher resolution than the live
+  // preview frames the baseline was built from.
+  const observedForAnchor = sharpnessAtBasis(
+    observation.sharpness,
+    observation.sharpnessWidth,
+    previous.sharpnessWidth,
+  );
+  const observedForLast = sharpnessAtBasis(
+    observation.sharpness,
+    observation.sharpnessWidth,
+    previous.lastSharpnessWidth,
+  );
   const sharpnessStable =
     Number.isFinite(observation.sharpness) &&
-    Math.abs(previous.sharpness - observation.sharpness) /
-      Math.max(previous.sharpness, observation.sharpness, 0.1) <= MAX_SHARPNESS_CHANGE_RATIO &&
-    Math.abs(previous.lastSharpness - observation.sharpness) /
-      Math.max(previous.lastSharpness, observation.sharpness, 0.1) <= MAX_SHARPNESS_CHANGE_RATIO;
+    Math.abs(previous.sharpness - observedForAnchor) /
+      Math.max(previous.sharpness, observedForAnchor, 0.1) <= MAX_SHARPNESS_CHANGE_RATIO &&
+    Math.abs(previous.lastSharpness - observedForLast) /
+      Math.max(previous.lastSharpness, observedForLast, 0.1) <= MAX_SHARPNESS_CHANGE_RATIO;
   const geometryStable =
     isSheetGeometryStable(previous.geometry, observation.geometry) &&
     isSheetGeometryStable(previous.lastGeometry, observation.geometry);
@@ -166,6 +214,8 @@ export function advanceFrameStability(
         sharpness: observation.sharpness,
         lastLuminance: observation.luminance,
         lastSharpness: observation.sharpness,
+        sharpnessWidth: observation.sharpnessWidth,
+        lastSharpnessWidth: observation.sharpnessWidth,
         lastObservedAt: observation.observedAt,
         consecutive: 1,
       },
@@ -181,6 +231,8 @@ export function advanceFrameStability(
     sharpness: previous.sharpness,
     lastLuminance: observation.luminance,
     lastSharpness: observation.sharpness,
+    sharpnessWidth: previous.sharpnessWidth,
+    lastSharpnessWidth: observation.sharpnessWidth,
     lastObservedAt: observation.observedAt,
     consecutive: previous.consecutive + 1,
   };
