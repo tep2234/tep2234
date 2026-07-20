@@ -671,7 +671,11 @@ export default function SmartScanMobilePage() {
       const t0 = performance.now();
       // Identity must be decoded freshly on every counted frame. Reusing a QR
       // from a prior frame can bind the next physical sheet to the wrong learner.
-      const analysis = await analyzeAsync(frame, nativeQr, false);
+      // With no native BarcodeDetector (e.g. iOS Safari) the cheap jsQR pass
+      // cannot lock the small sheet QR, so escalate to the thorough, geometry-
+      // guided zone-rescue cascade. When a native QR is present the flag is a
+      // no-op (analysis uses the provided code), so Android pays nothing extra.
+      const analysis = await analyzeAsync(frame, nativeQr, !nativeQr);
       if (!runIsActive()) return;
       const analysisMs = performance.now() - t0;
       analyzeIntervalRef.current = adaptiveAnalyzeInterval(analysisMs, ANALYZE_INTERVAL_MS);
@@ -682,7 +686,13 @@ export default function SmartScanMobilePage() {
       });
       const result = analysis.result;
       const genuineQr = analysis.qrText;
-      setLastFrame(result);
+      // A transient garbled/partial QR read while hunting is not a hard error.
+      // Show gentle centering guidance instead of an alarming "invalid format"
+      // that sticks in the banner (the code hasn't been locked yet).
+      const liveResult = result.reasonCodes?.includes("QR_INVALID")
+        ? { ...result, message: "Center the sheet's QR in the frame and hold steady in good light." }
+        : result;
+      setLastFrame(liveResult);
       if (result.scan && genuineQr) {
         // Trusted layer: accumulate per-bubble darkness across aligned frames of
         // the same freshly identified, geometrically stable sheet.
