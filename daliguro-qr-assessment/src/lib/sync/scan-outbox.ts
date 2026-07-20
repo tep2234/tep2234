@@ -12,6 +12,7 @@ export interface HeldScan {
   capturedAt: number;
   sequenceNumber: number;
   issuedAt: string;
+  identitySource?: "provided" | "whole-frame" | "region-cascade" | "zone-rescue";
 }
 
 export interface SafeScanDiagnostic {
@@ -22,13 +23,14 @@ export interface SafeScanDiagnostic {
     itemCount: number;
     confidence: number;
     statusCounts: Record<string, number>;
+    identitySource: HeldScan["identitySource"] | null;
   };
 }
 
 // Diagnostics must help support identify pipeline failures without exporting
 // pairing credentials, learner identity, assessment identity, or answers.
 export function buildSafeScanDiagnostic(
-  scan: Pick<HeldScan, "scanId" | "capturedAt" | "detected" | "confidence">,
+  scan: Pick<HeldScan, "scanId" | "capturedAt" | "detected" | "confidence" | "identitySource">,
   syncState: string,
 ): SafeScanDiagnostic {
   const statusCounts: Record<string, number> = {};
@@ -43,6 +45,7 @@ export function buildSafeScanDiagnostic(
       itemCount: scan.detected.length,
       confidence: scan.confidence,
       statusCounts,
+      identitySource: scan.identitySource ?? null,
     },
   };
 }

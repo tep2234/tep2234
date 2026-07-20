@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "updated": "2026-07-18",
+  "fixtures": [
+    { "id": "clean-whole-frame", "kind": "synthetic", "wholeFrame": "exact-token", "zoneRescue": "not-required", "identity": "confirmed", "answers": "complete", "sync": "not-applicable", "review": "quality-dependent", "reason": null },
+    { "id": "recoverable-zone", "kind": "synthetic", "wholeFrame": "miss", "zoneRescue": "exact-token", "identity": "confirmed", "answers": "unchanged", "sync": "not-applicable", "review": "quality-dependent", "reason": "ZONE_RESCUE" },
+    { "id": "no-qr-readable-omr", "kind": "synthetic", "wholeFrame": "miss", "zoneRescue": "miss", "identity": "unresolved", "answers": "preserved", "sync": "not-saved", "review": "manual-identity", "reason": "QR_NOT_FOUND" },
+    { "id": "malformed-token", "kind": "logic", "wholeFrame": "decoded-text", "zoneRescue": "not-required", "identity": "rejected", "answers": "not-attached", "sync": "not-saved", "review": "none", "reason": "QR_INVALID" },
+    { "id": "wrong-assessment", "kind": "logic", "wholeFrame": "exact-other-token", "zoneRescue": "not-required", "identity": "rejected", "answers": "not-attached", "sync": "not-saved", "review": "none", "reason": "WRONG_ASSESSMENT" },
+    { "id": "conflicting-identities", "kind": "logic", "wholeFrame": "conflict", "zoneRescue": "not-required", "identity": "rejected", "answers": "not-accepted", "sync": "not-saved", "review": "none", "reason": "IDENTITY_CHANGED" },
+    { "id": "duplicate-submit", "kind": "database-contract", "wholeFrame": "not-applicable", "zoneRescue": "not-applicable", "identity": "confirmed", "answers": "unchanged", "sync": "one-receipt", "review": "duplicate-policy", "reason": "IDEMPOTENT_REPLAY" },
+    { "id": "offline-retry", "kind": "logic-and-database-contract", "wholeFrame": "not-applicable", "zoneRescue": "not-applicable", "identity": "confirmed", "answers": "preserved-in-outbox", "sync": "pending-then-receipted", "review": "unchanged", "reason": "PENDING_SYNC" },
+    { "id": "anonymous-teacher", "kind": "frontend-logic", "wholeFrame": "not-applicable", "zoneRescue": "not-applicable", "identity": "not-a-teacher", "answers": "not-applicable", "sync": "blocked-in-ui", "review": "not-applicable", "reason": "VERIFIED_TEACHER_REQUIRED", "certification": "server-contract-pending" },
+    { "id": "real-phone-optics", "kind": "physical-device", "wholeFrame": "unmeasured", "zoneRescue": "unmeasured", "identity": "unmeasured", "answers": "unmeasured", "sync": "unmeasured", "review": "unmeasured", "reason": "EXTERNAL_VALIDATION_REQUIRED" }
+  ]
+}

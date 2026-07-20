@@ -11,7 +11,7 @@ import type {
   TestVersion,
 } from "../lib/types";
 import { buildQrPayload } from "../lib/qr";
-import { omrItemsOf } from "../lib/scanner/omr-template";
+import { MAX_ITEMS, omrItemsOf } from "../lib/scanner/omr-template";
 import { ActiveGate } from "./ActiveGate";
 import { AnswerSheet } from "./AnswerSheet";
 import { Button, Empty } from "./ui";
@@ -58,6 +58,8 @@ function SheetGenerator({
   navigate: PanelProps["navigate"];
 }) {
   const items: Item[] = state.items.filter((i) => i.assessmentId === active.id);
+  const omrItemCount = omrItemsOf(items).length;
+  const printBlocked = omrItemCount > MAX_ITEMS;
   const unmappedItems = state.items.filter((i) => i.assessmentId !== active.id);
   const sections = distinctSections(state.learners);
 
@@ -170,6 +172,10 @@ function SheetGenerator({
   }
 
   function printSheets() {
+    if (printBlocked) {
+      window.alert(`This assessment has ${omrItemCount} scannable items. SmartScan sheets support at most ${MAX_ITEMS}. Split or revise the assessment before printing.`);
+      return;
+    }
     if (chosen.length === 0) {
       window.alert("Select at least one learner to print.");
       return;
@@ -189,13 +195,19 @@ function SheetGenerator({
           </p>
         </div>
         <div className="text-right">
-          <Button onClick={printSheets}>🖨 Print Selected ({chosen.length})</Button>
+          <Button onClick={printSheets} disabled={printBlocked}>🖨 Print Selected ({chosen.length})</Button>
           <p className="mt-1 text-xs text-slate-400">
             Two learner sheets per A4 landscape page. In the print dialog: A4 · Landscape ·
             Scale 100% · Headers/footers off (or “Save as PDF”).
           </p>
         </div>
       </div>
+
+      {printBlocked ? (
+        <div className="no-print mt-3 rounded-lg border border-red-300 bg-red-50 px-4 py-3 text-sm font-bold text-red-800" role="alert">
+          Printing blocked: this assessment has {omrItemCount} scannable items, but one SmartScan sheet supports at most {MAX_ITEMS}. Split the assessment or remove scannable items before generating sheets.
+        </div>
+      ) : null}
 
       {/* Controls */}
       <div className="no-print mt-4 rounded-xl border border-slate-200 bg-white p-4">
@@ -266,8 +278,8 @@ function SheetGenerator({
         </div>
 
         <div className="mt-3 text-xs text-slate-500">
-          🔐 QR encodes identity only: assessment ID, learner ID, LRN, section,
-          grade, version, security token. <b>No answer key inside the QR.</b> The
+          🔐 Current QR sheets encode opaque assessment/learner IDs, version,
+          item count, and a unique sheet token. <b>No name, LRN, answer key, or score is inside the QR.</b> The
           printed OMR sheet has four black corner markers and A–D bubbles —
           learners shade with black pen/pencil; scan it in Check → Scan Answer
           Sheet to auto-read and score.
@@ -300,10 +312,10 @@ function SheetGenerator({
           >
             {showPayload ? "Hide" : "Show"} QR payload preview (debug)
           </button>
-          {showPayload && chosen.length > 0 ? (
+          {showPayload && chosen.length > 0 && !printBlocked ? (
             <pre className="mt-2 overflow-auto rounded-lg bg-slate-900 p-3 text-[11px] text-emerald-300">
               {JSON.stringify(
-                buildQrPayload(active.id, chosen[0], activeVersion, omrItemsOf(items).length),
+                buildQrPayload(active.id, chosen[0], activeVersion, omrItemCount),
                 null,
                 2,
               )}
@@ -315,7 +327,9 @@ function SheetGenerator({
       {/* Printable sheets */}
       <style media="print">{"@page { size: A4 landscape; margin: 8mm; }"}</style>
       <div className="print-area sheet-print-area mt-4">
-        {chosen.length === 0 ? (
+        {printBlocked ? (
+          <Empty text={`Cannot preview: ${omrItemCount} scannable items exceed the ${MAX_ITEMS}-item sheet limit.`} />
+        ) : chosen.length === 0 ? (
           <Empty text="Select learners above to preview their answer sheets." />
         ) : (
           printPairs.map((pair) => (

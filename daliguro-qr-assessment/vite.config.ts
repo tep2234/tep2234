@@ -23,7 +23,14 @@ const httpsConfig = useHttps && hasMkcert
   ? { key: readFileSync(mkcertKey), cert: readFileSync(mkcertCert) }
   : undefined
 
+// Build stamp surfaced in the UI/console so a stale cached client (old service
+// worker or old deployment) is identifiable from a user screenshot. Field
+// failures have been mis-attributed to scanner bugs when the phone was in fact
+// running a previous build.
+const buildId = new Date().toISOString().replace(/[-:]/g, '').slice(2, 13)
+
 export default defineConfig({
+  define: { __BUILD_ID__: JSON.stringify(buildId) },
   plugins: [react(), tailwindcss(), ...(useHttps && !hasMkcert ? [basicSsl()] : [])],
   server: {
     host: true,

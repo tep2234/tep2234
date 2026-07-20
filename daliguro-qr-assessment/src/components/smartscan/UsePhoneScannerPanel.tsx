@@ -6,7 +6,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import QRCode from "qrcode";
 import { isSupabaseConfigured } from "../../lib/supabase/client";
-import { useSupabaseAuth } from "../../lib/auth/supabaseAuth";
+import { sendMagicLink, useSupabaseAuth } from "../../lib/auth/supabaseAuth";
 import { buildPairingUrl, checkedRowFromScan, isLoopbackOrigin, normalizePairingOrigin, scoredCheckedRow, secondsLeft, validateScanBroadcast } from "../../lib/sync/pairing";
 import {
   commitCheckedResult,
@@ -21,7 +21,7 @@ import {
 import type { CheckedResultRow, ScanBroadcast, ScoredSummary } from "../../lib/sync/pairing";
 import { subscribeCheckedResults, subscribePhoneSubmissions, subscribeSession } from "../../lib/sync/realtimeSmartScan";
 import type { PhoneInboxRow } from "../../lib/sync/realtime-security";
-import { Button } from "../ui";
+import { Button, TextInput } from "../ui";
 
 interface FeedItem {
   learnerId: string;
@@ -55,6 +55,8 @@ export function UsePhoneScannerPanel({
 }) {
   const auth = useSupabaseAuth();
   const [authErr, setAuthErr] = useState("");
+  const [teacherEmail, setTeacherEmail] = useState("");
+  const [sendingLink, setSendingLink] = useState(false);
 
   const [session, setSession] = useState<{ id: string; url: string; expiresAtMs: number } | null>(null);
   const [qrUrl, setQrUrl] = useState("");
@@ -383,11 +385,15 @@ export function UsePhoneScannerPanel({
   return (
     <div className="mt-4 rounded-xl border border-slate-200 bg-white p-4">
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <div className="text-sm font-bold">📱 Use Phone as Scanner</div>
+        <div className="text-sm font-bold">
+          📱 Use Phone as Scanner{" "}
+          {/* Build stamp: identifies stale cached clients from screenshots. */}
+          <span className="align-middle font-mono text-[10px] font-normal text-slate-400">b{__BUILD_ID__}</span>
+        </div>
         <div className="flex items-center gap-2 text-xs text-slate-500">
           {auth.teacherUserId ? (
             <span className="rounded-full bg-emerald-50 px-2 py-1 font-bold text-emerald-800">
-              {auth.isAnonymous ? "Direct pairing active" : auth.email ?? "Secure pairing active"}
+              {auth.email ?? "Verified teacher pairing active"}
             </span>
           ) : (
             <span className="rounded-full bg-red-50 px-2 py-1 font-bold text-red-700">Direct pairing unavailable</span>
@@ -399,11 +405,35 @@ export function UsePhoneScannerPanel({
         <div className="mt-3">
           {!auth.teacherUserId ? (
             <div className="rounded-lg border border-red-200 bg-red-50 p-3 text-xs text-red-950">
-              <div className="font-extrabold">Could not prepare direct phone pairing</div>
+              <div className="font-extrabold">Verified teacher sign-in required</div>
               <p className="mt-1">
-                {auth.error ?? "Check the connection, then reload this page to retry."}
+                {auth.error ?? (auth.isAnonymous
+                  ? "Anonymous sessions cannot create teacher pairing sessions or commit assessment results."
+                  : "Sign in with your teacher email before using phone synchronization.")}
               </p>
-              <Button className="mt-2" onClick={() => window.location.reload()}>Retry direct pairing</Button>
+              <div className="mt-2 flex flex-wrap gap-2">
+                <TextInput
+                  type="email"
+                  value={teacherEmail}
+                  onChange={(event) => setTeacherEmail(event.target.value)}
+                  placeholder="teacher@school.edu"
+                  className="min-w-64 flex-1"
+                />
+                <Button
+                  disabled={sendingLink || !teacherEmail.trim()}
+                  onClick={() => {
+                    setSendingLink(true);
+                    setAuthErr("");
+                    void sendMagicLink(teacherEmail, window.location.href).then((result) => {
+                      setSendingLink(false);
+                      setAuthErr(result.ok ? "Sign-in link sent. Open it in this browser." : result.error ?? "Sign-in failed.");
+                    });
+                  }}
+                >
+                  {sendingLink ? "Sending…" : "Send sign-in link"}
+                </Button>
+              </div>
+              {authErr ? <p className="mt-2 font-bold">{authErr}</p> : null}
             </div>
           ) : (
             <>

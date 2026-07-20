@@ -1,6 +1,9 @@
 import { defineConfig } from "vitest/config";
 
 export default defineConfig({
+  // Mirrors the vite.config.ts build stamp so components referencing
+  // __BUILD_ID__ stay importable under the unit-test runner.
+  define: { __BUILD_ID__: JSON.stringify("test") },
   test: {
     // Keep Playwright's real-browser specs under its own runner. Allowing
     // Vitest to import them makes Playwright hooks execute without a browser

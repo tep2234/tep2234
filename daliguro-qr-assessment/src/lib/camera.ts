@@ -212,3 +212,80 @@ export function emptyDiagnostics(): CameraDiagnostics {
     lastErrorName: null,
   };
 }
+
+export interface CameraDeviceChoice {
+  deviceId: string;
+  label: string;
+  rearLike: boolean;
+  ultrawideLike: boolean;
+}
+
+export interface CameraTrackProfile {
+  width: number | null;
+  height: number | null;
+  frameRate: number | null;
+  facingMode: string | null;
+  deviceId: string | null;
+  aspectRatio: number | null;
+  focusMode: string | null;
+  zoom: number | null;
+  torchSupported: boolean;
+}
+
+export function preferredVideoConstraints(deviceId = ""): MediaTrackConstraints {
+  return {
+    ...(deviceId ? { deviceId: { exact: deviceId } } : { facingMode: { ideal: "environment" } }),
+    width: { ideal: 2560 },
+    height: { ideal: 1440 },
+    frameRate: { ideal: 30 },
+  };
+}
+
+export function rankVideoDevices(
+  devices: Pick<MediaDeviceInfo, "kind" | "deviceId" | "label">[],
+  rememberedDeviceId = "",
+): CameraDeviceChoice[] {
+  const choices = devices
+    .filter((device) => device.kind === "videoinput" && device.deviceId)
+    .map((device, index) => {
+      const label = device.label.trim() || `Camera ${index + 1}`;
+      return {
+        deviceId: device.deviceId,
+        label,
+        rearLike: /back|rear|environment|world/i.test(label),
+        ultrawideLike: /ultra[ -]?wide|0[.,]5\s*x/i.test(label),
+      };
+    });
+  return choices.sort((left, right) => {
+    if (left.deviceId === rememberedDeviceId) return -1;
+    if (right.deviceId === rememberedDeviceId) return 1;
+    const leftRank = left.rearLike ? (left.ultrawideLike ? 1 : 0) : 2;
+    const rightRank = right.rearLike ? (right.ultrawideLike ? 1 : 0) : 2;
+    return leftRank - rightRank || left.label.localeCompare(right.label);
+  });
+}
+
+export function inspectCameraTrack(
+  settings: MediaTrackSettings,
+  capabilities?: MediaTrackCapabilities & { torch?: boolean; focusMode?: string[] },
+): CameraTrackProfile {
+  const extended = settings as MediaTrackSettings & { focusMode?: string; zoom?: number };
+  return {
+    width: typeof settings.width === "number" ? settings.width : null,
+    height: typeof settings.height === "number" ? settings.height : null,
+    frameRate: typeof settings.frameRate === "number" ? settings.frameRate : null,
+    facingMode: settings.facingMode ?? null,
+    deviceId: settings.deviceId ?? null,
+    aspectRatio: typeof settings.aspectRatio === "number" ? settings.aspectRatio : null,
+    focusMode: extended.focusMode ?? null,
+    zoom: typeof extended.zoom === "number" ? extended.zoom : null,
+    torchSupported: capabilities?.torch === true,
+  };
+}
+
+export function adaptiveAnalyzeInterval(lastDurationMs: number, baseMs = 90): number {
+  if (!Number.isFinite(lastDurationMs) || lastDurationMs <= 0) return baseMs;
+  // Leave headroom for painting and input. Slow devices naturally skip more
+  // frames instead of building a decode backlog.
+  return Math.max(baseMs, Math.min(500, Math.ceil(lastDurationMs * 1.25)));
+}

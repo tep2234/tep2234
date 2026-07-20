@@ -60,6 +60,10 @@ export interface AuthState {
   error: string | null;
 }
 
+export function teacherPrincipalId(user: Pick<User, "id" | "is_anonymous"> | null): string | null {
+  return user && user.is_anonymous !== true ? user.id : null;
+}
+
 function directPairingAuthError(message: string): string {
   const normalized = message.toLowerCase();
   if (normalized.includes("anonymous") && normalized.includes("disabled")) {
@@ -136,7 +140,10 @@ export function useSupabaseAuth(): AuthState {
     configured,
     loading,
     user,
-    teacherUserId: user?.id ?? null,
+    // Anonymous users carry the authenticated Postgres role, but they are not
+    // verified teachers. Never expose them as teacher principals to the PC
+    // scanner workflow.
+    teacherUserId: teacherPrincipalId(user),
     email: user?.email ?? null,
     isAnonymous: user?.is_anonymous === true,
     error,

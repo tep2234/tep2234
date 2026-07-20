@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { User } from "@supabase/supabase-js";
-import { ensureDirectPairingUser } from "../src/lib/auth/supabaseAuth";
+import { ensureDirectPairingUser, teacherPrincipalId } from "../src/lib/auth/supabaseAuth";
 
 function user(id: string, anonymous: boolean): User {
   return {
@@ -55,5 +55,13 @@ describe("direct SmartScan pairing authentication", () => {
 
     expect(result.user).toBeNull();
     expect(result.error).toContain("Enable Anonymous Sign-Ins");
+  });
+});
+
+describe("teacher principal classification", () => {
+  it("documents that anonymous authenticated users are not teacher principals", () => {
+    const anonymous = user("anonymous-1", true);
+    expect(teacherPrincipalId(anonymous)).toBeNull();
+    expect(teacherPrincipalId(user("teacher-1", false))).toBe("teacher-1");
   });
 });

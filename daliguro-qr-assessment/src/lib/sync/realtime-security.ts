@@ -68,6 +68,7 @@ export function phonePayloadText(scan: ScanBroadcast): string {
     detected: scan.detected,
     confidence: scan.confidence,
     capturedAt: scan.capturedAt,
+    ...(scan.identitySource ? { identitySource: scan.identitySource } : {}),
     ...(scan.deviceName ? { deviceName: scan.deviceName.slice(0, 160) } : {}),
   });
 }

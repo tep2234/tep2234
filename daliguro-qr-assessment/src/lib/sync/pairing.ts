@@ -137,6 +137,7 @@ export interface ScanBroadcast {
   confidence: number;
   capturedAt: number;
   deviceName?: string;
+  identitySource?: "provided" | "whole-frame" | "region-cascade" | "zone-rescue";
 }
 
 // Redacted score summary returned by the status RPC after the PC has persisted
@@ -197,6 +198,12 @@ export function validateScanBroadcast(
   }
   if (!Number.isFinite(scan.capturedAt) || (scan.capturedAt as number) <= 0) {
     return { ok: false, reason: "Missing capture timestamp." };
+  }
+  if (
+    scan.identitySource !== undefined &&
+    !["provided", "whole-frame", "region-cascade", "zone-rescue"].includes(scan.identitySource)
+  ) {
+    return { ok: false, reason: "Invalid QR identity source." };
   }
   if (!Array.isArray(scan.detected) || scan.detected.length < 1 || scan.detected.length > 80) {
     return { ok: false, reason: "Detected item count is outside the supported range." };

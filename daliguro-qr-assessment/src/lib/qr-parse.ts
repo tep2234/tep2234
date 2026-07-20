@@ -6,7 +6,7 @@
 
 import type { QrPayload, TestVersion } from "./types";
 import { TEST_VERSIONS } from "./types";
-import { payloadChecksum } from "./qr";
+import { payloadChecksum, QR_V3_PREFIX, v3Checksum } from "./qr";
 import { MAX_ITEMS } from "./scanner/omr-template";
 
 // Fields that must NEVER appear in a learner-identity QR. If any of these
@@ -70,13 +70,60 @@ function checksumProblem(p: Record<string, unknown>): string | null {
   return null;
 }
 
+// V3 compact payload: `DG3|assessmentId|learnerId|version|n|sheetToken|check`.
+// Identity-only by construction — there are no other fields to smuggle data
+// in, and the checksum binds every field. See qr.ts for the format rationale.
+function decodeV3Payload(text: string): QrParseResult {
+  const fields = text.split("|");
+  if (fields.length !== 7) {
+    return { ok: false, reason: "Damaged DALIguro sheet code (wrong field count). Rescan or reprint." };
+  }
+  const [, assessmentId, learnerId, rawVersion, rawN, sheetToken, check] = fields;
+  if (!assessmentId || !learnerId) {
+    return { ok: false, reason: "QR is missing learner identity fields." };
+  }
+  if (!isTestVersion(rawVersion)) {
+    return { ok: false, reason: "QR is missing a valid sheet version. Reprint this learner's sheet." };
+  }
+  const n = /^\d{1,2}$/.test(rawN) ? Number(rawN) : NaN;
+  if (!Number.isInteger(n) || n < 1 || n > MAX_ITEMS) {
+    return { ok: false, reason: `QR has an invalid OMR item count. Expected an integer from 1 to ${MAX_ITEMS}.` };
+  }
+  if (!sheetToken || sheetToken.length < 12 || sheetToken.length > 128) {
+    return { ok: false, reason: "QR is missing a valid sheet identity token. Reprint this learner's sheet." };
+  }
+  if (!check || check !== v3Checksum(assessmentId, learnerId, rawVersion, n, sheetToken)) {
+    return { ok: false, reason: "QR failed its integrity check (damaged or altered). Reprint this learner's sheet." };
+  }
+  return {
+    ok: true,
+    payload: {
+      assessmentId,
+      learnerId,
+      // Descriptive fields intentionally left blank: v3 carries no PII. The
+      // resolver fills learner details from local data after id lookup.
+      lrn: "",
+      section: "",
+      gradeLevel: "",
+      version: rawVersion,
+      securityToken: sheetToken,
+      n,
+      checksum: check,
+    },
+  };
+}
+
 // Shape-only decode: validates the payload is a well-formed identity QR, WITHOUT
 // checking whether the assessment/learner exist on this device. Identity
 // resolution against local data is a separate step (see scanner/resolve.ts), so
 // a successfully decoded QR is never reported as "rejected".
+// Accepts BOTH formats: v3 compact (`DG3|...`, current prints) and v2 JSON
+// (every previously printed sheet stays scannable).
 export function decodeQrPayload(raw: string): QrParseResult {
   const text = raw.trim();
   if (!text) return { ok: false, reason: "Empty QR. Nothing to read." };
+
+  if (text.startsWith(QR_V3_PREFIX + "|")) return decodeV3Payload(text);
 
   let parsed: unknown;
   try {

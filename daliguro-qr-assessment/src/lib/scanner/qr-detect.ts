@@ -16,6 +16,8 @@ export interface QrRead {
   region: string;
 }
 
+const FAST_WHOLE_FRAME_MAX_SIDE = 1000;
+
 interface Crop {
   name: string;
   x: number;
@@ -26,6 +28,28 @@ interface Crop {
 
 function cloneImage(img: QrImage): QrImage {
   return { data: new Uint8ClampedArray(img.data), width: img.width, height: img.height };
+}
+
+function downsampleForFastWholeFrame(img: QrImage): QrImage {
+  const longest = Math.max(img.width, img.height);
+  if (longest <= FAST_WHOLE_FRAME_MAX_SIDE) return img;
+  const scale = FAST_WHOLE_FRAME_MAX_SIDE / longest;
+  const width = Math.max(1, Math.round(img.width * scale));
+  const height = Math.max(1, Math.round(img.height * scale));
+  const out = new Uint8ClampedArray(width * height * 4);
+  for (let y = 0; y < height; y += 1) {
+    const sy = Math.min(img.height - 1, Math.floor(y / scale));
+    for (let x = 0; x < width; x += 1) {
+      const sx = Math.min(img.width - 1, Math.floor(x / scale));
+      const src = (sy * img.width + sx) * 4;
+      const dst = (y * width + x) * 4;
+      out[dst] = img.data[src];
+      out[dst + 1] = img.data[src + 1];
+      out[dst + 2] = img.data[src + 2];
+      out[dst + 3] = 255;
+    }
+  }
+  return { data: out, width, height };
 }
 
 function crop(img: QrImage, c: Crop): QrImage {
@@ -117,8 +141,20 @@ function readRegions(img: QrImage, suffix: string, inversionAttempts: "dontInver
   return null;
 }
 
+// The literal whole-frame stage, exported separately so production telemetry
+// and regression fixtures can prove when the geometry-guided rescue adds value.
+// It intentionally performs one normal-polarity jsQR attempt only.
+export function readQrWholeFrame(img: QrImage): QrRead | null {
+  return tryRead(downsampleForFastWholeFrame(img), "full", "dontInvert");
+}
+
 export function readQrSmart(img: QrImage, thorough = true): QrRead | null {
   // Cheapest path: full frame in normal polarity.
+  const whole = readQrWholeFrame(img);
+  if (whole) return whole;
+
+  // Region crops are still normal-polarity and cheaper than the transformed
+  // recovery tournament. They are not counted as independent consensus votes.
   const fast = readRegions(img, "", "dontInvert");
   if (fast) return fast;
 

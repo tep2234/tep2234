@@ -4,12 +4,13 @@
 // explicit outcome the UI can route. Extracted from the scanner component so
 // it stays under test and the component stays small.
 
-import type { Assessment, Learner, QrAssessmentState, TestVersion } from "../types";
-import { buildTemplate, omrItemsOf } from "./omr-template";
-import { readSheet, toGray, type SheetReading } from "./omr-detect";
+import type { Assessment, Item, Learner, QrAssessmentState, TestVersion } from "../types";
+import { buildTemplate, omrItemsOf, type Point } from "./omr-template";
+import { findCornerMarkers, readSheet, toGray, type SheetReading } from "./omr-detect";
 import { buildReview, type ReviewSummary } from "./omr-score";
 import { resolveScanIdentity, type ScanResolution } from "./resolve";
-import { readQrSmart } from "./qr-detect";
+import { readQrWholeFrame } from "./qr-detect";
+import { readQrFromSheetZone } from "./qr-zone-rescue";
 import { scanQuality, type ScanQuality } from "./scan-quality";
 import {
   evaluateQualityGates,
@@ -34,16 +35,28 @@ export interface ScanResult {
   evidence: string | null;
 }
 
+// A fully read sheet whose QR never decoded. Answers are PRESERVED (mandate:
+// QR failure must never discard readable answers); identity is resolved by
+// the teacher through the visible sheet code or explicit learner selection.
+export interface PreservedSheet {
+  assessmentId: string;
+  version: TestVersion;
+  itemFingerprint: string;
+  reading: SheetReading;
+}
+
 export type StillOutcome =
   | { kind: "ready"; result: ScanResult; switchToAssessment: string | null }
   | { kind: "image"; message: string; reasonCodes?: StillImageReasonCode[] }
-  | { kind: "identity"; resolution: ScanResolution };
+  | { kind: "identity"; resolution: ScanResolution }
+  | { kind: "unidentified"; preserved: PreservedSheet; message: string; reasonCodes: StillImageReasonCode[] };
 
 export type StillImageReasonCode =
   | CaptureQualityReasonCode
   | "QR_NOT_FOUND"
   | "NO_OMR_ITEMS"
   | "ITEM_COUNT_MISMATCH"
+  | "ITEM_TEMPLATE_MISMATCH"
   | "VERSION_MARK_MISSING"
   | "VERSION_MARK_UNCLEAR"
   | "VERSION_MARK_MULTIPLE"
@@ -58,6 +71,22 @@ export function omrContext(state: QrAssessmentState, assessmentId: string) {
   const validByItem: Record<number, number> = {};
   items.forEach((it, i) => (validByItem[i + 1] = Math.max(2, Math.min(it.choices, 5))));
   return { items, template, validByItem };
+}
+
+// A preserved reading is positional, so item count alone cannot prove it is
+// still safe to score. Bind it to the ordered, scoring-relevant item template
+// that existed at capture time and reject reorder/replacement/edit drift.
+function itemTemplateFingerprint(items: Item[]): string {
+  return JSON.stringify(items.map((item) => ({
+    id: item.id,
+    itemNumber: item.itemNumber,
+    type: item.type,
+    question: item.question,
+    correctAnswer: item.correctAnswer,
+    acceptedAnswers: item.acceptedAnswers,
+    points: item.points,
+    choices: item.choices,
+  })));
 }
 
 function meanConfidence(reading: SheetReading): number {
@@ -79,6 +108,53 @@ function versionMissingReason(status: SheetReading["version"]["status"]): StillI
   return "VERSION_MARK_MISSING";
 }
 
+// When the QR is unreadable but the four markers were found and the sheet
+// read cleanly against the ACTIVE assessment, preserve the answers for
+// teacher-driven identity recovery instead of discarding the scan. Every
+// hard gate still applies: quality retake-blockers, a clear single VERSION
+// mark, and the version being enabled — anything less falls back to a plain
+// image failure. Identity is NEVER guessed here.
+function preserveUnidentifiedSheet(
+  gray: ReturnType<typeof toGray>,
+  corners: Point[],
+  state: QrAssessmentState,
+  activeId: string | null,
+): StillOutcome | null {
+  const active = activeId ? state.assessments.find((a) => a.id === activeId) : undefined;
+  if (!active) return null;
+  const ctx = omrContext(state, active.id);
+  if (ctx.items.length === 0) return null;
+  const reading = readSheet(gray, ctx.template, ctx.validByItem, corners);
+  if (!reading.aligned) return null;
+  const captureGates = evaluateQualityGates({
+    aligned: reading.aligned,
+    brightness: reading.brightness,
+    sharpness: reading.sharpness,
+    shadowLevel: reading.shadowLevel,
+    tiltAngle: tiltAngle(reading),
+    bubbleDarkness: reading.printContrast,
+    glareLevel: reading.glareLevel,
+    obscuredBubbleCount: reading.obscuredBubbleCount,
+  });
+  if (captureGates.disposition === "retake") return null;
+  // Membership check doubles as the TestVersion narrowing.
+  const version = active.versions.find((v) => v === reading.version.detected);
+  if (!version) return null;
+  return {
+    kind: "unidentified",
+    preserved: {
+      assessmentId: active.id,
+      version,
+      itemFingerprint: itemTemplateFingerprint(ctx.items),
+      reading,
+    },
+    message:
+      "The QR would not decode, but every answer was captured and preserved. " +
+      "Identify the learner below (or type the sheet code printed under the QR into the paste box) to finish checking — nothing was lost.",
+    reasonCodes: ["QR_NOT_FOUND"],
+  };
+}
+
 export function processStillImage(
   img: ImageData,
   state: QrAssessmentState,
@@ -86,15 +162,36 @@ export function processStillImage(
   evidence: string | null,
   captureSource: CaptureProvenance = "gallery",
 ): StillOutcome {
-  const qr = readQrSmart(img, true);
-  if (!qr) {
-    return {
-      kind: "image",
-      message: "No QR code found. Make sure the QR is fully visible, focused, and glare-free.",
-      reasonCodes: ["QR_NOT_FOUND"],
-    };
+  // Keep the initial pass deliberately cheap. A scorable sheet must expose
+  // its four alignment markers anyway, so a miss goes directly to the
+  // geometry-guided, bounded QR-zone decoder instead of running a multi-crop
+  // full-frame tournament on the UI thread.
+  const qr = readQrWholeFrame(img);
+  let qrData = qr?.data ?? null;
+  let rescuedCorners: Point[] | null = null;
+  if (!qrData) {
+    // Decoder tournament, geometry-guided stage: markers first, then re-decode
+    // the QR from its known zone at full resolution (+2x upscale). This is
+    // where dense/small QRs that fail the whole-frame pass get recovered.
+    const grayForRescue = toGray(img);
+    rescuedCorners = findCornerMarkers(grayForRescue);
+    if (rescuedCorners) {
+      const rescued = readQrFromSheetZone(img, rescuedCorners);
+      if (rescued) qrData = rescued.data;
+      else {
+        const preserved = preserveUnidentifiedSheet(grayForRescue, rescuedCorners, state, activeId);
+        if (preserved) return preserved;
+      }
+    }
+    if (!qrData) {
+      return {
+        kind: "image",
+        message: "No QR code found. Make sure the QR is fully visible, focused, and glare-free.",
+        reasonCodes: ["QR_NOT_FOUND"],
+      };
+    }
   }
-  const res = resolveScanIdentity(qr.data, state, activeId);
+  const res = resolveScanIdentity(qrData, state, activeId);
 
   // Identity is always taken from the validated QR. Unknown learners must be
   // resolved through the separate Manual checking workflow, never reassigned
@@ -124,7 +221,8 @@ export function processStillImage(
     };
   }
   const gray = toGray(img);
-  const reading = readSheet(gray, ctx.template, ctx.validByItem);
+  // Reuse corners already found during QR rescue instead of re-searching.
+  const reading = readSheet(gray, ctx.template, ctx.validByItem, rescuedCorners ?? undefined);
   const captureGates = evaluateQualityGates({
     aligned: reading.aligned,
     brightness: reading.brightness,
@@ -201,5 +299,79 @@ export function processStillImage(
     // Align app context to the QR's assessment so Results/Analysis match.
     switchToAssessment:
       res.status === "ASSESSMENT_NOT_ACTIVE" ? assessment.id : null,
+  };
+}
+
+// Complete a preserved (QR-less) sheet after the teacher EXPLICITLY selected
+// the learner. Scores through the exact same review/quality machinery as a
+// QR scan, but marked source:"manual" so the record is attributable to a
+// teacher identity decision, and it still lands in the normal review flow.
+export function completeUnidentifiedScan(
+  preserved: PreservedSheet,
+  state: QrAssessmentState,
+  learnerId: string,
+  evidence: string | null,
+  captureSource: CaptureProvenance,
+): StillOutcome {
+  const assessment = state.assessments.find((a) => a.id === preserved.assessmentId);
+  if (!assessment) {
+    return { kind: "image", message: "The assessment for this preserved scan is no longer loaded.", reasonCodes: [] };
+  }
+  const learner = state.learners.find((l) => l.id === learnerId);
+  if (!learner) {
+    return { kind: "image", message: "Selected learner is not loaded on this device.", reasonCodes: [] };
+  }
+  const ctx = omrContext(state, assessment.id);
+  if (ctx.items.length === 0) {
+    return { kind: "image", message: "This assessment has no letter-choice items for OMR.", reasonCodes: ["NO_OMR_ITEMS"] };
+  }
+  const { reading, version } = preserved;
+  if (!assessment.versions.includes(version)) {
+    return { kind: "image", message: "This preserved scan uses a version that is no longer enabled.", reasonCodes: [] };
+  }
+  if (reading.items.length !== ctx.items.length) {
+    return {
+      kind: "image",
+      message: "The assessment items changed after this sheet was captured. Reprint and rescan the current sheet.",
+      reasonCodes: ["ITEM_COUNT_MISMATCH"],
+    };
+  }
+  if (preserved.itemFingerprint !== itemTemplateFingerprint(ctx.items)) {
+    return {
+      kind: "image",
+      message: "The assessment items changed after this sheet was captured. Reprint and rescan the current sheet.",
+      reasonCodes: ["ITEM_TEMPLATE_MISMATCH"],
+    };
+  }
+  const vk = (state.answerKeys[assessment.id] ?? {})[version] ?? {};
+  const summary = buildReview(ctx.items, vk, reading.items);
+  const confidence = meanConfidence(reading);
+  const quality = scanQuality({
+    confidence,
+    brightness: reading.brightness,
+    sharpness: reading.sharpness,
+    aligned: reading.aligned,
+    doubtfulItems: summary.unclearCount + summary.multipleCount + summary.unreadableCount + summary.lowConfidenceCount,
+    shadowLevel: reading.shadowLevel,
+    tiltAngle: tiltAngle(reading),
+    bubbleDarkness: reading.printContrast,
+    glareLevel: reading.glareLevel,
+    obscuredBubbleCount: reading.obscuredBubbleCount,
+  });
+  return {
+    kind: "ready",
+    result: {
+      assessment,
+      learner,
+      version,
+      summary,
+      reading,
+      source: "manual",
+      captureSource,
+      confidence,
+      quality,
+      evidence,
+    },
+    switchToAssessment: null,
   };
 }

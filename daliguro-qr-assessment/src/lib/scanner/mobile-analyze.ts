@@ -8,7 +8,8 @@ import { decodeQrPayload } from "../qr-parse";
 import { assessmentMatches, type ScanDetection } from "../sync/pairing";
 import { buildTemplate, MAX_ITEMS } from "./omr-template";
 import { ensureCompleteItems, findCornerMarkers, readSheet, toGray, type SheetReading } from "./omr-detect";
-import { readQrSmart } from "./qr-detect";
+import { readQrSmart, readQrWholeFrame } from "./qr-detect";
+import { readQrFromSheetZone } from "./qr-zone-rescue";
 import { BLANK_REVIEW_CONFIDENCE, REVIEW_CONFIDENCE } from "./omr-score";
 import { scanQuality, type ScanQuality } from "./scan-quality";
 import {
@@ -45,6 +46,7 @@ export interface MobileScan {
   // Pixel width frameSharpness was measured at, so stability checks can compare
   // a low-res preview baseline against the high-res final still fairly.
   frameWidth: number;
+  identitySource?: "provided" | "whole-frame" | "region-cascade" | "zone-rescue";
 }
 
 export interface FrameResult {
@@ -74,9 +76,26 @@ export interface FrameAnalysis {
   // back, or a fresh jsQR decode. Callers use fresh decodes to refresh their
   // sticky QR cache.
   qrText: string | null;
+  qrSource: "provided" | "whole-frame" | "region-cascade" | "zone-rescue" | null;
 }
 
 export const AUTO_ACCEPT = 0.8;
+
+type IdentitySource = NonNullable<MobileScan["identitySource"]>;
+
+function analyzedWithSource(
+  img: FrameImage,
+  assessmentId: string,
+  qrText: string,
+  qrSource: IdentitySource,
+): FrameAnalysis {
+  const result = analyzeDecodedFrame(img, assessmentId, qrText);
+  return {
+    result: result.scan ? { ...result, scan: { ...result.scan, identitySource: qrSource } } : result,
+    qrText,
+    qrSource,
+  };
+}
 
 export function avgConfidence(data: ScanDetection[]): number {
   return data.length ? data.reduce((s, d) => s + d.confidence, 0) / data.length : 0;
@@ -268,14 +287,38 @@ export function analyzeFrameData(
   thoroughQr: boolean,
 ): FrameAnalysis {
   if (qrText) {
-    return { result: analyzeDecodedFrame(img, assessmentId, qrText), qrText };
+    return analyzedWithSource(img, assessmentId, qrText, "provided");
+  }
+  // Still/final captures use the measured cascade explicitly: one cheap
+  // whole-frame attempt, then geometry-guided rescue from the original pixels,
+  // then the broader transformed region tournament. This makes the rescue path
+  // observable and avoids paying for every transform before using known sheet
+  // geometry.
+  const whole = thoroughQr ? readQrWholeFrame(img) : null;
+  if (whole) {
+    return analyzedWithSource(img, assessmentId, whole.data, "whole-frame");
+  }
+  if (thoroughQr) {
+    const corners = findCornerMarkers(toGray(img));
+    if (corners) {
+      const rescued = readQrFromSheetZone(img, corners);
+      if (rescued) {
+        return analyzedWithSource(img, assessmentId, rescued.data, "zone-rescue");
+      }
+    }
   }
   const qr = readQrSmart(img, thoroughQr);
   if (!qr) {
     return {
       result: { scan: null, status: "searching", qrVisible: false, markersVisible: false, brightness: quickBrightness(img.data), aligned: false, message: "Find the sheet QR" },
       qrText: null,
+      qrSource: null,
     };
   }
-  return { result: analyzeDecodedFrame(img, assessmentId, qr.data), qrText: qr.data };
+  return analyzedWithSource(
+    img,
+    assessmentId,
+    qr.data,
+    qr.region === "full" ? "whole-frame" : "region-cascade",
+  );
 }

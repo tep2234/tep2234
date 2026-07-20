@@ -1,8 +1,12 @@
 import { describe, expect, it } from "vitest";
 import {
   classifyMediaError,
+  adaptiveAnalyzeInterval,
   emptyDiagnostics,
+  inspectCameraTrack,
   isSecureLike,
+  preferredVideoConstraints,
+  rankVideoDevices,
   STATE_META,
 } from "../src/lib/camera";
 
@@ -88,5 +92,48 @@ describe("emptyDiagnostics", () => {
     expect(d.secureContext).toBeNull();
     expect(d.permissionState).toBe("unknown");
     expect(d.gotStream).toBeNull();
+  });
+});
+
+describe("camera capability negotiation", () => {
+  it("prefers a remembered normal rear camera over front and ultrawide cameras", () => {
+    const ranked = rankVideoDevices([
+      { kind: "videoinput", deviceId: "front", label: "Front Camera" },
+      { kind: "videoinput", deviceId: "ultra", label: "Back Ultra Wide 0.5x" },
+      { kind: "videoinput", deviceId: "rear", label: "Back Camera" },
+    ] as MediaDeviceInfo[], "rear");
+    expect(ranked.map((device) => device.deviceId)).toEqual(["rear", "ultra", "front"]);
+  });
+
+  it("uses ideal acquisition settings unless the teacher selected an exact device", () => {
+    expect(preferredVideoConstraints()).toMatchObject({
+      facingMode: { ideal: "environment" },
+      width: { ideal: 2560 },
+      height: { ideal: 1440 },
+    });
+    expect(preferredVideoConstraints("rear-1")).toMatchObject({ deviceId: { exact: "rear-1" } });
+  });
+
+  it("reports actual granted settings and supported controls", () => {
+    expect(inspectCameraTrack({
+      width: 1920,
+      height: 1080,
+      frameRate: 29.97,
+      facingMode: "environment",
+      deviceId: "rear-1",
+      aspectRatio: 16 / 9,
+    }, { torch: true, focusMode: ["continuous"] } as never)).toMatchObject({
+      width: 1920,
+      height: 1080,
+      facingMode: "environment",
+      deviceId: "rear-1",
+      torchSupported: true,
+    });
+  });
+
+  it("adds backpressure when decoding is slower than the nominal interval", () => {
+    expect(adaptiveAnalyzeInterval(40)).toBe(90);
+    expect(adaptiveAnalyzeInterval(160)).toBe(200);
+    expect(adaptiveAnalyzeInterval(1000)).toBe(500);
   });
 });

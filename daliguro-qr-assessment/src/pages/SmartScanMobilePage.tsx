@@ -7,7 +7,16 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useParams } from "react-router-dom";
-import { classifyMediaError, isSecureLike } from "../lib/camera";
+import {
+  adaptiveAnalyzeInterval,
+  classifyMediaError,
+  inspectCameraTrack,
+  isSecureLike,
+  preferredVideoConstraints,
+  rankVideoDevices,
+  type CameraDeviceChoice,
+  type CameraTrackProfile,
+} from "../lib/camera";
 import { isSupabaseConfigured } from "../lib/supabase/client";
 import { type ScanDetection, type ScoreBroadcast } from "../lib/sync/pairing";
 import { claimSession, getPhoneSubmissionStatus, submitPhoneScan } from "../lib/sync/smartscanSync";
@@ -79,6 +88,12 @@ const ANALYZE_INTERVAL_MS = 90;
 // If the worker hangs (rare — bad frame, browser bug), fall back to the
 // main-thread pipeline rather than stalling the scan loop forever.
 const WORKER_TIMEOUT_MS = 2000;
+const CAMERA_DEVICE_KEY = "smartscan_preferred_camera_v1";
+
+function loadPreferredCameraId(): string {
+  if (typeof window === "undefined") return "";
+  try { return window.localStorage.getItem(CAMERA_DEVICE_KEY) ?? ""; } catch { return ""; }
+}
 
 // Human-readable status for the review screen — every item carries a clear
 // label and (when uncertain) a reason, so nothing is silently empty.
@@ -138,11 +153,13 @@ export default function SmartScanMobilePage() {
   const streamRef = useRef<MediaStream | null>(null);
   const trackEndedCleanupRef = useRef<(() => void) | null>(null);
   const rafRef = useRef<number | null>(null);
+  const videoFrameRequestRef = useRef<number | null>(null);
   const cameraRunRef = useRef(0);
   const loopRef = useRef<() => void>(() => {});
   const accumRef = useRef<FillAccum | null>(null);
   const stabilityRef = useRef<FrameStabilityState | null>(null);
   const lastAnalyzeRef = useRef(0);
+  const analyzeIntervalRef = useRef(ANALYZE_INTERVAL_MS);
   const cooldownUntilRef = useRef(0);
   const workerRef = useRef<Worker | null>(null);
   const workerFailedRef = useRef(forceSyncEngine);
@@ -158,6 +175,7 @@ export default function SmartScanMobilePage() {
     if (import.meta.env.DEV) console.info("[camera-lifecycle]", { cameraLifecycleOutcome: snapshot.outcome });
   }));
   const startCameraRef = useRef<(recovering?: boolean) => void>(() => {});
+  const selectedCameraRef = useRef(initialCameraId);
 
   const [stage, setStage] = useState<Flow>("ready");
   const [error, setError] = useState("");
@@ -169,7 +187,10 @@ export default function SmartScanMobilePage() {
   const [syncState, setSyncState] = useState<SyncState>("idle");
   const [torchAvailable, setTorchAvailable] = useState(false);
   const [torchOn, setTorchOn] = useState(false);
-  const [engineInfo, setEngineInfo] = useState<{ engine: "worker" | "fallback"; ms: number } | null>(null);
+  const [cameraDevices, setCameraDevices] = useState<CameraDeviceChoice[]>([]);
+  const [selectedCameraId, setSelectedCameraId] = useState(initialCameraId);
+  const [cameraProfile, setCameraProfile] = useState<CameraTrackProfile | null>(null);
+  const [engineInfo, setEngineInfo] = useState<{ engine: "worker" | "fallback"; ms: number; intervalMs: number } | null>(null);
   // Outbox of captured-but-unsent scans, persisted per session so neither
   // "Scan next sheet" nor a page reload can lose a teacher's work.
   const outboxKey = `smartscan_outbox_${sessionId}_${assessmentId}`;
@@ -263,10 +284,30 @@ export default function SmartScanMobilePage() {
     [],
   );
 
+  const scheduleNextFrame = useCallback(() => {
+    const video = videoRef.current as (HTMLVideoElement & {
+      requestVideoFrameCallback?: (callback: () => void) => number;
+    }) | null;
+    if (video?.requestVideoFrameCallback) {
+      videoFrameRequestRef.current = video.requestVideoFrameCallback(() => {
+        videoFrameRequestRef.current = null;
+        void loopRef.current();
+      });
+      return;
+    }
+    rafRef.current = requestAnimationFrame(() => {
+      rafRef.current = null;
+      void loopRef.current();
+    });
+  }, []);
+
   const releaseCamera = useCallback(() => {
     cameraRunRef.current += 1;
     if (rafRef.current !== null) cancelAnimationFrame(rafRef.current);
     rafRef.current = null;
+    const video = videoRef.current as (HTMLVideoElement & { cancelVideoFrameCallback?: (id: number) => void }) | null;
+    if (videoFrameRequestRef.current !== null) video?.cancelVideoFrameCallback?.(videoFrameRequestRef.current);
+    videoFrameRequestRef.current = null;
     trackEndedCleanupRef.current?.();
     trackEndedCleanupRef.current = null;
     if (streamRef.current) stopCameraStreamOnce(streamRef.current);
@@ -358,6 +399,7 @@ export default function SmartScanMobilePage() {
               resolve({
                 result: { scan: null, status: "searching", qrVisible: false, markersVisible: false, brightness: 0, aligned: false, message: "Find the sheet QR" },
                 qrText: null,
+                qrSource: null,
               });
             }
           }, WORKER_TIMEOUT_MS);
@@ -436,7 +478,7 @@ export default function SmartScanMobilePage() {
         setLastSent(held.learnerId);
         setSyncState("pc_received");
       }
-      return true;
+      return { status: "accepted" };
     },
     [capability, replaceOutbox],
   );
@@ -465,6 +507,7 @@ export default function SmartScanMobilePage() {
         capturedAt: scan.capturedAt,
         sequenceNumber: capability ? nextPhoneSequence(window.sessionStorage, capability) : 0,
         issuedAt: new Date().toISOString(),
+        identitySource: scan.identitySource,
       };
       if (!capability || held.sequenceNumber < 1) {
         submittingRef.current = false;
@@ -611,8 +654,8 @@ export default function SmartScanMobilePage() {
     if (!runIsActive()) return;
     const now = Date.now();
     // Throttle heavy work so the main thread stays free for taps/scrolling.
-    if (now - lastAnalyzeRef.current < ANALYZE_INTERVAL_MS) {
-      if (runIsActive()) rafRef.current = requestAnimationFrame(() => void loopRef.current());
+    if (now - lastAnalyzeRef.current < analyzeIntervalRef.current) {
+      if (runIsActive()) scheduleNextFrame();
       return;
     }
     lastAnalyzeRef.current = now;
@@ -630,7 +673,13 @@ export default function SmartScanMobilePage() {
       // from a prior frame can bind the next physical sheet to the wrong learner.
       const analysis = await analyzeAsync(frame, nativeQr, false);
       if (!runIsActive()) return;
-      setEngineInfo({ engine: lastEngineRef.current, ms: Math.round(performance.now() - t0) });
+      const analysisMs = performance.now() - t0;
+      analyzeIntervalRef.current = adaptiveAnalyzeInterval(analysisMs, ANALYZE_INTERVAL_MS);
+      setEngineInfo({
+        engine: lastEngineRef.current,
+        ms: Math.round(analysisMs),
+        intervalMs: analyzeIntervalRef.current,
+      });
       const result = analysis.result;
       const genuineQr = analysis.qrText;
       setLastFrame(result);
@@ -700,7 +749,7 @@ export default function SmartScanMobilePage() {
               message: "The final still could not be captured. Hold the sheet still and try again.",
             });
             if (runIsActive()) {
-              rafRef.current = requestAnimationFrame(() => void loopRef.current());
+              scheduleNextFrame();
             }
             return;
           }
@@ -730,7 +779,7 @@ export default function SmartScanMobilePage() {
               message: verified.message,
             });
             if (runIsActive()) {
-              rafRef.current = requestAnimationFrame(() => void loopRef.current());
+              scheduleNextFrame();
             }
             return;
           }
@@ -753,8 +802,8 @@ export default function SmartScanMobilePage() {
         setStableCount(0);
       }
     }
-    if (runIsActive()) rafRef.current = requestAnimationFrame(() => void loopRef.current());
-  }, [analyzeAsync, grabFrame, handleStableScan]);
+    if (runIsActive()) scheduleNextFrame();
+  }, [analyzeAsync, grabFrame, handleStableScan, scheduleNextFrame]);
 
   useEffect(() => {
     loopRef.current = loop;
@@ -782,13 +831,7 @@ export default function SmartScanMobilePage() {
     try {
       const stream = await navigator.mediaDevices
         .getUserMedia({
-          video: {
-            facingMode: { ideal: "environment" },
-            // Ask generously: the sheet QR needs pixels. Capable cameras give
-            // 1440p+; anything else settles on its best supported mode.
-            width: { ideal: 2560 },
-            height: { ideal: 1440 },
-          },
+          video: preferredVideoConstraints(selectedCameraRef.current),
           audio: false,
         })
         .catch((err) => {
@@ -825,6 +868,20 @@ export default function SmartScanMobilePage() {
       try {
         const track = stream.getVideoTracks()[0];
         const caps = track?.getCapabilities?.() as (MediaTrackCapabilities & { torch?: boolean; focusMode?: string[] }) | undefined;
+        if (track) {
+          const profile = inspectCameraTrack(track.getSettings(), caps);
+          setCameraProfile(profile);
+          const devices = rankVideoDevices(
+            await navigator.mediaDevices.enumerateDevices(),
+            selectedCameraRef.current || profile.deviceId || "",
+          );
+          setCameraDevices(devices);
+          if (profile.deviceId) {
+            selectedCameraRef.current = profile.deviceId;
+            setSelectedCameraId(profile.deviceId);
+            try { localStorage.setItem(CAMERA_DEVICE_KEY, profile.deviceId); } catch { /* optional preference */ }
+          }
+        }
         setTorchAvailable(Boolean(caps?.torch));
         if (caps?.focusMode?.includes("continuous")) {
           await track.applyConstraints({ advanced: [{ focusMode: "continuous" } as MediaTrackConstraintSet] });
@@ -851,7 +908,7 @@ export default function SmartScanMobilePage() {
         trackEndedCleanupRef.current = () => activeTrack.removeEventListener("ended", onEnded);
       }
       setStage("live");
-      rafRef.current = requestAnimationFrame(() => loopRef.current());
+      scheduleNextFrame();
     } catch (err) {
       if (lifecycleRef.current.isCurrent(lifecycleGeneration)) {
         lifecycleRef.current.fail(
@@ -988,7 +1045,11 @@ export default function SmartScanMobilePage() {
   return (
     <div className="mx-auto min-h-screen max-w-md bg-slate-950 p-3 text-white">
       <header className="mb-3 rounded-xl bg-indigo-700 px-4 py-3 text-white">
-        <div className="text-lg font-extrabold">DALIguro Phone Scanner</div>
+        <div className="flex items-baseline justify-between gap-2">
+          <div className="text-lg font-extrabold">DALIguro Phone Scanner</div>
+          {/* Build stamp: lets any user screenshot identify a stale cached client. */}
+          <div className="text-[10px] font-mono opacity-70">b{__BUILD_ID__}</div>
+        </div>
         {linkOk ? (
           <div className="text-xs opacity-90">
             Camera companion · PC dashboard is the system of record{assessmentId ? ` · ${assessmentId}` : ""}
@@ -1027,7 +1088,7 @@ export default function SmartScanMobilePage() {
                   <div className="text-xs text-slate-500">Averages {CONSENSUS_FRAMES} steady reads, then requires teacher confirmation before submission.</div>
                   {engineInfo ? (
                     <div className={"mt-0.5 text-[10px] font-bold " + (engineInfo.engine === "worker" ? "text-emerald-600" : "text-amber-600")}>
-                      Engine: {engineInfo.engine === "worker" ? "worker ✓" : "main-thread fallback"} · {engineInfo.ms}ms/frame
+                      Engine: {engineInfo.engine === "worker" ? "worker ✓" : "main-thread fallback"} · {engineInfo.ms}ms decode · {engineInfo.intervalMs}ms schedule
                     </div>
                   ) : null}
                 </div>
@@ -1073,6 +1134,40 @@ export default function SmartScanMobilePage() {
                 <input ref={photoInputRef} type="file" accept="image/jpeg,image/png,.jpg,.jpeg,.png" capture="environment" hidden onChange={(event) => onPhoto(event, "manual-capture")} />
                 <input ref={galleryInputRef} type="file" accept="image/jpeg,image/png,.jpg,.jpeg,.png" hidden onChange={(event) => onPhoto(event, "gallery")} />
               </div>
+              {cameraDevices.length > 1 ? (
+                <label className="mt-3 block text-xs font-bold text-slate-600">
+                  Camera
+                  <select
+                    value={selectedCameraId}
+                    onChange={(event) => {
+                      const deviceId = event.target.value;
+                      selectedCameraRef.current = deviceId;
+                      setSelectedCameraId(deviceId);
+                      try { localStorage.setItem(CAMERA_DEVICE_KEY, deviceId); } catch { /* optional preference */ }
+                      closeCamera();
+                      setStage("ready");
+                      window.setTimeout(() => startCameraRef.current(false), 0);
+                    }}
+                    className="mt-1 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-slate-900"
+                  >
+                    {cameraDevices.map((device) => (
+                      <option key={device.deviceId} value={device.deviceId}>
+                        {device.label}{device.ultrawideLike ? " (ultrawide)" : ""}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              ) : null}
+              {cameraProfile ? (
+                <div className="mt-2 rounded-lg bg-slate-100 px-3 py-2 font-mono text-[10px] text-slate-600" role="status">
+                  Actual camera: {cameraProfile.width ?? "?"}×{cameraProfile.height ?? "?"}
+                  {cameraProfile.frameRate ? ` @ ${Math.round(cameraProfile.frameRate)}fps` : ""}
+                  {cameraProfile.facingMode ? ` · ${cameraProfile.facingMode}` : ""}
+                  {cameraProfile.focusMode ? ` · focus ${cameraProfile.focusMode}` : ""}
+                  {cameraProfile.zoom ? ` · zoom ${cameraProfile.zoom}` : ""}
+                  {cameraProfile.torchSupported ? " · torch" : ""}
+                </div>
+              ) : null}
               {lastFrame?.message ? (
                 <div className="mt-2 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-xs font-bold text-slate-700" role="status" aria-live="polite">
                   {lastFrame.message}
@@ -1093,6 +1188,7 @@ export default function SmartScanMobilePage() {
               <div className="mt-1 grid grid-cols-2 gap-1 text-[11px] text-slate-600">
                 <span>Learner: <b className="text-slate-900">{pendingScan.learnerId}</b></span>
                 <span>Source: <b className="text-slate-900">{pendingScan.captureSource}</b></span>
+                <span>QR path: <b className="text-slate-900">{pendingScan.identitySource ?? "native/unknown"}</b></span>
                 <span>Version: <b className="text-slate-900">{pendingScan.version || "—"}</b></span>
                 <span>Assessment: <b className="text-slate-900">{assessmentId || "—"}</b></span>
                 <span>Items: <b className="text-slate-900">{pendingScan.detected.length}/{pendingScan.totalItems}</b></span>

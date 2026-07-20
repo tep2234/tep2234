@@ -23,6 +23,7 @@ function held(scanId: string, capturedAt: number): HeldScan {
     capturedAt,
     sequenceNumber: capturedAt,
     issuedAt: new Date(capturedAt).toISOString(),
+    identitySource: "zone-rescue",
   };
 }
 
@@ -74,6 +75,7 @@ describe("durable scan outbox primitives", () => {
         capturedAt: 10,
         itemCount: 1,
         confidence: 0.9,
+        identitySource: "zone-rescue",
         statusCounts: { selected: 1 },
       },
     });

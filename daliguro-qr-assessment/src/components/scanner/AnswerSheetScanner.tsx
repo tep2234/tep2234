@@ -41,12 +41,14 @@ import {
 } from "../../lib/scanner/camera-lifecycle";
 import { resolveScanIdentity, type ScanResolution } from "../../lib/scanner/resolve";
 import {
+  completeUnidentifiedScan,
   processStillImage,
   type CaptureProvenance,
+  type PreservedSheet,
   type ScanResult,
 } from "../../lib/scanner/still-pipeline";
 import { Button } from "../ui";
-import { Chip, Recovery } from "./ScanRecovery";
+import { Chip, PreservedRecovery, Recovery } from "./ScanRecovery";
 
 export type { ScanResult } from "../../lib/scanner/still-pipeline";
 
@@ -118,6 +120,8 @@ export function AnswerSheetScanner({
   const [insecure, setInsecure] = useState(false);
   const [imageMsg, setImageMsg] = useState("");
   const [recovery, setRecovery] = useState<ScanResolution | null>(null);
+  // QR-less sheet whose answers were fully read: awaiting explicit teacher identification.
+  const [preserved, setPreserved] = useState<PreservedSheet | null>(null);
   // live feedback
   const [liveQr, setLiveQr] = useState<ScanResolution | null>(null);
   const [aligned, setAligned] = useState(false);
@@ -170,15 +174,24 @@ export function AnswerSheetScanner({
       if (out.kind === "ready") {
         setImageMsg("");
         setRecovery(null);
+        setPreserved(null);
         lastAcceptedRef.current = { learnerId: out.result.learner.id, at: Date.now() };
         if (out.switchToAssessment) onSetActive(out.switchToAssessment);
         onResult(out.result);
       } else if (out.kind === "image") {
         setImageMsg(out.message);
         setRecovery(null);
+        setPreserved(null);
+      } else if (out.kind === "unidentified") {
+        // Answers were fully read but the QR never decoded: hold them for an
+        // explicit teacher identification instead of discarding the scan.
+        setPreserved(out.preserved);
+        setImageMsg("");
+        setRecovery(null);
       } else {
         setRecovery(out.resolution);
         setImageMsg("");
+        setPreserved(null);
       }
     },
     [state, activeId, onSetActive, onResult],
@@ -688,6 +701,31 @@ export function AnswerSheetScanner({
             if (img) runStill(img, lastCaptureSourceRef.current);
           }}
           onDismiss={() => setRecovery(null)}
+        />
+      ) : null}
+
+      {preserved ? (
+        <PreservedRecovery
+          preserved={preserved}
+          state={state}
+          onIdentify={(learnerId) => {
+            const out = completeUnidentifiedScan(
+              preserved,
+              state,
+              learnerId,
+              lastEvidenceRef.current,
+              lastCaptureSourceRef.current,
+            );
+            if (out.kind === "ready") {
+              setPreserved(null);
+              lastAcceptedRef.current = { learnerId: out.result.learner.id, at: Date.now() };
+              onResult(out.result);
+            } else if (out.kind === "image") {
+              setPreserved(null);
+              setImageMsg(out.message);
+            }
+          }}
+          onDismiss={() => setPreserved(null)}
         />
       ) : null}
     </div>

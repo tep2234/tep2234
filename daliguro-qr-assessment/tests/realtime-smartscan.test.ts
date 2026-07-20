@@ -32,6 +32,7 @@ const scan: ScanBroadcast = {
   confidence: 0.95,
   capturedAt: Date.now(),
   deviceName: "Test phone",
+  identitySource: "zone-rescue",
 };
 
 describe("SmartScan secured Realtime envelope", () => {
@@ -55,6 +56,7 @@ describe("SmartScan secured Realtime envelope", () => {
     expect(envelope.payloadText).not.toContain(capability.capability);
     expect(envelope.payloadText.toLowerCase()).not.toContain("token");
     expect(JSON.parse(envelope.payloadText)).not.toHaveProperty("capability");
+    expect(JSON.parse(envelope.payloadText)).toMatchObject({ identitySource: "zone-rescue" });
   });
 
   it("stores only the scoped capability in sessionStorage and expires it locally", () => {
