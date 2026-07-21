@@ -7,7 +7,7 @@
 import { useEffect, useMemo, useState } from "react";
 import QRCode from "qrcode";
 import type { Assessment, Item, Learner, TestVersion } from "../lib/types";
-import { buildQrPayload, qrText } from "../lib/qr";
+import { buildQrPayload, qrTextCompact } from "../lib/qr";
 import {
   bubbleCenter,
   CHOICES,
@@ -90,14 +90,19 @@ export function AnswerSheet({
   version: TestVersion;
 }) {
   const omr = useMemo(() => omrItemsOf(items), [items]);
+  // V3 compact payload: roughly half the bytes of the old JSON payload, so the
+  // printed symbol drops from about 53 to 33 modules and each module is much
+  // larger — the difference between failing and decoding on a
+  // whole-page phone photo. Print spec per the 98% mandate: error correction M
+  // (not Q — Q adds ~25% more modules) and a full 4-module quiet zone.
   const payloadText = useMemo(
-    () => qrText(buildQrPayload(assessment.id, learner, version, omr.length)),
+    () => qrTextCompact(buildQrPayload(assessment.id, learner, version, omr.length)),
     [assessment.id, learner, version, omr.length],
   );
   const [qrUrl, setQrUrl] = useState("");
   useEffect(() => {
     let on = true;
-    QRCode.toDataURL(payloadText, { width: 768, margin: 2, errorCorrectionLevel: "Q" })
+    QRCode.toDataURL(payloadText, { width: 768, margin: 4, errorCorrectionLevel: "M" })
       .then((u) => on && setQrUrl(u))
       .catch(() => on && setQrUrl(""));
     return () => {
@@ -158,8 +163,19 @@ export function AnswerSheet({
         ) : (
           <rect x={QR_ZONE.x} y={QR_ZONE.y} width={QR_ZONE.w} height={QR_ZONE.h} fill="#f1f5f9" />
         )}
-        <text x={QR_PANEL.x + QR_PANEL.w / 2} y={QR_ZONE.y + QR_ZONE.h + 11} textAnchor="middle" fontSize={10} fill={INK}>
-          Scan to check this sheet
+        {/* Visible sheet code == the exact QR payload. When the QR itself will
+            not photograph, the teacher types this into the SmartScan paste box
+            and takes the identical validated path (recoverable completion). */}
+        <text
+          x={QR_PANEL.x + QR_PANEL.w / 2}
+          y={QR_ZONE.y + QR_ZONE.h + 8}
+          textAnchor="middle"
+          fontSize={5.5}
+          fill={INK}
+          style={{ fontFamily: "ui-monospace, Menlo, monospace" }}
+        >
+          <tspan x={QR_PANEL.x + QR_PANEL.w / 2}>{payloadText.slice(0, 34)}</tspan>
+          <tspan x={QR_PANEL.x + QR_PANEL.w / 2} dy={7}>{payloadText.slice(34)}</tspan>
         </text>
 
         {/* Learner info panel */}

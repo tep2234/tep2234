@@ -10,8 +10,9 @@ import {
   SHEET_H,
   SHEET_W,
 } from "../src/lib/scanner/omr-template";
-import { readSheet, toGray } from "../src/lib/scanner/omr-detect";
+import { readSheet, toGray, type OmrPerformanceProfile } from "../src/lib/scanner/omr-detect";
 import { buildReview } from "../src/lib/scanner/omr-score";
+import { compositeImageDataOntoWhite } from "../src/lib/scanner/image-ingestion";
 import type { Item, Learner } from "../src/lib/types";
 
 // The sheet is rendered at 2x canonical scale, imitating a hi-res photo, so
@@ -68,6 +69,20 @@ const learner: Learner = {
 
 describe("OMR end-to-end on a rendered image (SmartScan v2 sheet)", () => {
   it("decodes the QR, verifies the checksum, reads bubbles + version, and scores", () => {
+    const profile = {
+      fileParsingMs: 0,
+      imageDecodingMs: 0,
+      canvasNormalizationMs: 0,
+      qrDetectionMs: 0,
+      renderingMs: 0,
+      reactStateUpdatesMs: 0,
+      markerDetectionMs: 0,
+      geometryCorrectionMs: 0,
+      bubbleSamplingMs: 0,
+      confidenceCalculationMs: 0,
+      reviewCalculationMs: 0,
+    };
+    const renderingStartedAt = performance.now();
     const items = Array.from({ length: 10 }, (_, i) => mcItem(i + 1));
     const t = buildTemplate(10);
     const KEY = ["B", "C", "A", "D", "B", "C", "A", "D", "B", "C"];
@@ -102,9 +117,12 @@ describe("OMR end-to-end on a rendered image (SmartScan v2 sheet)", () => {
       const b = t.bubbles.find((x) => x.item === i + 1 && x.choiceIndex === ci)!;
       disc(img, b.cx * S, b.cy * S, b.r * S * 0.8, 0);
     });
+    profile.renderingMs = performance.now() - renderingStartedAt;
 
     // --- run the SAME pipeline the app uses ---
+    const qrStartedAt = performance.now();
     const decoded = jsQR(img.data, img.width, img.height, { inversionAttempts: "attemptBoth" });
+    profile.qrDetectionMs = performance.now() - qrStartedAt;
     expect(decoded?.data).toBe(payload); // QR really decodes from the image
 
     const parsed = parseQrPayload(decoded!.data, {
@@ -115,15 +133,43 @@ describe("OMR end-to-end on a rendered image (SmartScan v2 sheet)", () => {
     expect(parsed.ok).toBe(true);
     if (parsed.ok) expect(parsed.payload.n).toBe(10);
 
-    const reading = readSheet(toGray(img), t, {});
+    const normalizationStartedAt = performance.now();
+    const grayBeforeNormalization = toGray(img);
+    const normalized = compositeImageDataOntoWhite({
+      ...img,
+      data: img.data.slice(),
+      colorSpace: "srgb",
+    } as ImageData);
+    const grayAfterNormalization = toGray(normalized);
+    profile.canvasNormalizationMs = performance.now() - normalizationStartedAt;
+    expect(grayAfterNormalization.data.length).toBe(grayBeforeNormalization.data.length);
+    let firstNormalizationMismatch = -1;
+    for (let index = 0; index < grayAfterNormalization.data.length; index += 1) {
+      if (grayAfterNormalization.data[index] !== grayBeforeNormalization.data[index]) {
+        firstNormalizationMismatch = index;
+        break;
+      }
+    }
+    expect(firstNormalizationMismatch).toBe(-1);
+    const omrProfile: OmrPerformanceProfile = {
+      markerDetectionMs: 0,
+      geometryCorrectionMs: 0,
+      bubbleSamplingMs: 0,
+      confidenceCalculationMs: 0,
+    };
+    const reading = readSheet(grayAfterNormalization, t, {}, undefined, omrProfile);
+    Object.assign(profile, omrProfile);
     expect(reading.aligned).toBe(true);
     // Layer-2 identity: the shaded version row matches the QR's version.
     expect(reading.version.detected).toBe("A");
 
+    const reviewStartedAt = performance.now();
     const summary = buildReview(items, key, reading.items);
+    profile.reviewCalculationMs = performance.now() - reviewStartedAt;
     expect(summary.rawScore).toBe(8);
     expect(summary.totalScore).toBe(10);
     expect(summary.blankCount).toBe(1);
     expect(summary.needsReview).toBe(false);
+    console.info("[omr-performance]", profile);
   });
 });

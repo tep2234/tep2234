@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildQrPayload, qrText } from "../src/lib/qr";
+import { buildQrPayload, qrText, qrTextCompact } from "../src/lib/qr";
 import { parseQrPayload, type QrParseContext } from "../src/lib/qr-parse";
 import type { Learner } from "../src/lib/types";
 
@@ -109,5 +109,62 @@ describe("parseQrPayload", () => {
 
   it("rejects a JSON array (not an identity object)", () => {
     expect(parseQrPayload("[1,2,3]", ctx()).ok).toBe(false);
+  });
+});
+
+describe("parseQrPayload — V3 compact format", () => {
+  const v3 = () => qrTextCompact(buildQrPayload("A1", learner(), "B", 10));
+
+  it("accepts a valid V3 code and resolves the same identity as v2", () => {
+    const res = parseQrPayload(v3(), ctx());
+    expect(res.ok).toBe(true);
+    if (res.ok) {
+      expect(res.payload.assessmentId).toBe("A1");
+      expect(res.payload.learnerId).toBe("L1");
+      expect(res.payload.version).toBe("B");
+      expect(res.payload.n).toBe(10);
+      // identity-only by construction: no PII travels in the QR
+      expect(res.payload.lrn).toBe("");
+      expect(res.payload.section).toBe("");
+    }
+  });
+
+  it("rejects a V3 code whose checksum no longer matches (damaged/altered)", () => {
+    const tampered = v3().replace("|L1|", "|L2|");
+    const res = parseQrPayload(tampered, ctx({ hasLearner: () => true }));
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.reason).toMatch(/integrity/i);
+  });
+
+  it("rejects a V3 code with a damaged field count", () => {
+    const res = parseQrPayload("DG3|A1|L1|B", ctx());
+    expect(res.ok).toBe(false);
+  });
+
+  it("keeps a unique sheet token in the compact payload", () => {
+    const first = qrTextCompact(buildQrPayload("A1", learner(), "A", 10));
+    const second = qrTextCompact(buildQrPayload("A1", learner(), "A", 10));
+    expect(first).not.toBe(second);
+    const decoded = parseQrPayload(first, ctx());
+    expect(decoded.ok && decoded.payload.securityToken.length).toBeGreaterThanOrEqual(12);
+  });
+
+  it("rejects a V3 code for a version not enabled on the assessment", () => {
+    const text = qrTextCompact(buildQrPayload("A1", learner(), "D", 10));
+    const res = parseQrPayload(text, ctx({ versions: ["A", "B"] }));
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.reason).toMatch(/version/i);
+  });
+
+  it("rejects a V3 code for an unknown learner instead of guessing", () => {
+    const text = qrTextCompact(buildQrPayload("A1", learner({ id: "L9" }), "A", 10));
+    const res = parseQrPayload(text, ctx());
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.reason).toMatch(/not found/i);
+  });
+
+  it("falls back to the v2 JSON payload when an id contains the field separator", () => {
+    const text = qrTextCompact(buildQrPayload("A|1", learner(), "A", 10));
+    expect(text.startsWith("{")).toBe(true);
   });
 });

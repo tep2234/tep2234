@@ -26,10 +26,29 @@ import {
   REQUIRED_STABLE_FRAMES,
   type FrameStabilityState,
 } from "../../lib/scanner/frame-stability";
+import {
+  type StableCaptureExpectation,
+  verifyFinalCaptureStability,
+} from "../../lib/scanner/final-capture";
+import {
+  ingestGalleryImage,
+  ScannerGeneration,
+} from "../../lib/scanner/image-ingestion";
+import {
+  CameraLifecycleMachine,
+  stopCameraStreamOnce,
+  type CameraLifecycleOutcome,
+} from "../../lib/scanner/camera-lifecycle";
 import { resolveScanIdentity, type ScanResolution } from "../../lib/scanner/resolve";
-import { processStillImage, type ScanResult } from "../../lib/scanner/still-pipeline";
+import {
+  completeUnidentifiedScan,
+  processStillImage,
+  type CaptureProvenance,
+  type PreservedSheet,
+  type ScanResult,
+} from "../../lib/scanner/still-pipeline";
 import { Button } from "../ui";
-import { Chip, Recovery } from "./ScanRecovery";
+import { Chip, PreservedRecovery, Recovery } from "./ScanRecovery";
 
 export type { ScanResult } from "../../lib/scanner/still-pipeline";
 
@@ -46,11 +65,6 @@ const LIVE_W = 900;
 const HOLD_MS = 1100; // stable-good time before auto-capture
 const COOLDOWN_MS = 3500; // pause after a capture before the next auto fire
 const SAME_SHEET_MS = 8000; // extra wait before re-capturing the SAME learner
-
-interface StableCaptureExpectation {
-  identity: string;
-  state: FrameStabilityState;
-}
 
 function quickBrightness(data: Uint8ClampedArray | number[]): number {
   let sum = 0;
@@ -77,8 +91,10 @@ export function AnswerSheetScanner({
   const videoRef = useRef<HTMLVideoElement>(null);
   const liveCanvasRef = useRef<HTMLCanvasElement>(null);
   const capCanvasRef = useRef<HTMLCanvasElement>(null);
-  const fileInputRef = useRef<HTMLInputElement>(null);
+  const photoInputRef = useRef<HTMLInputElement>(null);
+  const galleryInputRef = useRef<HTMLInputElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
+  const trackEndedCleanupRef = useRef<(() => void) | null>(null);
   const rafRef = useRef<number | null>(null);
   const detectorRef = useRef<BarcodeDetectorLike | null>(null);
   const loopRef = useRef<() => void>(() => {});
@@ -86,18 +102,26 @@ export function AnswerSheetScanner({
   const sessionRef = useRef(0);
   const lastImageRef = useRef<ImageData | null>(null);
   const lastEvidenceRef = useRef<string | null>(null);
+  const lastCaptureSourceRef = useRef<CaptureProvenance>("manual-capture");
   // Auto-capture pacing.
   const goodSinceRef = useRef<number | null>(null);
   const stabilityRef = useRef<FrameStabilityState | null>(null);
   const cooldownUntilRef = useRef(0);
   const lastAcceptedRef = useRef<{ learnerId: string; at: number } | null>(null);
   const capturingRef = useRef(false);
+  const galleryGenerationRef = useRef(new ScannerGeneration());
+  const lifecycleRef = useRef(new CameraLifecycleMachine((snapshot) => {
+    if (import.meta.env.DEV) console.info("[camera-lifecycle]", { cameraLifecycleOutcome: snapshot.outcome });
+  }));
+  const startRef = useRef<(recovering?: boolean) => void>(() => {});
 
   const [phase, setPhase] = useState<Phase>("idle");
   const [camMessage, setCamMessage] = useState("");
   const [insecure, setInsecure] = useState(false);
   const [imageMsg, setImageMsg] = useState("");
   const [recovery, setRecovery] = useState<ScanResolution | null>(null);
+  // QR-less sheet whose answers were fully read: awaiting explicit teacher identification.
+  const [preserved, setPreserved] = useState<PreservedSheet | null>(null);
   // live feedback
   const [liveQr, setLiveQr] = useState<ScanResolution | null>(null);
   const [aligned, setAligned] = useState(false);
@@ -112,14 +136,18 @@ export function AnswerSheetScanner({
       cancelAnimationFrame(rafRef.current);
       rafRef.current = null;
     }
-    streamRef.current?.getTracks().forEach((t) => t.stop());
+    trackEndedCleanupRef.current?.();
+    trackEndedCleanupRef.current = null;
+    if (streamRef.current) stopCameraStreamOnce(streamRef.current);
     streamRef.current = null;
     if (videoRef.current) videoRef.current.srcObject = null;
   }, []);
 
   const stop = useCallback(() => {
+    const stoppedGeneration = lifecycleRef.current.stop();
     sessionRef.current += 1;
     release();
+    lifecycleRef.current.stopped(stoppedGeneration);
     setLiveQr(null);
     setAligned(false);
     setHolding(false);
@@ -133,21 +161,37 @@ export function AnswerSheetScanner({
   // ---------- core pipeline (used by photo AND live capture) ----------
   // Runs the pure still-image pipeline, then routes its outcome into UI state.
   const runStill = useCallback(
-    (img: ImageData) => {
-      const out = processStillImage(img, state, activeId, lastEvidenceRef.current);
+    (img: ImageData, captureSource: CaptureProvenance, evidence = lastEvidenceRef.current) => {
+      lastCaptureSourceRef.current = captureSource;
+      const analysisStartedAt = performance.now();
+      const out = processStillImage(img, state, activeId, evidence, captureSource);
+      if (import.meta.env.DEV) {
+        console.info("[scanner-analysis]", {
+          analysisDurationMs: Math.round((performance.now() - analysisStartedAt) * 100) / 100,
+        });
+      }
       cooldownUntilRef.current = Date.now() + COOLDOWN_MS;
       if (out.kind === "ready") {
         setImageMsg("");
         setRecovery(null);
+        setPreserved(null);
         lastAcceptedRef.current = { learnerId: out.result.learner.id, at: Date.now() };
         if (out.switchToAssessment) onSetActive(out.switchToAssessment);
         onResult(out.result);
       } else if (out.kind === "image") {
         setImageMsg(out.message);
         setRecovery(null);
+        setPreserved(null);
+      } else if (out.kind === "unidentified") {
+        // Answers were fully read but the QR never decoded: hold them for an
+        // explicit teacher identification instead of discarding the scan.
+        setPreserved(out.preserved);
+        setImageMsg("");
+        setRecovery(null);
       } else {
         setRecovery(out.resolution);
         setImageMsg("");
+        setPreserved(null);
       }
     },
     [state, activeId, onSetActive, onResult],
@@ -198,57 +242,51 @@ export function AnswerSheetScanner({
         const identity = readQrSmart(img, true)?.data ?? null;
         const brightness = Math.round(quickBrightness(img.data));
         const sharpness = sharpnessOf(gray);
-        if (!geometry || identity !== expected.identity) {
-          setStabilityMessage("The sheet or QR moved during capture. Hold the same sheet still and try again.");
-          return false;
-        }
-        const finalObservation = advanceFrameStability(expected.state, {
+        const finalObservation = verifyFinalCaptureStability(expected, {
           identity,
           geometry,
           luminance: brightness,
           sharpness,
+          sharpnessWidth: img.width,
           observedAt: Date.now(),
-          freshIdentity: true,
         });
-        if (
-          !finalObservation.ready ||
-          brightness < 70 ||
-          brightness > 245 ||
-          sharpness < 2.4
-        ) {
-          setStabilityMessage("Movement, focus, or lighting changed during capture. Hold still for four new stable frames.");
+        if (!finalObservation.ok) {
+          setStabilityMessage(finalObservation.message);
           return false;
         }
       }
       lastImageRef.current = img;
-      runStill(img);
+      runStill(img, expected ? "camera-final" : "manual-capture");
       return true;
     } finally {
       capturingRef.current = false;
     }
   }, [grabImageData, runStill]);
 
-  const onPhoto = useCallback(
-    (e: React.ChangeEvent<HTMLInputElement>) => {
+  const onImageFile = useCallback(
+    async (e: React.ChangeEvent<HTMLInputElement>, captureSource: CaptureProvenance) => {
       const file = e.target.files?.[0];
       e.target.value = "";
       if (!file) return;
+      stop();
+      const request = galleryGenerationRef.current.begin();
       setImageMsg("Reading photo…");
-      const im = new Image();
-      im.onload = () => {
-        const data = grabImageData(im, im.naturalWidth, im.naturalHeight);
-        URL.revokeObjectURL(im.src);
-        if (!data) {
-          setImageMsg("Could not read that image.");
-          return;
-        }
-        lastImageRef.current = data;
-        runStill(data);
-      };
-      im.onerror = () => setImageMsg("Could not open that photo. Try another.");
-      im.src = URL.createObjectURL(file);
+      const canvas = capCanvasRef.current;
+      if (!canvas) {
+        setImageMsg("[IMAGE_DECODE_FAILED] The image-processing canvas is unavailable.");
+        return;
+      }
+      const ingested = await ingestGalleryImage(file, canvas, request.signal);
+      if (!galleryGenerationRef.current.isCurrent(request.generation)) return;
+      if (!ingested.ok) {
+        setImageMsg(`[${ingested.code}] ${ingested.message}`);
+        return;
+      }
+      lastEvidenceRef.current = ingested.evidence;
+      lastImageRef.current = ingested.image;
+      runStill(ingested.image, captureSource, ingested.evidence);
     },
-    [grabImageData, runStill],
+    [runStill, stop],
   );
 
   // ---------- live preview loop (status chips + auto-capture) ----------
@@ -332,6 +370,7 @@ export function AnswerSheetScanner({
           geometry,
           luminance: bright,
           sharpness,
+          sharpnessWidth: frame.width,
           observedAt: now,
           freshIdentity: true,
         });
@@ -384,9 +423,14 @@ export function AnswerSheetScanner({
     loopRef.current = () => void loop();
   }, [loop]);
 
-  const start = useCallback(async () => {
+  const start = useCallback(async (recovering = false) => {
+    galleryGenerationRef.current.cancel();
+    const lifecycleGeneration = recovering
+      ? lifecycleRef.current.recover()
+      : lifecycleRef.current.request();
+    if (lifecycleGeneration === null) return;
     const session = (sessionRef.current += 1);
-    const alive = () => mountedRef.current && session === sessionRef.current;
+    const alive = () => mountedRef.current && session === sessionRef.current && lifecycleRef.current.isCurrent(lifecycleGeneration);
     setCamMessage("");
     setInsecure(false);
     stabilityRef.current = null;
@@ -397,12 +441,14 @@ export function AnswerSheetScanner({
     logCameraContext("scan-start");
 
     if (!isSecureLike()) {
+      lifecycleRef.current.fail(lifecycleGeneration, "start-failed");
       setPhase("error");
       setInsecure(true);
       setCamMessage(INSECURE_MESSAGE);
       return;
     }
     if (!navigator.mediaDevices?.getUserMedia) {
+      lifecycleRef.current.fail(lifecycleGeneration, "start-failed");
       setPhase("error");
       setCamMessage("This browser can't open a camera here. Use the photo button instead.");
       return;
@@ -432,17 +478,28 @@ export function AnswerSheetScanner({
         });
     } catch (err) {
       if (!alive()) return;
+      lifecycleRef.current.fail(
+        lifecycleGeneration,
+        err instanceof DOMException && (err.name === "NotAllowedError" || err.name === "PermissionDeniedError")
+          ? "permission-denied"
+          : "start-failed",
+      );
       setPhase("error");
       setCamMessage(classifyMediaError(err, true).message);
       return;
     }
     if (!alive()) {
-      stream.getTracks().forEach((t) => t.stop());
+      stopCameraStreamOnce(stream);
+      return;
+    }
+    if (!lifecycleRef.current.starting(lifecycleGeneration)) {
+      stopCameraStreamOnce(stream);
       return;
     }
     streamRef.current = stream;
     const v = videoRef.current;
     if (!v) {
+      lifecycleRef.current.fail(lifecycleGeneration, "start-failed");
       release();
       return;
     }
@@ -450,22 +507,91 @@ export function AnswerSheetScanner({
     v.srcObject = stream;
     try {
       await v.play();
-    } catch {
-      /* muted autoplay */
+    } catch (error) {
+      if (alive()) {
+        lifecycleRef.current.fail(lifecycleGeneration, "start-failed");
+        setPhase("error");
+        setCamMessage(classifyMediaError(error, true).message);
+      }
+      release();
+      return;
     }
     if (!alive()) {
       release();
       return;
     }
+    if (!lifecycleRef.current.activate(lifecycleGeneration)) {
+      release();
+      return;
+    }
+    const track = stream.getVideoTracks()[0];
+    if (track) {
+      const onEnded = () => {
+        if (lifecycleRef.current.snapshot().state !== "ACTIVE") return;
+        lifecycleRef.current.suspend("track-ended");
+        sessionRef.current += 1;
+        release();
+        setPhase("idle");
+        if (document.visibilityState === "visible") {
+          void startRef.current(true);
+        }
+      };
+      track.addEventListener("ended", onEnded, { once: true });
+      trackEndedCleanupRef.current = () => track.removeEventListener("ended", onEnded);
+    }
     rafRef.current = requestAnimationFrame(() => loopRef.current());
   }, [release]);
 
   useEffect(() => {
+    startRef.current = (recovering = false) => { void start(recovering); };
+  }, [start]);
+
+  useEffect(() => {
+    const suspend = (outcome: Extract<CameraLifecycleOutcome, "page-hidden" | "focus-lost" | "device-change">) => {
+      const state = lifecycleRef.current.snapshot().state;
+      const canSuspend = outcome === "page-hidden"
+        ? ["REQUESTING_PERMISSION", "STARTING", "ACTIVE"].includes(state)
+        : state === "ACTIVE";
+      if (!canSuspend) return;
+      if (!lifecycleRef.current.suspend(outcome)) return;
+      sessionRef.current += 1;
+      release();
+      setPhase("idle");
+    };
+    const recover = () => {
+      if (document.visibilityState !== "visible") return;
+      startRef.current(true);
+    };
+    const onVisibility = () => document.visibilityState === "hidden" ? suspend("page-hidden") : recover();
+    const onBlur = () => suspend("focus-lost");
+    const onFocus = () => recover();
+    const onDeviceChange = () => {
+      suspend("device-change");
+      recover();
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    window.addEventListener("blur", onBlur);
+    window.addEventListener("focus", onFocus);
+    navigator.mediaDevices?.addEventListener?.("devicechange", onDeviceChange);
+    return () => {
+      document.removeEventListener("visibilitychange", onVisibility);
+      window.removeEventListener("blur", onBlur);
+      window.removeEventListener("focus", onFocus);
+      navigator.mediaDevices?.removeEventListener?.("devicechange", onDeviceChange);
+    };
+  }, [release]);
+
+  useEffect(() => {
+    const galleryGeneration = galleryGenerationRef.current;
+    const lifecycle = lifecycleRef.current;
     mountedRef.current = true;
     return () => {
       mountedRef.current = false;
+      galleryGeneration.cancel();
+      const stoppedGeneration = lifecycle.stop();
       sessionRef.current += 1;
       release();
+      lifecycle.stopped(stoppedGeneration);
     };
   }, [release]);
 
@@ -485,7 +611,8 @@ export function AnswerSheetScanner({
           <span className="rounded-full bg-slate-100 px-2 py-0.5 text-xs text-slate-500">jsQR fallback</span>
         ) : null}
         <div className="ml-auto flex flex-wrap gap-2">
-          <Button onClick={() => fileInputRef.current?.click()}>📷 Scan with camera</Button>
+          <Button onClick={() => photoInputRef.current?.click()}>📷 Take Photo</Button>
+          <Button variant="small" onClick={() => galleryInputRef.current?.click()}>🖼️ Choose Existing Image</Button>
           {live ? (
             <>
               <Button variant="small" onClick={() => { void capture(); }}>📸 Capture now</Button>
@@ -497,11 +624,12 @@ export function AnswerSheetScanner({
             </Button>
           )}
         </div>
-        <input ref={fileInputRef} type="file" accept="image/*" capture="environment" hidden onChange={onPhoto} />
+        <input ref={photoInputRef} type="file" accept="image/jpeg,image/png,.jpg,.jpeg,.png" capture="environment" hidden onChange={(event) => void onImageFile(event, "manual-capture")} />
+        <input ref={galleryInputRef} type="file" accept="image/jpeg,image/png,.jpg,.jpeg,.png" hidden onChange={(event) => void onImageFile(event, "gallery")} />
       </div>
 
       <p className="mt-2 text-xs text-slate-500">
-        <b>📷 Scan with camera</b> photographs one sheet. <b>Live camera</b> auto-captures
+        <b>📷 Take Photo</b> photographs one sheet. <b>🖼️ Choose Existing Image</b> securely scans a saved JPEG or PNG. <b>Live camera</b> auto-captures
         each sheet after ~1 second of steady framing — all four black corners + QR visible,
         flat and well-lit — so you can go through a pile paper after paper.
       </p>
@@ -534,10 +662,10 @@ export function AnswerSheetScanner({
         {!live ? (
           <div className="absolute inset-0 flex items-center justify-center px-4 text-center text-sm text-slate-300">
             {phase === "error"
-              ? "⚠ Live camera unavailable — use 📷 Scan with camera."
+              ? "⚠ Live camera unavailable — take a photo or choose an existing image."
               : phase === "requesting"
                 ? "Waiting for permission… choose Allow."
-                : "Use 📷 Scan with camera, or start the live camera for hands-free batch scanning."}
+                : "Take a photo, choose an existing image, or start the live camera for hands-free batch scanning."}
           </div>
         ) : null}
       </div>
@@ -570,9 +698,34 @@ export function AnswerSheetScanner({
             onSetActive(id);
             const img = lastImageRef.current;
             setRecovery(null);
-            if (img) runStill(img);
+            if (img) runStill(img, lastCaptureSourceRef.current);
           }}
           onDismiss={() => setRecovery(null)}
+        />
+      ) : null}
+
+      {preserved ? (
+        <PreservedRecovery
+          preserved={preserved}
+          state={state}
+          onIdentify={(learnerId) => {
+            const out = completeUnidentifiedScan(
+              preserved,
+              state,
+              learnerId,
+              lastEvidenceRef.current,
+              lastCaptureSourceRef.current,
+            );
+            if (out.kind === "ready") {
+              setPreserved(null);
+              lastAcceptedRef.current = { learnerId: out.result.learner.id, at: Date.now() };
+              onResult(out.result);
+            } else if (out.kind === "image") {
+              setPreserved(null);
+              setImageMsg(out.message);
+            }
+          }}
+          onDismiss={() => setPreserved(null)}
         />
       ) : null}
     </div>

@@ -7,21 +7,26 @@ import { getSupabaseClient } from "../supabase/client";
 import type { Result, ScanItemStatus } from "../types";
 import {
   checkedResultRow,
-  expiresAt,
   generatePairingToken,
   hashToken,
-  isExpired,
-  verifyPairingToken,
   type CheckedResultRow,
   type RowContext,
 } from "./pairing";
+import type {
+  PhoneCapability,
+  PhoneInboxRow,
+  PhoneSubmissionEnvelope,
+  PhoneSubmissionStatus,
+} from "./realtime-security";
 
 export interface SessionRow {
   id: string;
   teacher_user_id: string;
   school_id: string | null;
   assessment_id: string;
-  session_token_hash: string;
+  assessment_scope_id: string;
+  allowed_versions: string[];
+  item_count: number;
   status: "active" | "paired" | "expired" | "ended";
   paired_device_name: string | null;
   paired_at: string | null;
@@ -36,32 +41,65 @@ export interface CreatedSession {
   expiresAtMs: number;
 }
 
+export class PairingSessionError extends Error {
+  readonly code: string;
+
+  constructor(code: string, message: string) {
+    super(message);
+    this.name = "PairingSessionError";
+    this.code = code;
+  }
+}
+
+export function pairingSessionErrorMessage(error: unknown): string {
+  if (error instanceof PairingSessionError) {
+    if (error.code === "PGRST202" || error.code === "42883") {
+      return "Phone pairing is not installed on this Supabase project yet. Apply the reviewed SmartScan realtime migration, then retry.";
+    }
+    if (error.code === "28000" || error.code === "PGRST302") {
+      return "Direct pairing could not obtain a secure browser identity. Enable Anonymous Sign-Ins in Supabase Auth, then reload.";
+    }
+    if (error.code === "42501") {
+      return "This browser is not authorized to create a phone pairing session. Reload to renew direct pairing, then retry.";
+    }
+  }
+  if (error instanceof Error && error.message.includes("Web Crypto unavailable")) {
+    return "Pairing needs a secure page (HTTPS or localhost). Open the teacher app at http://localhost:5173 on this computer, or restart with `npm run dev:https` and use the https:// address on both devices.";
+  }
+  return "Could not reach the phone pairing service. Check the connection and retry.";
+}
+
 // PC creates a pairing session. Only the token HASH is stored; the raw token is
 // returned to the caller to embed in the QR/URL.
 export async function createPairingSession(args: {
-  teacherUserId: string;
   assessmentId: string;
-  schoolId?: string | null;
+  learnerIds: string[];
+  allowedVersions: string[];
+  itemCount: number;
 }): Promise<CreatedSession | null> {
   const sb = getSupabaseClient();
   if (!sb) return null;
   const token = generatePairingToken();
   const hash = await hashToken(token);
-  const expMs = expiresAt();
-  const { data, error } = await sb
-    .from("smartscan_sessions")
-    .insert({
-      teacher_user_id: args.teacherUserId,
-      assessment_id: args.assessmentId,
-      school_id: args.schoolId ?? null,
-      session_token_hash: hash,
-      status: "active",
-      expires_at: new Date(expMs).toISOString(),
-    })
-    .select("id")
-    .single();
-  if (error || !data) return null;
-  return { sessionId: data.id as string, token, expiresAtMs: expMs };
+  const { data, error } = await sb.rpc("create_smartscan_pairing_session", {
+    p_assessment_id: args.assessmentId,
+    p_pairing_token_hash: hash,
+    p_learner_ids: args.learnerIds,
+    p_allowed_versions: args.allowedVersions,
+    p_item_count: args.itemCount,
+  });
+  const record = Array.isArray(data) ? data[0] : data;
+  if (error) {
+    throw new PairingSessionError(error.code ?? "unknown", error.message);
+  }
+  if (!record || typeof record.session_id !== "string" || typeof record.expires_at !== "string") {
+    throw new PairingSessionError("invalid_response", "Pairing service returned an invalid response.");
+  }
+  return {
+    sessionId: record.session_id,
+    token,
+    expiresAtMs: new Date(record.expires_at).getTime(),
+  };
 }
 
 export async function getSession(sessionId: string): Promise<SessionRow | null> {
@@ -72,10 +110,11 @@ export async function getSession(sessionId: string): Promise<SessionRow | null> 
 }
 
 export type ClaimResult =
-  | { ok: true; session: SessionRow }
-  | { ok: false; reason: "not_found" | "invalid_token" | "expired" | "ended" | "offline" };
+  | { ok: true; capability: PhoneCapability }
+  | { ok: false; reason: "invalid_or_expired" | "offline" };
 
-// Phone claims a session: verify token hash, check expiry/status, mark paired.
+// Phone claims a session through the atomic server boundary. The pairing token
+// is consumed and never becomes the reusable submission credential.
 export async function claimSession(
   sessionId: string,
   token: string,
@@ -83,36 +122,154 @@ export async function claimSession(
 ): Promise<ClaimResult> {
   const sb = getSupabaseClient();
   if (!sb) return { ok: false, reason: "offline" };
-  const session = await getSession(sessionId);
-  if (!session) return { ok: false, reason: "not_found" };
-  if (session.status === "ended") return { ok: false, reason: "ended" };
-  if (isExpired(new Date(session.expires_at).getTime())) return { ok: false, reason: "expired" };
-  if (!(await verifyPairingToken(token, session.session_token_hash))) {
-    return { ok: false, reason: "invalid_token" };
+  const { data, error } = await sb.rpc("claim_smartscan_session", {
+    p_session_id: sessionId,
+    p_pairing_token: token,
+    p_device_name: deviceName.slice(0, 160),
+  });
+  const record = Array.isArray(data) ? data[0] : data;
+  if (error || !record || typeof record.capability !== "string") {
+    return { ok: false, reason: "invalid_or_expired" };
   }
-  const now = new Date().toISOString();
-  const { data } = await sb
-    .from("smartscan_sessions")
-    .update({ status: "paired", paired_at: now, last_seen_at: now, paired_device_name: deviceName })
-    .eq("id", sessionId)
-    .select("*")
-    .single();
-  return { ok: true, session: (data as SessionRow) ?? session };
+  return {
+    ok: true,
+    capability: {
+      sessionId,
+      capability: record.capability,
+      capabilityExpiresAtMs: new Date(record.capability_expires_at).getTime(),
+      assessmentId: record.assessment_id,
+      schoolId: record.school_id,
+      itemCount: record.item_count,
+      allowedVersions: record.allowed_versions,
+      nextSequence: record.next_sequence,
+    },
+  };
 }
 
 export async function endSession(sessionId: string): Promise<void> {
   const sb = getSupabaseClient();
   if (!sb) return;
-  await sb.from("smartscan_sessions").update({ status: "ended" }).eq("id", sessionId);
+  await sb.rpc("end_smartscan_pairing_session", { p_session_id: sessionId });
 }
 
-export async function touchSession(sessionId: string): Promise<void> {
+export type PhoneIngressResult =
+  | { ok: true; inboxReceiptId: string; receivedAt: string; replayed: boolean }
+  | { ok: false; reason: "offline" | "rejected"; code: string | null; permanent: boolean };
+
+// Envelope-intrinsic rejections that can never succeed on retry of the SAME
+// message: malformed payload, a message_id reused with a different payload, and
+// timestamps or learner/version scope that are fixed at capture time. Every
+// other failure (transport, expired capability, out-of-order sequence) is
+// transient and must stay queued for a later retry rather than being dropped.
+const PERMANENT_PHONE_REJECTIONS = new Set([
+  "invalid_phone_submission",
+  "message_id_payload_mismatch",
+  "message_timestamp_outside_window",
+  "capture_timestamp_outside_window",
+  "submission_scope_mismatch",
+]);
+
+export function classifyPhoneRejection(
+  error: { message?: string } | null,
+): { code: string | null; permanent: boolean } {
+  const message = error?.message?.trim();
+  if (!message) return { code: null, permanent: false };
+  // The RPC raises a stable identifier as the exception message.
+  for (const known of PERMANENT_PHONE_REJECTIONS) {
+    if (message === known || message.includes(known)) {
+      return { code: known, permanent: true };
+    }
+  }
+  return { code: message, permanent: false };
+}
+
+export async function submitPhoneScan(envelope: PhoneSubmissionEnvelope): Promise<PhoneIngressResult> {
   const sb = getSupabaseClient();
-  if (!sb) return;
-  await sb
-    .from("smartscan_sessions")
-    .update({ last_seen_at: new Date().toISOString() })
-    .eq("id", sessionId);
+  if (!sb) return { ok: false, reason: "offline", code: null, permanent: false };
+  const { data, error } = await sb.rpc("submit_smartscan_phone_scan", {
+    p_session_id: envelope.sessionId,
+    p_capability: envelope.capability,
+    p_message_id: envelope.messageId,
+    p_sequence_number: envelope.sequenceNumber,
+    p_issued_at: envelope.issuedAt,
+    p_payload_text: envelope.payloadText,
+    p_payload_digest: envelope.payloadDigest,
+  });
+  const record = Array.isArray(data) ? data[0] : data;
+  if (error || !record || typeof record.inbox_receipt_id !== "string") {
+    const { code, permanent } = classifyPhoneRejection(error);
+    return { ok: false, reason: "rejected", code, permanent };
+  }
+  return {
+    ok: true,
+    inboxReceiptId: record.inbox_receipt_id,
+    receivedAt: record.received_at,
+    replayed: record.replayed === true,
+  };
+}
+
+export async function getPhoneSubmissionStatus(
+  capability: PhoneCapability,
+  messageId: string,
+): Promise<PhoneSubmissionStatus | null> {
+  const sb = getSupabaseClient();
+  if (!sb) return null;
+  const { data, error } = await sb.rpc("get_smartscan_phone_submission_status", {
+    p_session_id: capability.sessionId,
+    p_capability: capability.capability,
+    p_message_id: messageId,
+  });
+  const record = Array.isArray(data) ? data[0] : data;
+  if (error || !record || typeof record.status !== "string") return null;
+  return {
+    status: record.status,
+    inboxReceiptId: record.inbox_receipt_id,
+    resultReceiptId: record.result_receipt_id ?? null,
+    score: record.score_summary ?? null,
+    rejectionCode: record.rejection_code ?? null,
+    receivedAt: record.received_at,
+    completedAt: record.completed_at ?? null,
+  } as PhoneSubmissionStatus;
+}
+
+export async function fetchPhoneSubmissions(
+  teacherUserId: string,
+  assessmentId: string,
+  status = "received",
+): Promise<PhoneInboxRow[]> {
+  const sb = getSupabaseClient();
+  if (!sb) return [];
+  const { data } = await sb
+    .from("smartscan_phone_submissions")
+    .select("*")
+    .eq("teacher_user_id", teacherUserId)
+    .eq("assessment_id", assessmentId)
+    .eq("status", status)
+    .order("sequence_number", { ascending: true });
+  return (data as PhoneInboxRow[]) ?? [];
+}
+
+export async function completePhoneSubmission(args: {
+  sessionId: string;
+  messageId: string;
+  resultReceiptId?: string;
+  score?: import("./pairing").ScoredSummary;
+  rejectionCode?: "pc_validation_failed" | "learner_or_version_invalid" | "duplicate_requires_review" | "durable_commit_failed";
+}): Promise<boolean> {
+  const sb = getSupabaseClient();
+  if (!sb) return false;
+  const scoreSummary = args.score && args.resultReceiptId
+    ? { receiptId: args.resultReceiptId, ...args.score }
+    : null;
+  const { data, error } = await sb.rpc("complete_smartscan_phone_submission", {
+    p_session_id: args.sessionId,
+    p_message_id: args.messageId,
+    p_result_receipt_id: args.resultReceiptId ?? null,
+    p_score_summary: scoreSummary,
+    p_rejection_code: args.rejectionCode ?? null,
+  });
+  const record = Array.isArray(data) ? data[0] : data;
+  return !error && !!record && typeof record.inbox_receipt_id === "string";
 }
 
 export type CommitResult =

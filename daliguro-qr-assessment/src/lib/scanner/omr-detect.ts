@@ -54,6 +54,17 @@ export interface SheetReading {
   obscuredBubbleCount?: number;
 }
 
+export interface OmrPerformanceProfile {
+  markerDetectionMs: number;
+  geometryCorrectionMs: number;
+  bubbleSamplingMs: number;
+  confidenceCalculationMs: number;
+}
+
+function profileNow(): number {
+  return typeof performance !== "undefined" ? performance.now() : Date.now();
+}
+
 // Adaptive contrast thresholds. markScore = (localBg - innerBrightness) / localBg,
 // so the same physical mark reads consistently regardless of ambient lighting.
 const MARK_HI = 0.25; // clearly shaded (inner 25%+ darker than surrounding paper)
@@ -557,10 +568,13 @@ export function readSheet(
   template: OmrTemplate,
   validChoicesByItem: Record<number, number> = {},
   precomputedCorners?: Point[] | null,
+  profile?: OmrPerformanceProfile,
 ): SheetReading {
   const brightness = meanGray(g);
   const sharpness = sharpnessOf(g);
+  const markerStartedAt = profileNow();
   const corners = precomputedCorners !== undefined ? precomputedCorners : findCornerMarkers(g);
+  if (profile) profile.markerDetectionMs = profileNow() - markerStartedAt;
   if (!corners) {
     return {
       aligned: false,
@@ -575,9 +589,12 @@ export function readSheet(
       printContrast: 0,
     };
   }
+  const geometryStartedAt = profileNow();
   const h = solveHomography(template.markerCenters, corners);
+  if (profile) profile.geometryCorrectionMs = profileNow() - geometryStartedAt;
 
   // Gather darkness per item/choice.
+  const bubbleStartedAt = profileNow();
   const fillByItem = new Map<number, number[]>();
   const features: BubbleFeature[] = [];
   const featuresByItem = new Map<number, BubbleFeature[]>();
@@ -589,6 +606,8 @@ export function readSheet(
     featuresByItem.get(b.item)![b.choiceIndex] = feature;
     fillByItem.get(b.item)![b.choiceIndex] = feature.darkness;
   }
+  if (profile) profile.bubbleSamplingMs = profileNow() - bubbleStartedAt;
+  const confidenceStartedAt = profileNow();
   const metrics = captureMetrics(features);
   const localizedVisibilityComparable = metrics.printContrast >= 0.12;
 
@@ -615,6 +634,7 @@ export function readSheet(
   }
 
   const version = readVersionMarks(g, h, template);
+  if (profile) profile.confidenceCalculationMs = profileNow() - confidenceStartedAt;
 
   return { aligned: true, markersFound: 4, corners, brightness, sharpness, version, items, ...metrics };
 }

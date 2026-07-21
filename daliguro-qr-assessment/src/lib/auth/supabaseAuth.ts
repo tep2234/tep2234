@@ -1,10 +1,12 @@
-// Magic-link authentication (Supabase Auth OTP). No passwords, no local fake
-// accounts. The signed-in user's id is the teacher_user_id used for RLS and for
-// scoping all sessions/results. When Supabase is not configured, every call is a
+// Supabase authentication for SmartScan pairing. Existing teacher sessions are
+// reused; otherwise the browser obtains an anonymous user automatically so the
+// pairing QR works without email while still receiving a unique auth.uid() for
+// RLS and durable receipts. Magic-link helpers remain available for an optional
+// future account-upgrade flow. When Supabase is not configured, every call is a
 // safe no-op so the offline app is unaffected.
 
 import { useEffect, useState } from "react";
-import type { User } from "@supabase/supabase-js";
+import type { SupabaseClient, User } from "@supabase/supabase-js";
 import { getSupabaseClient, isSupabaseConfigured } from "../supabase/client";
 
 export interface MagicLinkResult {
@@ -54,28 +56,80 @@ export interface AuthState {
   user: User | null;
   teacherUserId: string | null;
   email: string | null;
+  isAnonymous: boolean;
+  error: string | null;
 }
 
-// React hook: current auth state, kept live via onAuthStateChange.
+export function teacherPrincipalId(user: Pick<User, "id" | "is_anonymous"> | null): string | null {
+  return user && user.is_anonymous !== true ? user.id : null;
+}
+
+function directPairingAuthError(message: string): string {
+  const normalized = message.toLowerCase();
+  if (normalized.includes("anonymous") && normalized.includes("disabled")) {
+    return "Direct phone pairing is disabled in the Supabase Auth settings. Enable Anonymous Sign-Ins, then retry.";
+  }
+  return message || "Could not prepare direct phone pairing. Check the connection and retry.";
+}
+
+type DirectPairingAuthClient = Pick<SupabaseClient["auth"], "getSession" | "signInAnonymously">;
+
+export async function ensureDirectPairingUser(
+  auth: DirectPairingAuthClient,
+): Promise<{ user: User | null; error: string | null }> {
+  const current = await auth.getSession();
+  if (current.data.session?.user) {
+    return { user: current.data.session.user, error: null };
+  }
+  const direct = await auth.signInAnonymously();
+  if (direct.error) {
+    return { user: null, error: directPairingAuthError(direct.error.message) };
+  }
+  return {
+    user: direct.data.user ?? direct.data.session?.user ?? null,
+    error: null,
+  };
+}
+
+// React hook: current auth state, kept live via onAuthStateChange. When this
+// browser has no existing teacher session, create an anonymous Supabase user
+// automatically. That gives the pairing RPC a unique auth.uid() for RLS and
+// durable receipts without asking the teacher for an email address.
 export function useSupabaseAuth(): AuthState {
   const configured = isSupabaseConfigured();
   const [user, setUser] = useState<User | null>(null);
   const [loading, setLoading] = useState(configured);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     const sb = getSupabaseClient();
     // When unconfigured, `loading` already initialized to false (useState above).
     if (!sb) return;
     let active = true;
-    sb.auth.getSession().then(({ data }) => {
-      if (!active) return;
-      setUser(data.session?.user ?? null);
-      setLoading(false);
-    });
     const { data: sub } = sb.auth.onAuthStateChange((_event, session) => {
-      setUser(session?.user ?? null);
-      setLoading(false);
+      if (!active) return;
+      if (session?.user) {
+        setUser(session.user);
+        setError(null);
+        setLoading(false);
+        return;
+      }
+      // A null session here is either INITIAL_SESSION on a fresh browser
+      // (anonymous sign-in is still in flight — keep `loading` true so the
+      // panel doesn't flash "pairing unavailable") or a later sign-out.
+      setUser(null);
     });
+    void (async () => {
+      const direct = await ensureDirectPairingUser(sb.auth);
+      if (!active) return;
+      if (direct.error) {
+        setError(direct.error);
+        setLoading(false);
+        return;
+      }
+      setUser(direct.user);
+      setLoading(false);
+    })();
     return () => {
       active = false;
       sub.subscription.unsubscribe();
@@ -86,7 +140,12 @@ export function useSupabaseAuth(): AuthState {
     configured,
     loading,
     user,
-    teacherUserId: user?.id ?? null,
+    // Anonymous users carry the authenticated Postgres role, but they are not
+    // verified teachers. Never expose them as teacher principals to the PC
+    // scanner workflow.
+    teacherUserId: teacherPrincipalId(user),
     email: user?.email ?? null,
+    isAnonymous: user?.is_anonymous === true,
+    error,
   };
 }

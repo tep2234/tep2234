@@ -87,7 +87,6 @@ function drawRing(image: GrayImage, cx: number, cy: number, radius: number) {
 
 function scanBroadcast(): ScanBroadcast {
   return {
-    token: "pairing-token",
     scanId: "scan-unreadable-0001",
     sessionId: "session-1",
     assessmentId: "A1",
@@ -192,6 +191,7 @@ function localUnreadableScan(): ScanResult {
       obscuredBubbleCount: 1,
     },
     source: "qr",
+    captureSource: "gallery",
     confidence: 0.1,
     quality: scanQuality({
       confidence: 0.1,
@@ -296,6 +296,8 @@ describe("unreadable OMR state contract", () => {
       detected: scan.detected,
       confidence: scan.confidence,
       capturedAt: scan.capturedAt,
+      sequenceNumber: 1,
+      issuedAt: new Date(scan.capturedAt).toISOString(),
     };
     const restored = parseHeldScans(JSON.stringify([held]), "session-1", "A1");
     expect(restored[0].detected[0]).toMatchObject({ status: "unreadable", unreadableChoices: [1] });

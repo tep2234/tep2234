@@ -5,7 +5,10 @@
 //  - Same-origin GET assets (hashed JS/CSS, icons): cache-first, then network.
 // Bump CACHE_VERSION on each release to retire old caches.
 
-const CACHE_VERSION = "daliguro-qr-v2";
+// v5: adds the ZXing WASM decoder asset (dist/assets/zxing_reader-*.wasm).
+// It is same-origin and content-hashed, so the cache-first asset rule below
+// stores it on first use and a new build's new hash supersedes it.
+const CACHE_VERSION = "daliguro-qr-v5";
 const SHELL = [
   "./",
   "./index.html",

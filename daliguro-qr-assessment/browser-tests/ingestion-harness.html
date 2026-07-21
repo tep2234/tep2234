@@ -1,0 +1,11 @@
+<!doctype html>
+<html lang="en">
+  <head><meta charset="UTF-8"><title>Scanner ingestion browser harness</title></head>
+  <body>
+    <input id="take-photo" type="file" accept="image/jpeg,image/png,.jpg,.jpeg,.png" capture="environment">
+    <input id="existing-image" type="file" accept="image/jpeg,image/png,.jpg,.jpeg,.png">
+    <canvas id="scanner-canvas"></canvas>
+    <pre id="result" aria-live="polite"></pre>
+    <script type="module" src="./ingestion-harness.ts"></script>
+  </body>
+</html>

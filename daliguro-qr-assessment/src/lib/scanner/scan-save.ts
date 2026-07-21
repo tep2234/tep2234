@@ -213,13 +213,13 @@ export function upsertScanResult(
   const quality = result.quality?.score ?? Math.round(result.confidence * 100);
   let action: string;
   if (existing) {
-    action = `Rescanned and replaced (trust ${trust}%, quality ${quality})`;
+    action = `Rescanned and replaced via ${result.captureSource} (trust ${trust}%, quality ${quality})`;
   } else if (reviewStatus === "auto") {
-    action = `Scanned (trust ${trust}%, quality ${quality}), auto-accepted`;
+    action = `Scanned via ${result.captureSource} (trust ${trust}%, quality ${quality}), auto-accepted`;
   } else if (reviewStatus === "needs_review") {
-    action = `Scanned (trust ${trust}%, quality ${quality}), queued for review`;
+    action = `Scanned via ${result.captureSource} (trust ${trust}%, quality ${quality}), queued for review`;
   } else {
-    action = `Scanned (trust ${trust}%, quality ${quality}), teacher-reviewed`;
+    action = `Scanned via ${result.captureSource} (trust ${trust}%, quality ${quality}), teacher-reviewed`;
   }
 
   const saved: Result = {

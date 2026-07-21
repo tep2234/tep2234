@@ -30,13 +30,40 @@ docker cp "$repo_root/supabase/tests/postgres_bootstrap.sql" "$container:/tmp/00
 docker cp "$repo_root/supabase/migrations/0001_smartscan_sync.sql" "$container:/tmp/0001.sql"
 docker cp "$repo_root/supabase/migrations/0002_phase1_scan_integrity.sql" "$container:/tmp/0002.sql"
 docker cp "$repo_root/supabase/migrations/0003_unreadable_review_audit.sql" "$container:/tmp/0003.sql"
+docker cp "$repo_root/supabase/migrations/20260713123518_smartscan_realtime_security.sql" "$container:/tmp/0004.sql"
+docker cp "$repo_root/supabase/migrations/20260719000000_smartscan_verified_teacher_guard.sql" "$container:/tmp/0005.sql"
 docker cp "$repo_root/supabase/tests/unreadable_contract.sql" "$container:/tmp/unreadable_contract.sql"
+docker cp "$repo_root/supabase/tests/realtime_security_contract.sql" "$container:/tmp/realtime_security_contract.sql"
+docker cp "$repo_root/supabase/tests/realtime_concurrency_fixture.sql" "$container:/tmp/realtime_concurrency_fixture.sql"
+docker cp "$repo_root/supabase/tests/realtime_upgrade_fixture.sql" "$container:/tmp/realtime_upgrade_fixture.sql"
+docker cp "$repo_root/supabase/tests/realtime_upgrade_contract.sql" "$container:/tmp/realtime_upgrade_contract.sql"
+docker cp "$repo_root/supabase/tests/realtime_rollback_rehearsal.sql" "$container:/tmp/realtime_rollback_rehearsal.sql"
 docker cp "$repo_root/supabase/tests/concurrency_fixture.sql" "$container:/tmp/concurrency_fixture.sql"
 docker cp "$repo_root/supabase/tests/retry_lifecycle_contract.sql" "$container:/tmp/retry_lifecycle_contract.sql"
 
-for sql in /tmp/0000_bootstrap.sql /tmp/0001.sql /tmp/0002.sql /tmp/0003.sql /tmp/unreadable_contract.sql /tmp/concurrency_fixture.sql; do
+for sql in /tmp/0000_bootstrap.sql /tmp/0001.sql /tmp/0002.sql /tmp/0003.sql /tmp/0004.sql /tmp/0005.sql /tmp/realtime_security_contract.sql /tmp/unreadable_contract.sql /tmp/concurrency_fixture.sql /tmp/realtime_concurrency_fixture.sql; do
   docker exec "$container" psql -v ON_ERROR_STOP=1 -U postgres -d postgres -f "$sql"
 done
+
+# Rehearse an upgrade containing rows produced by the legacy application.
+docker exec "$container" createdb -U postgres smartscan_upgrade
+for sql in /tmp/0000_bootstrap.sql /tmp/0001.sql /tmp/0002.sql /tmp/0003.sql /tmp/realtime_upgrade_fixture.sql; do
+  docker exec "$container" psql -v ON_ERROR_STOP=1 -U postgres -d smartscan_upgrade -f "$sql"
+done
+docker exec "$container" psql -v ON_ERROR_STOP=1 --single-transaction -U postgres -d smartscan_upgrade -f /tmp/0004.sql
+docker exec "$container" psql -v ON_ERROR_STOP=1 --single-transaction -U postgres -d smartscan_upgrade -f /tmp/0005.sql
+docker exec "$container" psql -v ON_ERROR_STOP=1 -U postgres -d smartscan_upgrade -f /tmp/realtime_upgrade_contract.sql
+
+# Verify rollback is complete, then prove the same database can recover by
+# applying the migration normally without losing the legacy fixture.
+docker exec "$container" createdb -U postgres smartscan_rollback
+for sql in /tmp/0000_bootstrap.sql /tmp/0001.sql /tmp/0002.sql /tmp/0003.sql /tmp/realtime_upgrade_fixture.sql; do
+  docker exec "$container" psql -v ON_ERROR_STOP=1 -U postgres -d smartscan_rollback -f "$sql"
+done
+docker exec "$container" psql -v ON_ERROR_STOP=1 -U postgres -d smartscan_rollback -f /tmp/realtime_rollback_rehearsal.sql
+docker exec "$container" psql -v ON_ERROR_STOP=1 --single-transaction -U postgres -d smartscan_rollback -f /tmp/0004.sql
+docker exec "$container" psql -v ON_ERROR_STOP=1 --single-transaction -U postgres -d smartscan_rollback -f /tmp/0005.sql
+docker exec "$container" psql -v ON_ERROR_STOP=1 -U postgres -d smartscan_rollback -f /tmp/realtime_upgrade_contract.sql
 
 race_tmp="$(mktemp -d)"
 auth_prefix="set role authenticated; select set_config('request.jwt.claim.sub','66666666-6666-4666-8666-666666666666',false);"
@@ -45,6 +72,46 @@ run_authenticated() {
   docker exec "$container" psql -X -qAt -v ON_ERROR_STOP=1 -U postgres -d postgres \
     -c "$auth_prefix $1"
 }
+
+run_anon() {
+  docker exec "$container" psql -X -qAt -v ON_ERROR_STOP=1 -U postgres -d postgres \
+    -c "set role anon; select set_config('request.jwt.claim.sub','',false); $1"
+}
+
+# Two phones racing the same one-time QR secret: exactly one claim succeeds.
+set +e
+run_anon "select capability from public.claim_smartscan_session('99999999-9999-4999-8999-999999999991',repeat('r',64),'Race phone A');" \
+  >"$race_tmp/pair-claim-a" 2>"$race_tmp/pair-claim-a.err" &
+pid_a="$!"
+run_anon "select capability from public.claim_smartscan_session('99999999-9999-4999-8999-999999999991',repeat('r',64),'Race phone B');" \
+  >"$race_tmp/pair-claim-b" 2>"$race_tmp/pair-claim-b.err" &
+pid_b="$!"
+wait "$pid_a"; status_a="$?"
+wait "$pid_b"; status_b="$?"
+set -e
+if [[ "$status_a" -eq 0 && "$status_b" -eq 0 ]] || [[ "$status_a" -ne 0 && "$status_b" -ne 0 ]]; then
+  echo "Expected exactly one concurrent pairing claim to succeed" >&2
+  exit 1
+fi
+
+# Two capability holders racing the same next sequence cannot both persist.
+set +e
+run_anon "select inbox_receipt_id from public.submit_smartscan_phone_scan('99999999-9999-4999-8999-999999999992',repeat('q',64),'realtime-race-message-a',1,clock_timestamp(),public.test_realtime_race_payload('realtime-race-message-a'),encode(sha256(convert_to(public.test_realtime_race_payload('realtime-race-message-a'),'UTF8')),'hex'));" \
+  >"$race_tmp/phone-submit-a" 2>"$race_tmp/phone-submit-a.err" &
+pid_a="$!"
+run_anon "select inbox_receipt_id from public.submit_smartscan_phone_scan('99999999-9999-4999-8999-999999999992',repeat('q',64),'realtime-race-message-b',1,clock_timestamp(),public.test_realtime_race_payload('realtime-race-message-b'),encode(sha256(convert_to(public.test_realtime_race_payload('realtime-race-message-b'),'UTF8')),'hex'));" \
+  >"$race_tmp/phone-submit-b" 2>"$race_tmp/phone-submit-b.err" &
+pid_b="$!"
+wait "$pid_a"; status_a="$?"
+wait "$pid_b"; status_b="$?"
+set -e
+if [[ "$status_a" -eq 0 && "$status_b" -eq 0 ]] || [[ "$status_a" -ne 0 && "$status_b" -ne 0 ]]; then
+  echo "Expected exactly one same-sequence phone submission to succeed" >&2
+  exit 1
+fi
+realtime_race_rows="$(docker exec "$container" psql -X -qAt -U postgres -d postgres -c \
+  "select count(*) from public.smartscan_phone_submissions where session_id='99999999-9999-4999-8999-999999999992';")"
+[[ "$realtime_race_rows" = "1" ]]
 
 # Five genuinely concurrent identical transactions must all receive the one
 # authoritative receipt and leave one ledger row.
@@ -128,4 +195,4 @@ review_event_count="$(docker exec "$container" psql -X -qAt -U postgres -d postg
 
 docker exec "$container" psql -v ON_ERROR_STOP=1 -U postgres -d postgres -f /tmp/retry_lifecycle_contract.sql
 
-echo "Real PostgreSQL concurrency/retry contracts passed: 5-way idempotency, conflict serialization, correction ordering, competing reviewers, expiry recovery, and pending-slot release."
+echo "SmartScan PostgreSQL certification passed: clean install, legacy upgrade, rollback/recovery, one-time pairing race, sequence serialization, receipt idempotency, correction ordering, competing reviewers, expiry recovery, and pending-slot release."

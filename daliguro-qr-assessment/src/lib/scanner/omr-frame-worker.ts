@@ -5,6 +5,7 @@
 // low-end phones. The page falls back to running the same pure module on the
 // main thread if workers are unavailable.
 
+import { analyzeFrameAsync } from "./analyze-frame";
 import { analyzeFrameData } from "./mobile-analyze";
 
 export interface FrameRequest {
@@ -25,6 +26,13 @@ export interface FrameResponse {
 self.onmessage = (e: MessageEvent<FrameRequest>) => {
   const { id, buffer, width, height, assessmentId, qrText, thoroughQr } = e.data;
   const img = { data: new Uint8ClampedArray(buffer), width, height };
-  const analysis = analyzeFrameData(img, assessmentId, qrText, thoroughQr);
-  (self as unknown as Worker).postMessage({ id, analysis } satisfies FrameResponse);
+  // Async because the ZXing WASM tier inside analyzeFrameAsync is async. Any
+  // rejection is contained here: the page's per-request timeout must never be
+  // the thing that notices a decoder fault, so fall back to the synchronous
+  // jsQR-only pipeline and still answer this frame.
+  void analyzeFrameAsync(img, assessmentId, qrText, thoroughQr)
+    .catch(() => analyzeFrameData(img, assessmentId, qrText, thoroughQr))
+    .then((analysis) => {
+      (self as unknown as Worker).postMessage({ id, analysis } satisfies FrameResponse);
+    });
 };

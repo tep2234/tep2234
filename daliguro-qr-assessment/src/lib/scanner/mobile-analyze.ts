@@ -8,7 +8,8 @@ import { decodeQrPayload } from "../qr-parse";
 import { assessmentMatches, type ScanDetection } from "../sync/pairing";
 import { buildTemplate, MAX_ITEMS } from "./omr-template";
 import { ensureCompleteItems, findCornerMarkers, readSheet, toGray, type SheetReading } from "./omr-detect";
-import { readQrSmart } from "./qr-detect";
+import { readQrSmart, readQrWholeFrame } from "./qr-detect";
+import { readQrFromSheetZone } from "./qr-zone-rescue";
 import { BLANK_REVIEW_CONFIDENCE, REVIEW_CONFIDENCE } from "./omr-score";
 import { scanQuality, type ScanQuality } from "./scan-quality";
 import {
@@ -42,6 +43,13 @@ export interface MobileScan {
   geometry: NormalizedSheetGeometry;
   frameBrightness: number;
   frameSharpness: number;
+  // Pixel width frameSharpness was measured at, so stability checks can compare
+  // a low-res preview baseline against the high-res final still fairly.
+  frameWidth: number;
+  // Which decoder produced the identity. "zxing-wasm" is the WASM fallback tier
+  // used when no native BarcodeDetector exists; "provided" is a native
+  // BarcodeDetector hit handed in by the caller.
+  identitySource?: "provided" | "whole-frame" | "region-cascade" | "zone-rescue" | "zxing-wasm";
 }
 
 export interface FrameResult {
@@ -71,9 +79,26 @@ export interface FrameAnalysis {
   // back, or a fresh jsQR decode. Callers use fresh decodes to refresh their
   // sticky QR cache.
   qrText: string | null;
+  qrSource: "provided" | "whole-frame" | "region-cascade" | "zone-rescue" | "zxing-wasm" | null;
 }
 
 export const AUTO_ACCEPT = 0.8;
+
+type IdentitySource = NonNullable<MobileScan["identitySource"]>;
+
+function analyzedWithSource(
+  img: FrameImage,
+  assessmentId: string,
+  qrText: string,
+  qrSource: IdentitySource,
+): FrameAnalysis {
+  const result = analyzeDecodedFrame(img, assessmentId, qrText);
+  return {
+    result: result.scan ? { ...result, scan: { ...result.scan, identitySource: qrSource } } : result,
+    qrText,
+    qrSource,
+  };
+}
 
 export function avgConfidence(data: ScanDetection[]): number {
   return data.length ? data.reduce((s, d) => s + d.confidence, 0) / data.length : 0;
@@ -240,6 +265,7 @@ export function analyzeDecodedFrame(img: FrameImage, assessmentId: string, qrTex
     geometry,
     frameBrightness: reading.brightness,
     frameSharpness: reading.sharpness,
+    frameWidth: img.width,
   };
   return {
     scan,
@@ -262,16 +288,57 @@ export function analyzeFrameData(
   assessmentId: string,
   qrText: string | null,
   thoroughQr: boolean,
+  // Which decoder supplied `qrText`. Defaults to "provided" (native
+  // BarcodeDetector) so every existing caller is unaffected; the ZXing WASM
+  // tier passes "zxing-wasm" so diagnostics can tell the two apart.
+  providedSource: IdentitySource = "provided",
 ): FrameAnalysis {
   if (qrText) {
-    return { result: analyzeDecodedFrame(img, assessmentId, qrText), qrText };
+    return analyzedWithSource(img, assessmentId, qrText, providedSource);
   }
-  const qr = readQrSmart(img, thoroughQr);
-  if (!qr) {
-    return {
-      result: { scan: null, status: "searching", qrVisible: false, markersVisible: false, brightness: quickBrightness(img.data), aligned: false, message: "Find the sheet QR" },
-      qrText: null,
-    };
+  // Image-decode cascade: cheap whole-frame, then geometry-guided zone rescue
+  // from the original pixels, then the broader region tournament. CRITICAL: only
+  // ACCEPT a read that decodes to a well-formed identity payload. A false-
+  // positive jsQR hit from an early/cheap stage must never block the reliable
+  // rescue below — that was surfacing sticky "invalid"/"missing fields" errors
+  // on iOS (no BarcodeDetector, so jsQR does all the work). Remember the first
+  // read that decoded to SOMETHING so a genuinely foreign/damaged QR still
+  // surfaces its specific error instead of a bare "searching".
+  // Held in a ref object rather than a bare `let`: the only writes happen inside
+  // the `accept` closure below, which TypeScript's control-flow analysis cannot
+  // see, so a plain `let` narrows to `null` and the later truthy branch becomes
+  // `never`. A mutable property keeps the declared union intact and type-safe.
+  const fallback: { current: { data: string; source: IdentitySource } | null } = { current: null };
+  const accept = (data: string | undefined, source: IdentitySource): FrameAnalysis | null => {
+    if (!data) return null;
+    if (decodeQrPayload(data).ok) return analyzedWithSource(img, assessmentId, data, source);
+    if (!fallback.current) fallback.current = { data, source };
+    return null;
+  };
+
+  const wholeResult = accept((thoroughQr ? readQrWholeFrame(img) : null)?.data, "whole-frame");
+  if (wholeResult) return wholeResult;
+
+  if (thoroughQr) {
+    const corners = findCornerMarkers(toGray(img));
+    if (corners) {
+      const rescuedResult = accept(readQrFromSheetZone(img, corners)?.data, "zone-rescue");
+      if (rescuedResult) return rescuedResult;
+    }
   }
-  return { result: analyzeDecodedFrame(img, assessmentId, qr.data), qrText: qr.data };
+
+  const smart = readQrSmart(img, thoroughQr);
+  const smartResult = accept(smart?.data, smart?.region === "full" ? "whole-frame" : "region-cascade");
+  if (smartResult) return smartResult;
+
+  if (fallback.current) {
+    // Something decoded but no stage produced a valid identity — surface its
+    // specific parse error (damaged code, wrong shape) with the raw read.
+    return analyzedWithSource(img, assessmentId, fallback.current.data, fallback.current.source);
+  }
+  return {
+    result: { scan: null, status: "searching", qrVisible: false, markersVisible: false, brightness: quickBrightness(img.data), aligned: false, message: "Find the sheet QR" },
+    qrText: null,
+    qrSource: null,
+  };
 }

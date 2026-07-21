@@ -1,16 +1,35 @@
 // Phone scanner page (deep-linked from the PC pairing QR):
-//   /smartscan/mobile/:sessionId?t=RAW_TOKEN&a=ASSESSMENT_ID
+//   /smartscan/mobile/:sessionId?t=ONE_TIME_PAIRING_SECRET
 // The phone is intentionally NOT a second dashboard. It is a temporary camera
-// companion. The signed-in PC remains the system of record: it verifies the
-// pairing token, writes the scan, scores against the local answer key, then
-// broadcasts the score back to this phone.
+// companion. The one-time secret is exchanged for a short-lived capability and
+// stripped from the URL. The database inbox is durable before the PC processes
+// the scan, and the phone polls only its capability-scoped status RPC.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useParams, useSearchParams } from "react-router-dom";
-import { classifyMediaError, isSecureLike } from "../lib/camera";
+import { useParams } from "react-router-dom";
+import {
+  adaptiveAnalyzeInterval,
+  classifyMediaError,
+  inspectCameraTrack,
+  isSecureLike,
+  preferredVideoConstraints,
+  rankVideoDevices,
+  type CameraDeviceChoice,
+  type CameraTrackProfile,
+} from "../lib/camera";
 import { isSupabaseConfigured } from "../lib/supabase/client";
 import { type ScanDetection, type ScoreBroadcast } from "../lib/sync/pairing";
-import { joinScanChannel, type ScanChannel } from "../lib/sync/realtimeSmartScan";
+import { claimSession, getPhoneSubmissionStatus, submitPhoneScan } from "../lib/sync/smartscanSync";
+import {
+  buildPhoneSubmissionEnvelope,
+  clearPhoneCapability,
+  loadPhoneCapability,
+  nextPhoneSequence,
+  safePhoneError,
+  savePhoneCapability,
+  stripPairingSecretFromUrl,
+  type PhoneCapability,
+} from "../lib/sync/realtime-security";
 import { CHOICES } from "../lib/scanner/omr-template";
 import { BLANK_REVIEW_CONFIDENCE, REVIEW_CONFIDENCE } from "../lib/scanner/omr-score";
 import { buildConsensusScan, type FillAccum } from "../lib/scanner/mobile-consensus";
@@ -19,19 +38,39 @@ import {
   REQUIRED_STABLE_FRAMES,
   type FrameStabilityState,
 } from "../lib/scanner/frame-stability";
+import { verifyFinalMobileCapture } from "../lib/scanner/final-capture";
 import {
-  analyzeFrameData,
+  captureFinalStill,
+  createImageCapture,
+  type FinalCaptureSource,
+} from "../lib/scanner/final-still-capture";
+import {
+  ingestGalleryImage,
+  ScannerGeneration,
+} from "../lib/scanner/image-ingestion";
+import {
+  CameraLifecycleMachine,
+  stopCameraStreamOnce,
+  type CameraLifecycleOutcome,
+} from "../lib/scanner/camera-lifecycle";
+import {
   type FrameAnalysis,
   type FrameResult,
   type MobileScan,
 } from "../lib/scanner/mobile-analyze";
+// Main-thread fallback shares the worker's exact decoder cascade (native ->
+// ZXing WASM -> jsQR), so a device without workers is not also a device
+// without the WASM tier.
+import { analyzeFrameAsync } from "../lib/scanner/analyze-frame";
 import {
   acknowledgeHeldScan,
   buildSafeScanDiagnostic,
+  drainHeldScans,
   generateScanId,
   parseHeldScans,
   upsertHeldScan,
   type HeldScan,
+  type SendOutcome,
 } from "../lib/sync/scan-outbox";
 import type { FrameRequest, FrameResponse } from "../lib/scanner/omr-frame-worker";
 import { Button } from "../components/ui";
@@ -39,12 +78,17 @@ import { Button } from "../components/ui";
 type Flow = "ready" | "live" | "review" | "done";
 type SyncState = "idle" | "pending" | "sent" | "pc_received" | "saved" | "scored" | "failed";
 type SignalTone = "good" | "warn" | "bad";
-type CapturedMobileScan = MobileScan & { scanId: string; capturedAt: number };
+type CapturedMobileScan = MobileScan & {
+  scanId: string;
+  capturedAt: number;
+  captureSource: "gallery" | "camera-final" | "manual-capture";
+};
 
 // Number of aligned frames averaged before we trust a reading. A short burst
 // denoises the read while still locking fast (~3 good frames).
 const CONSENSUS_FRAMES = REQUIRED_STABLE_FRAMES;
 const FRAME_W = 1300;
+const FINAL_CAPTURE_W = 2200;
 const COOLDOWN_MS = 2500;
 // Throttle the heavy analysis so the RAF loop yields the main thread to touch
 // events — keeps buttons responsive on phones instead of janky/laggy.
@@ -52,6 +96,12 @@ const ANALYZE_INTERVAL_MS = 90;
 // If the worker hangs (rare — bad frame, browser bug), fall back to the
 // main-thread pipeline rather than stalling the scan loop forever.
 const WORKER_TIMEOUT_MS = 2000;
+const CAMERA_DEVICE_KEY = "smartscan_preferred_camera_v1";
+
+function loadPreferredCameraId(): string {
+  if (typeof window === "undefined") return "";
+  try { return window.localStorage.getItem(CAMERA_DEVICE_KEY) ?? ""; } catch { return ""; }
+}
 
 // Human-readable status for the review screen — every item carries a clear
 // label and (when uncertain) a reason, so nothing is silently empty.
@@ -81,37 +131,61 @@ async function readNativeQr(source: CanvasImageSource): Promise<string | null> {
   }
 }
 
+function permanentRejectionMessage(code: string | null): string {
+  const detail = code ? ` (${code})` : "";
+  return `This scan was permanently rejected by the secure inbox${detail} and removed from the queue. Re-scan the sheet, and if it keeps failing, generate a new pairing QR.`;
+}
+
 export default function SmartScanMobilePage() {
   const { sessionId = "" } = useParams();
-  const [params] = useSearchParams();
-  const token = params.get("t") ?? "";
-  const assessmentId = params.get("a") ?? "";
+  const pairingTokenRef = useRef(
+    typeof window === "undefined" ? "" : new URLSearchParams(window.location.search).get("t") ?? "",
+  );
+  const claimRef = useRef<ReturnType<typeof claimSession> | null>(null);
+  const initialCameraId = useMemo(() => loadPreferredCameraId(), []);
+  const [capability, setCapability] = useState<PhoneCapability | null>(() => {
+    if (typeof window === "undefined" || !sessionId) return null;
+    return loadPhoneCapability(window.sessionStorage, sessionId);
+  });
+  const [pairingPending, setPairingPending] = useState(!capability);
+  const assessmentId = capability?.assessmentId ?? "";
   // Field-test override: append &engine=sync to the pairing URL to force the
   // main-thread fallback pipeline, so testers can verify both paths.
-  const forceSyncEngine = params.get("engine") === "sync";
+  const forceSyncEngine = typeof window !== "undefined" && new URLSearchParams(window.location.search).get("engine") === "sync";
   const configured = isSupabaseConfigured();
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const fileRef = useRef<HTMLInputElement>(null);
+  const photoInputRef = useRef<HTMLInputElement>(null);
+  const galleryInputRef = useRef<HTMLInputElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
+  const trackEndedCleanupRef = useRef<(() => void) | null>(null);
   const rafRef = useRef<number | null>(null);
+  const videoFrameRequestRef = useRef<number | null>(null);
   const cameraRunRef = useRef(0);
   const loopRef = useRef<() => void>(() => {});
-  const channelRef = useRef<ScanChannel | null>(null);
   const accumRef = useRef<FillAccum | null>(null);
   const stabilityRef = useRef<FrameStabilityState | null>(null);
   const lastAnalyzeRef = useRef(0);
+  const analyzeIntervalRef = useRef(ANALYZE_INTERVAL_MS);
   const cooldownUntilRef = useRef(0);
   const workerRef = useRef<Worker | null>(null);
   const workerFailedRef = useRef(forceSyncEngine);
   const lastEngineRef = useRef<"worker" | "fallback">(forceSyncEngine ? "fallback" : "worker");
   const workerReqIdRef = useRef(0);
+  // Prevents a parallel final capture for the same stable hold (R2).
+  const finalCaptureInFlightRef = useRef(false);
   const workerPendingRef = useRef(new Map<number, (a: FrameAnalysis) => void>());
   const submittingRef = useRef(false);
   const retryingRef = useRef(false);
   const pendingScanRef = useRef<CapturedMobileScan | null>(null);
   const committedScanIdsRef = useRef(new Set<string>());
+  const galleryGenerationRef = useRef(new ScannerGeneration());
+  const lifecycleRef = useRef(new CameraLifecycleMachine((snapshot) => {
+    if (import.meta.env.DEV) console.info("[camera-lifecycle]", { cameraLifecycleOutcome: snapshot.outcome });
+  }));
+  const startCameraRef = useRef<(recovering?: boolean) => void>(() => {});
+  const selectedCameraRef = useRef(initialCameraId);
 
   const [stage, setStage] = useState<Flow>("ready");
   const [error, setError] = useState("");
@@ -123,7 +197,18 @@ export default function SmartScanMobilePage() {
   const [syncState, setSyncState] = useState<SyncState>("idle");
   const [torchAvailable, setTorchAvailable] = useState(false);
   const [torchOn, setTorchOn] = useState(false);
-  const [engineInfo, setEngineInfo] = useState<{ engine: "worker" | "fallback"; ms: number } | null>(null);
+  const [cameraDevices, setCameraDevices] = useState<CameraDeviceChoice[]>([]);
+  const [selectedCameraId, setSelectedCameraId] = useState(initialCameraId);
+  const [cameraProfile, setCameraProfile] = useState<CameraTrackProfile | null>(null);
+  const [engineInfo, setEngineInfo] = useState<{ engine: "worker" | "fallback"; ms: number; intervalMs: number } | null>(null);
+  // Which rung of the final-still ladder produced the scored image, and the
+  // TRUE source dimensions (before the processing downscale). Surfaced so field
+  // testers can tell a genuine takePhoto still from an upscaled preview frame.
+  const [finalCaptureInfo, setFinalCaptureInfo] = useState<{
+    source: FinalCaptureSource;
+    width: number;
+    height: number;
+  } | null>(null);
   // Outbox of captured-but-unsent scans, persisted per session so neither
   // "Scan next sheet" nor a page reload can lose a teacher's work.
   const outboxKey = `smartscan_outbox_${sessionId}_${assessmentId}`;
@@ -156,17 +241,94 @@ export default function SmartScanMobilePage() {
     pendingScanRef.current = pendingScan;
   }, [pendingScan]);
 
-  const linkOk = Boolean(configured && sessionId && token && assessmentId);
+  // Consume the QR secret once. A short-lived scoped capability is kept only in
+  // sessionStorage so a same-tab reconnect can recover; the pairing token is
+  // immediately removed from the address bar and is never persisted. The claim
+  // promise lives in a ref because the token is single-use: if the effect
+  // re-runs (StrictMode double-invoke, remount), the rerun must adopt the
+  // in-flight claim rather than find the consumed token and report it missing.
+  useEffect(() => {
+    if (!configured || !sessionId) return;
+    if (capability) {
+      if (window.location.search) stripPairingSecretFromUrl(window.location, window.history);
+      return;
+    }
+    const pairingToken = pairingTokenRef.current;
+    if (!pairingToken && !claimRef.current) {
+      setPairingPending(false);
+      setError("This pairing credential is missing or expired. Generate a new QR on the teacher PC.");
+      return;
+    }
+    if (!claimRef.current) {
+      pairingTokenRef.current = "";
+      stripPairingSecretFromUrl(window.location, window.history);
+      claimRef.current = claimSession(sessionId, pairingToken, navigator.userAgent.slice(0, 160));
+    }
+    let active = true;
+    void claimRef.current.then((result) => {
+      if (!active) return;
+      setPairingPending(false);
+      if (!result.ok) {
+        setError("This pairing QR is invalid, expired, revoked, or already used. Generate a new QR on the teacher PC.");
+        return;
+      }
+      savePhoneCapability(window.sessionStorage, result.capability);
+      setCapability(result.capability);
+      setError("");
+    });
+    return () => { active = false; };
+  }, [capability, configured, sessionId]);
+
+  useEffect(() => {
+    if (!sessionId || !assessmentId) return;
+    let active = true;
+    queueMicrotask(() => {
+      if (!active) return;
+      try {
+        const restored = parseHeldScans(localStorage.getItem(outboxKey), sessionId, assessmentId);
+        outboxRef.current = restored;
+        setOutbox(restored);
+      } catch {
+        outboxRef.current = [];
+        setOutbox([]);
+      }
+    });
+    return () => { active = false; };
+  }, [assessmentId, outboxKey, sessionId]);
+
+  const linkOk = Boolean(configured && sessionId && capability && assessmentId);
   const canUseLiveCamera = useMemo(
     () => typeof window !== "undefined" && isSecureLike(window, window.location.hostname),
     [],
   );
 
-  const closeCamera = useCallback(() => {
+  const scheduleNextFrame = useCallback(() => {
+    const video = videoRef.current as (HTMLVideoElement & {
+      requestVideoFrameCallback?: (callback: () => void) => number;
+    }) | null;
+    if (video?.requestVideoFrameCallback) {
+      videoFrameRequestRef.current = video.requestVideoFrameCallback(() => {
+        videoFrameRequestRef.current = null;
+        void loopRef.current();
+      });
+      return;
+    }
+    rafRef.current = requestAnimationFrame(() => {
+      rafRef.current = null;
+      void loopRef.current();
+    });
+  }, []);
+
+  const releaseCamera = useCallback(() => {
     cameraRunRef.current += 1;
     if (rafRef.current !== null) cancelAnimationFrame(rafRef.current);
     rafRef.current = null;
-    streamRef.current?.getTracks().forEach((track) => track.stop());
+    const video = videoRef.current as (HTMLVideoElement & { cancelVideoFrameCallback?: (id: number) => void }) | null;
+    if (videoFrameRequestRef.current !== null) video?.cancelVideoFrameCallback?.(videoFrameRequestRef.current);
+    videoFrameRequestRef.current = null;
+    trackEndedCleanupRef.current?.();
+    trackEndedCleanupRef.current = null;
+    if (streamRef.current) stopCameraStreamOnce(streamRef.current);
     streamRef.current = null;
     accumRef.current = null;
     stabilityRef.current = null;
@@ -175,6 +337,12 @@ export default function SmartScanMobilePage() {
     setTorchAvailable(false);
     setTorchOn(false);
   }, []);
+
+  const closeCamera = useCallback(() => {
+    const stoppedGeneration = lifecycleRef.current.stop();
+    releaseCamera();
+    lifecycleRef.current.stopped(stoppedGeneration);
+  }, [releaseCamera]);
 
   // Toggle the camera flashlight (Android Chrome and other torch-capable
   // devices). Low light is the #1 real-world scan failure; this fixes it at
@@ -191,65 +359,22 @@ export default function SmartScanMobilePage() {
   }, []);
 
   useEffect(() => {
-    if (!linkOk) return;
-    const ch = joinScanChannel(sessionId, {
-      onAck: (ack) => {
-        if (ack.token !== token) return;
-        const pending = pendingScanRef.current;
-        const isCurrent = !pending || ack.scanId === pending.scanId;
-        const isHeld = outboxRef.current.some((held) => held.scanId === ack.scanId);
-        if (!isHeld && pending?.scanId !== ack.scanId) return;
-        if (ack.status === "saved") {
-          replaceOutbox(acknowledgeHeldScan(outboxRef.current, ack.scanId));
-          if (!committedScanIdsRef.current.has(ack.scanId)) {
-            committedScanIdsRef.current.add(ack.scanId);
-            setSentCount((count) => count + 1);
-          }
-        }
-        if (!isCurrent) return;
-        setLastSent(ack.learnerId);
-        if (ack.status === "failed") {
-          setSyncState("failed");
-          setError(ack.reason || "The PC rejected this scan. Review the pairing and try again.");
-          return;
-        }
-        if (ack.status === "saved") {
-          setLastReceiptId(ack.receiptId);
-        }
-        setSyncState((prev) => {
-          if (prev === "scored") return prev;
-          return ack.status;
-        });
-      },
-      onScore: (s) => {
-        if (s.token !== token) return;
-        const pending = pendingScanRef.current;
-        if (pending && s.scanId !== pending.scanId) return;
-        setLastScore(s);
-        setSyncState((previous) => previous === "saved" ? "scored" : previous);
-      },
-    });
-    channelRef.current = ch;
-    const device = navigator.userAgent.slice(0, 60);
-    const hello = () => ch.sendHello(device, token);
-    hello();
-    const t1 = setTimeout(hello, 1200);
-    const t2 = setTimeout(hello, 3000);
+    const galleryGeneration = galleryGenerationRef.current;
     return () => {
-      clearTimeout(t1);
-      clearTimeout(t2);
-      ch.close();
-      channelRef.current = null;
+      galleryGeneration.cancel();
+      closeCamera();
     };
-  }, [linkOk, replaceOutbox, sessionId, token]);
+  }, [closeCamera]);
 
-  useEffect(() => closeCamera, [closeCamera]);
-
-  const grabFrame = useCallback((): ImageData | null => {
+  const grabFrame = useCallback((maximumMinorSide = FRAME_W): ImageData | null => {
     const video = videoRef.current;
     const canvas = canvasRef.current;
     if (!video || !canvas || video.readyState < 2 || !video.videoWidth || !video.videoHeight) return null;
-    const scale = Math.min(1, FRAME_W / video.videoWidth);
+    // Cap the SMALLER side of the frame. Phones deliver landscape or portrait
+    // buffers depending on device and orientation; capping the width alone
+    // crushes a landscape frame's portrait sheet (and its QR) below what jsQR
+    // can decode, which presents as "Find the sheet QR" forever.
+    const scale = Math.min(1, maximumMinorSide / Math.min(video.videoWidth, video.videoHeight));
     canvas.width = Math.round(video.videoWidth * scale);
     canvas.height = Math.round(video.videoHeight * scale);
     const ctx = canvas.getContext("2d", { willReadFrequently: true });
@@ -257,6 +382,36 @@ export default function SmartScanMobilePage() {
     ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
     return ctx.getImageData(0, 0, canvas.width, canvas.height);
   }, []);
+
+  // Draw an ImageCapture bitmap into the analysis canvas, capping the LONGER
+  // side so a full-sensor still (e.g. 4000x3000) is downscaled to a size the
+  // OMR pipeline and phone memory can handle. Aspect ratio is preserved, so the
+  // marker/homography mapping stays valid.
+  const drawBitmapToCanvas = useCallback((bitmap: ImageBitmap): ImageData | null => {
+    const canvas = canvasRef.current;
+    if (!canvas || !bitmap.width || !bitmap.height) return null;
+    const scale = Math.min(1, FINAL_CAPTURE_W / Math.max(bitmap.width, bitmap.height));
+    canvas.width = Math.max(1, Math.round(bitmap.width * scale));
+    canvas.height = Math.max(1, Math.round(bitmap.height * scale));
+    const ctx = canvas.getContext("2d", { willReadFrequently: true });
+    if (!ctx) return null;
+    ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+    return ctx.getImageData(0, 0, canvas.width, canvas.height);
+  }, []);
+
+  // The full final-still ladder: takePhoto -> grabFrame -> canvas. Leaves the
+  // chosen still painted on canvasRef, so the independent final QR decode below
+  // reads the exact image that will be scored.
+  const captureFinalFrame = useCallback(async () => {
+    const track = streamRef.current?.getVideoTracks()[0] ?? null;
+    return captureFinalStill({
+      imageCapture: createImageCapture(track),
+      isTrackLive: () => track?.readyState === "live",
+      decodeBlob: (blob) => createImageBitmap(blob),
+      drawBitmap: drawBitmapToCanvas,
+      canvasCapture: () => grabFrame(FINAL_CAPTURE_W),
+    });
+  }, [drawBitmapToCanvas, grabFrame]);
 
   // Worker-first frame analysis. QR decoding + OMR run off the main thread so
   // the camera preview and buttons never stutter; the pixel buffer is
@@ -266,7 +421,7 @@ export default function SmartScanMobilePage() {
     (img: ImageData, qrText: string | null, thoroughQr: boolean): Promise<FrameAnalysis> => {
       if (workerFailedRef.current) {
         lastEngineRef.current = "fallback";
-        return Promise.resolve(analyzeFrameData(img, assessmentId, qrText, thoroughQr));
+        return analyzeFrameAsync(img, assessmentId, qrText, thoroughQr);
       }
       lastEngineRef.current = "worker";
       try {
@@ -292,6 +447,7 @@ export default function SmartScanMobilePage() {
               resolve({
                 result: { scan: null, status: "searching", qrVisible: false, markersVisible: false, brightness: 0, aligned: false, message: "Find the sheet QR" },
                 qrText: null,
+                qrSource: null,
               });
             }
           }, WORKER_TIMEOUT_MS);
@@ -313,7 +469,7 @@ export default function SmartScanMobilePage() {
       } catch {
         workerFailedRef.current = true;
         lastEngineRef.current = "fallback";
-        return Promise.resolve(analyzeFrameData(img, assessmentId, qrText, thoroughQr));
+        return analyzeFrameAsync(img, assessmentId, qrText, thoroughQr);
       }
     },
     [assessmentId],
@@ -330,11 +486,13 @@ export default function SmartScanMobilePage() {
   }, []);
 
   const sendHeld = useCallback(
-    async (held: HeldScan): Promise<boolean> => {
-      const ch = channelRef.current;
-      if (!ch) return false;
-      return ch.sendScan({
-        token,
+    async (held: HeldScan): Promise<SendOutcome> => {
+      if (!capability) return { status: "retry" };
+      const envelope = await buildPhoneSubmissionEnvelope({
+        capability,
+        sequenceNumber: held.sequenceNumber,
+        issuedAt: new Date(held.issuedAt),
+        scan: {
         scanId: held.scanId,
         sessionId: held.sessionId,
         assessmentId: held.assessmentId,
@@ -344,10 +502,33 @@ export default function SmartScanMobilePage() {
         detected: held.detected,
         confidence: held.confidence,
         capturedAt: held.capturedAt,
-        deviceName: navigator.userAgent.slice(0, 60),
+          identitySource: held.identitySource,
+          deviceName: navigator.userAgent.slice(0, 160),
+        },
       });
+      const result = await submitPhoneScan(envelope);
+      if (!result.ok) {
+        if (result.permanent) {
+          // Drop the doomed scan so it stops head-of-line blocking the queue.
+          // Retrying the identical envelope would fail forever; the teacher is
+          // told so they can re-scan or re-pair.
+          replaceOutbox(acknowledgeHeldScan(outboxRef.current, held.scanId));
+          return { status: "rejected", code: result.code };
+        }
+        return { status: "retry" };
+      }
+      replaceOutbox(acknowledgeHeldScan(outboxRef.current, held.scanId));
+      if (!committedScanIdsRef.current.has(held.scanId)) {
+        committedScanIdsRef.current.add(held.scanId);
+        setSentCount((count) => count + 1);
+      }
+      if (pendingScanRef.current?.scanId === held.scanId) {
+        setLastSent(held.learnerId);
+        setSyncState("pc_received");
+      }
+      return { status: "accepted" };
     },
-    [token],
+    [capability, replaceOutbox],
   );
 
   const submitScan = useCallback(
@@ -372,37 +553,45 @@ export default function SmartScanMobilePage() {
         detected: scan.detected,
         confidence: scan.confidence,
         capturedAt: scan.capturedAt,
+        sequenceNumber: capability ? nextPhoneSequence(window.sessionStorage, capability) : 0,
+        issuedAt: new Date().toISOString(),
+        identitySource: scan.identitySource,
       };
-      // Persist before transport. A Realtime send acknowledgement is not a
-      // durable receipt, so this entry remains until the PC echoes `saved` with
-      // this exact scan id and a receipt id.
+      if (!capability || held.sequenceNumber < 1) {
+        submittingRef.current = false;
+        setSyncState("failed");
+        setError("The secure phone capability is unavailable or expired. Generate a new pairing QR.");
+        return;
+      }
+      // Persist before transport. The local copy remains until the database
+      // returns the immutable inbox receipt for this exact message and digest.
       replaceOutbox(upsertHeldScan(outboxRef.current, held));
-      let ok: boolean;
+      let outcome: SendOutcome;
       try {
-        ok = await sendHeld(held);
+        outcome = await sendHeld(held);
       } catch {
-        ok = false;
+        outcome = { status: "retry" };
       } finally {
         submittingRef.current = false;
       }
-      if (!ok) {
+      if (outcome.status !== "accepted") {
         setSyncState("failed");
-        setError("Not connected to the PC yet. The scan is saved on this phone and will auto-send when the PC session is reachable.");
+        setError(
+          outcome.status === "rejected"
+            ? permanentRejectionMessage(outcome.code)
+            : "The secure inbox did not accept this scan. It remains queued while the active pairing can retry.",
+        );
         setStage("done");
         closeCamera();
         return;
       }
-      setSyncState((previous) =>
-        previous === "pc_received" || previous === "saved" || previous === "scored"
-          ? previous
-          : "sent",
-      );
+      setSyncState((previous) => previous === "scored" ? previous : "pc_received");
       setLastSent(scan.learnerId);
       setError("");
       setStage("done");
       closeCamera();
     },
-    [assessmentId, closeCamera, replaceOutbox, sendHeld, sessionId],
+    [assessmentId, capability, closeCamera, replaceOutbox, sendHeld, sessionId],
   );
 
   // Auto-retry the outbox every few seconds while anything is held. Successes
@@ -414,21 +603,30 @@ export default function SmartScanMobilePage() {
     const tick = async () => {
       if (cancelled || submittingRef.current || retryingRef.current) return;
       retryingRef.current = true;
-      let transportAccepted = false;
-      for (const held of outboxRef.current) {
-        const ok = !cancelled && (await sendHeld(held));
-        if (ok) {
-          transportAccepted = true;
-          if (pendingScanRef.current?.scanId === held.scanId) {
-            setLastSent(held.learnerId);
-          }
-        }
+      // A single rejected/thrown scan must never leave retryingRef stuck true —
+      // that silently disables all further auto-retries for the session. The
+      // drain contains every per-scan failure and the flag is reset in finally
+      // regardless of how the drain exits.
+      let outcome: Awaited<ReturnType<typeof drainHeldScans>>;
+      try {
+        outcome = await drainHeldScans(
+          outboxRef.current,
+          sendHeld,
+          () => cancelled,
+        );
+      } finally {
+        retryingRef.current = false;
       }
-      retryingRef.current = false;
       if (cancelled) return;
-      if (transportAccepted && pendingScanRef.current) {
+      // sendHeld already calls setLastSent for the pending scan on acceptance.
+      const lastRejection = outcome.rejected.at(-1);
+      if (lastRejection) {
+        setSyncState("failed");
+        setError(permanentRejectionMessage(lastRejection.code));
+      }
+      if (outcome.transportAccepted && pendingScanRef.current) {
         setSyncState((state) =>
-          state === "pc_received" || state === "saved" || state === "scored" ? state : "sent",
+          state === "saved" || state === "scored" ? state : "pc_received",
         );
       }
     };
@@ -440,12 +638,50 @@ export default function SmartScanMobilePage() {
     };
   }, [outbox, sendHeld]);
 
+  // Reconnect/status recovery always comes from the authoritative inbox row.
+  // Exact polling is capability scoped; no transient channel payload is used.
+  useEffect(() => {
+    const scanId = pendingScan?.scanId;
+    if (!capability || !scanId || syncState === "scored" || syncState === "failed") return;
+    let cancelled = false;
+    const poll = async () => {
+      const status = await getPhoneSubmissionStatus(capability, scanId);
+      if (cancelled || !status) {
+        if (!cancelled && Date.now() >= capability.capabilityExpiresAtMs) {
+          clearPhoneCapability(window.sessionStorage, capability.sessionId);
+          setCapability(null);
+          setSyncState("failed");
+          setError("This secure pairing capability expired. The PC can still recover any inbox receipt already stored.");
+        }
+        return;
+      }
+      if (status.status === "received") {
+        setSyncState("pc_received");
+        return;
+      }
+      if (status.status === "rejected") {
+        setSyncState("failed");
+        setError(safePhoneError(status.rejectionCode));
+        return;
+      }
+      if (status.resultReceiptId && status.score) {
+        setLastReceiptId(status.resultReceiptId);
+        setLastScore(status.score);
+        setSyncState("scored");
+      }
+    };
+    void poll();
+    const timer = setInterval(() => void poll(), 2000);
+    return () => { cancelled = true; clearInterval(timer); };
+  }, [capability, pendingScan?.scanId, syncState]);
+
   const handleStableScan = useCallback(
-    (scan: MobileScan) => {
+    (scan: MobileScan, captureSource: CapturedMobileScan["captureSource"] = "camera-final") => {
       const captured: CapturedMobileScan = {
         ...scan,
         scanId: generateScanId(),
         capturedAt: Date.now(),
+        captureSource,
       };
       setPendingScan(captured);
       pendingScanRef.current = captured;
@@ -466,8 +702,8 @@ export default function SmartScanMobilePage() {
     if (!runIsActive()) return;
     const now = Date.now();
     // Throttle heavy work so the main thread stays free for taps/scrolling.
-    if (now - lastAnalyzeRef.current < ANALYZE_INTERVAL_MS) {
-      if (runIsActive()) rafRef.current = requestAnimationFrame(() => void loopRef.current());
+    if (now - lastAnalyzeRef.current < analyzeIntervalRef.current) {
+      if (runIsActive()) scheduleNextFrame();
       return;
     }
     lastAnalyzeRef.current = now;
@@ -483,12 +719,28 @@ export default function SmartScanMobilePage() {
       const t0 = performance.now();
       // Identity must be decoded freshly on every counted frame. Reusing a QR
       // from a prior frame can bind the next physical sheet to the wrong learner.
-      const analysis = await analyzeAsync(frame, nativeQr, false);
+      // With no native BarcodeDetector (e.g. iOS Safari) the cheap jsQR pass
+      // cannot lock the small sheet QR, so escalate to the thorough, geometry-
+      // guided zone-rescue cascade. When a native QR is present the flag is a
+      // no-op (analysis uses the provided code), so Android pays nothing extra.
+      const analysis = await analyzeAsync(frame, nativeQr, !nativeQr);
       if (!runIsActive()) return;
-      setEngineInfo({ engine: lastEngineRef.current, ms: Math.round(performance.now() - t0) });
+      const analysisMs = performance.now() - t0;
+      analyzeIntervalRef.current = adaptiveAnalyzeInterval(analysisMs, ANALYZE_INTERVAL_MS);
+      setEngineInfo({
+        engine: lastEngineRef.current,
+        ms: Math.round(analysisMs),
+        intervalMs: analyzeIntervalRef.current,
+      });
       const result = analysis.result;
       const genuineQr = analysis.qrText;
-      setLastFrame(result);
+      // A transient garbled/partial QR read while hunting is not a hard error.
+      // Show gentle centering guidance instead of an alarming "invalid format"
+      // that sticks in the banner (the code hasn't been locked yet).
+      const liveResult = result.reasonCodes?.includes("QR_INVALID")
+        ? { ...result, message: "Center the sheet's QR in the frame and hold steady in good light." }
+        : result;
+      setLastFrame(liveResult);
       if (result.scan && genuineQr) {
         // Trusted layer: accumulate per-bubble darkness across aligned frames of
         // the same freshly identified, geometrically stable sheet.
@@ -498,6 +750,7 @@ export default function SmartScanMobilePage() {
           geometry: scan.geometry,
           luminance: scan.frameBrightness,
           sharpness: scan.frameSharpness,
+          sharpnessWidth: scan.frameWidth,
           observedAt: now,
           freshIdentity: true,
         }, CONSENSUS_FRAMES);
@@ -538,11 +791,87 @@ export default function SmartScanMobilePage() {
         setStableCount(stability.state?.consecutive ?? 0);
         if (stability.ready && active.n >= CONSENSUS_FRAMES) {
           const consensus = buildConsensusScan(active);
+          const expectation = stability.state
+            ? { identity: genuineQr, state: stability.state }
+            : null;
+          // Guard against a second final capture for the same stable hold: the
+          // ladder awaits, and another loop tick must not start a parallel
+          // takePhoto against the same track.
+          if (finalCaptureInFlightRef.current) {
+            if (runIsActive()) scheduleNextFrame();
+            return;
+          }
+          finalCaptureInFlightRef.current = true;
+          // `finally` rather than try/catch: the ladder already contains its own
+          // failures and resolves to null, but the in-flight flag must clear
+          // even if something unexpected rejects.
+          const finalStill = await captureFinalFrame().finally(() => {
+            finalCaptureInFlightRef.current = false;
+          });
+          if (!runIsActive()) return;
+          const finalFrame = finalStill?.image ?? null;
+          const capturedAt = Date.now();
+          if (finalStill) {
+            setFinalCaptureInfo({
+              source: finalStill.source,
+              width: finalStill.sourceWidth,
+              height: finalStill.sourceHeight,
+            });
+          }
+          if (!expectation || !finalFrame) {
+            stabilityRef.current = null;
+            accumRef.current = null;
+            setStableCount(0);
+            setLastFrame({
+              ...result,
+              scan: null,
+              status: "final_capture_rejected",
+              message: "The final still could not be captured. Hold the sheet still and try again.",
+            });
+            if (runIsActive()) {
+              scheduleNextFrame();
+            }
+            return;
+          }
+          // The exact high-resolution still entering review is independently
+          // decoded and analyzed. Never reuse preview identity for this step.
+          const finalNativeQr = canvasRef.current
+            ? await readNativeQr(canvasRef.current)
+            : null;
+          if (!runIsActive()) return;
+          const finalAnalysis = await analyzeAsync(finalFrame, finalNativeQr, true);
+          if (!runIsActive()) return;
+          const verified = verifyFinalMobileCapture(
+            expectation,
+            consensus,
+            finalAnalysis,
+            capturedAt,
+          );
           cooldownUntilRef.current = Date.now() + COOLDOWN_MS;
           accumRef.current = null;
           stabilityRef.current = null;
           setStableCount(0);
-          handleStableScan(consensus);
+          if (!verified.ok) {
+            setLastFrame({
+              ...finalAnalysis.result,
+              scan: null,
+              status: "final_capture_rejected",
+              message: verified.message,
+            });
+            if (runIsActive()) {
+              scheduleNextFrame();
+            }
+            return;
+          }
+          setLastFrame({
+            ...finalAnalysis.result,
+            scan: verified.scan,
+            status: verified.scan.hasDoubt ? "review" : "ready",
+            message: verified.evidenceDisagreed
+              ? "Final still disagreed with preview evidence. Teacher review is required."
+              : finalAnalysis.result.message,
+          });
+          handleStableScan(verified.scan);
           return;
         }
       } else {
@@ -553,34 +882,36 @@ export default function SmartScanMobilePage() {
         setStableCount(0);
       }
     }
-    if (runIsActive()) rafRef.current = requestAnimationFrame(() => void loopRef.current());
-  }, [analyzeAsync, grabFrame, handleStableScan]);
+    if (runIsActive()) scheduleNextFrame();
+  }, [analyzeAsync, captureFinalFrame, grabFrame, handleStableScan, scheduleNextFrame]);
 
   useEffect(() => {
     loopRef.current = loop;
   }, [loop]);
 
-  async function startLiveCamera() {
+  async function startLiveCamera(recovering = false) {
     if (!linkOk) return;
+    galleryGenerationRef.current.cancel();
+    const lifecycleGeneration = recovering
+      ? lifecycleRef.current.recover()
+      : lifecycleRef.current.request();
+    if (lifecycleGeneration === null) return;
     setError("");
     setCameraMessage("");
     setLastFrame(null);
     if (!canUseLiveCamera || !navigator.mediaDevices?.getUserMedia) {
-      setCameraMessage("Live camera requires HTTPS and browser camera access. Use Scan photo as fallback.");
-      fileRef.current?.click();
+      lifecycleRef.current.fail(lifecycleGeneration, "start-failed");
+      setCameraMessage("Live camera requires HTTPS and browser camera access. Take a photo or choose an existing image instead.");
+      photoInputRef.current?.click();
       return;
     }
-    closeCamera();
+    releaseCamera();
     const runId = cameraRunRef.current;
     setBusy(true);
     try {
       const stream = await navigator.mediaDevices
         .getUserMedia({
-          video: {
-            facingMode: { ideal: "environment" },
-            width: { ideal: 1920 },
-            height: { ideal: 1080 },
-          },
+          video: preferredVideoConstraints(selectedCameraRef.current),
           audio: false,
         })
         .catch((err) => {
@@ -590,25 +921,47 @@ export default function SmartScanMobilePage() {
           throw err;
         });
       if (runId !== cameraRunRef.current) {
-        stream.getTracks().forEach((track) => track.stop());
+        stopCameraStreamOnce(stream);
+        return;
+      }
+      if (!lifecycleRef.current.starting(lifecycleGeneration)) {
+        stopCameraStreamOnce(stream);
         return;
       }
       streamRef.current = stream;
       const video = videoRef.current;
       if (!video) {
-        stream.getTracks().forEach((track) => track.stop());
+        lifecycleRef.current.fail(lifecycleGeneration, "start-failed");
+        stopCameraStreamOnce(stream);
         streamRef.current = null;
         return;
       }
       video.srcObject = stream;
       await video.play();
-      if (runId !== cameraRunRef.current) return;
+      if (runId !== cameraRunRef.current || !lifecycleRef.current.isCurrent(lifecycleGeneration)) {
+        stopCameraStreamOnce(stream);
+        return;
+      }
       // Optional camera upgrades: continuous autofocus keeps a handheld sheet
       // sharp, and torch support unlocks the flashlight button in low light.
       // Both are best-effort — unsupported devices just skip them.
       try {
         const track = stream.getVideoTracks()[0];
         const caps = track?.getCapabilities?.() as (MediaTrackCapabilities & { torch?: boolean; focusMode?: string[] }) | undefined;
+        if (track) {
+          const profile = inspectCameraTrack(track.getSettings(), caps);
+          setCameraProfile(profile);
+          const devices = rankVideoDevices(
+            await navigator.mediaDevices.enumerateDevices(),
+            selectedCameraRef.current || profile.deviceId || "",
+          );
+          setCameraDevices(devices);
+          if (profile.deviceId) {
+            selectedCameraRef.current = profile.deviceId;
+            setSelectedCameraId(profile.deviceId);
+            try { localStorage.setItem(CAMERA_DEVICE_KEY, profile.deviceId); } catch { /* optional preference */ }
+          }
+        }
         setTorchAvailable(Boolean(caps?.torch));
         if (caps?.focusMode?.includes("continuous")) {
           await track.applyConstraints({ advanced: [{ focusMode: "continuous" } as MediaTrackConstraintSet] });
@@ -616,72 +969,124 @@ export default function SmartScanMobilePage() {
       } catch {
         /* best-effort enhancements only */
       }
+      if (!lifecycleRef.current.activate(lifecycleGeneration)) {
+        releaseCamera();
+        return;
+      }
+      const activeTrack = stream.getVideoTracks()[0];
+      if (activeTrack) {
+        const onEnded = () => {
+          if (lifecycleRef.current.snapshot().state !== "ACTIVE") return;
+          lifecycleRef.current.suspend("track-ended");
+          releaseCamera();
+          setStage("ready");
+          if (document.visibilityState === "visible") {
+            startCameraRef.current(true);
+          }
+        };
+        activeTrack.addEventListener("ended", onEnded, { once: true });
+        trackEndedCleanupRef.current = () => activeTrack.removeEventListener("ended", onEnded);
+      }
       setStage("live");
-      rafRef.current = requestAnimationFrame(() => loopRef.current());
+      scheduleNextFrame();
     } catch (err) {
-      closeCamera();
+      if (lifecycleRef.current.isCurrent(lifecycleGeneration)) {
+        lifecycleRef.current.fail(
+          lifecycleGeneration,
+          err instanceof DOMException && (err.name === "NotAllowedError" || err.name === "PermissionDeniedError")
+            ? "permission-denied"
+            : "start-failed",
+        );
+      }
+      releaseCamera();
       const outcome = classifyMediaError(err, true);
       setCameraMessage(outcome.message);
     } finally {
-      setBusy(false);
+      if (lifecycleRef.current.isCurrent(lifecycleGeneration)) setBusy(false);
     }
   }
 
-  function readPhoto(file: File) {
+  useEffect(() => {
+    startCameraRef.current = (recovering = false) => { void startLiveCamera(recovering); };
+  });
+
+  useEffect(() => {
+    const suspend = (outcome: Extract<CameraLifecycleOutcome, "page-hidden" | "focus-lost" | "device-change">) => {
+      const state = lifecycleRef.current.snapshot().state;
+      const canSuspend = outcome === "page-hidden"
+        ? ["REQUESTING_PERMISSION", "STARTING", "ACTIVE"].includes(state)
+        : state === "ACTIVE";
+      if (!canSuspend) return;
+      if (!lifecycleRef.current.suspend(outcome)) return;
+      releaseCamera();
+      setStage("ready");
+    };
+    const recover = () => {
+      if (document.visibilityState !== "visible") return;
+      startCameraRef.current(true);
+    };
+    const onVisibility = () => document.visibilityState === "hidden" ? suspend("page-hidden") : recover();
+    const onBlur = () => suspend("focus-lost");
+    const onFocus = () => recover();
+    const onDeviceChange = () => {
+      suspend("device-change");
+      recover();
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    window.addEventListener("blur", onBlur);
+    window.addEventListener("focus", onFocus);
+    navigator.mediaDevices?.addEventListener?.("devicechange", onDeviceChange);
+    return () => {
+      document.removeEventListener("visibilitychange", onVisibility);
+      window.removeEventListener("blur", onBlur);
+      window.removeEventListener("focus", onFocus);
+      navigator.mediaDevices?.removeEventListener?.("devicechange", onDeviceChange);
+    };
+  }, [releaseCamera]);
+
+  async function readPhoto(file: File, captureSource: CapturedMobileScan["captureSource"]) {
     // Gallery/capture decoding owns the canvas until it completes. Invalidate
     // any in-flight live analysis first so the two paths cannot corrupt pixels.
     closeCamera();
+    const request = galleryGenerationRef.current.begin();
     setStage("ready");
     setBusy(true);
     setError("");
     setLastScore(null);
-    const im = new Image();
-    im.onload = async () => {
-      const canvas = canvasRef.current;
-      const ctx = canvas?.getContext("2d", { willReadFrequently: true });
-      if (!canvas || !ctx) {
-        setBusy(false);
-        return;
-      }
-      const decodeAt = async (maxW: number, thoroughQr: boolean) => {
-        const scale = Math.min(1, maxW / im.naturalWidth);
-        canvas.width = Math.round(im.naturalWidth * scale);
-        canvas.height = Math.round(im.naturalHeight * scale);
-        ctx.drawImage(im, 0, 0, canvas.width, canvas.height);
-        const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
-        const nativeQr = await readNativeQr(canvas);
-        const analysis = await analyzeAsync(img, nativeQr, thoroughQr);
-        return analysis.result;
-      };
-      // Small-and-cheap first: QR decoders work best at 1–2K, and most photos
-      // resolve on the first pass in well under a second. Escalate resolution
-      // and the expensive multi-pass recovery ONLY while nothing is found —
-      // the old big-first thorough ladder made every photo pay worst-case time.
-      let result = await decodeAt(1600, false);
-      for (const [maxW, thoroughQr] of [[2200, false], [2800, true], [1300, true]] as const) {
-        if (result.scan || result.status !== "searching") break;
-        result = await decodeAt(maxW, thoroughQr);
-      }
-      URL.revokeObjectURL(im.src);
-      setLastFrame(result);
+    const canvas = canvasRef.current;
+    if (!canvas) {
       setBusy(false);
-      if (!result.scan) {
-        setError(result.message);
-        return;
-      }
-      handleStableScan(result.scan);
-    };
-    im.onerror = () => {
+      setError("[IMAGE_DECODE_FAILED] The image-processing canvas is unavailable.");
+      return;
+    }
+    const ingested = await ingestGalleryImage(file, canvas, request.signal);
+    if (!galleryGenerationRef.current.isCurrent(request.generation)) return;
+    if (!ingested.ok) {
       setBusy(false);
-      setError("Could not open that photo.");
-    };
-    im.src = URL.createObjectURL(file);
+      setError(`[${ingested.code}] ${ingested.message}`);
+      return;
+    }
+    const analysisStartedAt = performance.now();
+    const analysis = await analyzeAsync(ingested.image, null, true);
+    if (import.meta.env.DEV) {
+      console.info("[scanner-analysis]", {
+        analysisDurationMs: Math.round((performance.now() - analysisStartedAt) * 100) / 100,
+      });
+    }
+    if (!galleryGenerationRef.current.isCurrent(request.generation)) return;
+    setLastFrame(analysis.result);
+    setBusy(false);
+    if (!analysis.result.scan) {
+      setError(analysis.result.message);
+      return;
+    }
+    handleStableScan(analysis.result.scan, captureSource);
   }
 
-  function onPhoto(e: React.ChangeEvent<HTMLInputElement>) {
+  function onPhoto(e: React.ChangeEvent<HTMLInputElement>, captureSource: CapturedMobileScan["captureSource"]) {
     const file = e.target.files?.[0];
     e.target.value = "";
-    if (file) readPhoto(file);
+    if (file) void readPhoto(file, captureSource);
   }
 
   function resetForNext() {
@@ -718,9 +1123,21 @@ export default function SmartScanMobilePage() {
   );
 
   return (
-    <div className="mx-auto min-h-screen max-w-md bg-slate-950 p-3 text-white">
+    // `app-safe-area` replaces the plain `p-3`: viewport-fit=cover puts this
+    // shell under the iOS status bar and home indicator, so the device insets
+    // must be added to the padding or the header sits behind the clock.
+    // --app-shell-pad is the 0.75rem this layout used before (Tailwind p-3).
+    <div
+      data-testid="scanner-shell"
+      style={{ "--app-shell-pad": "0.75rem" } as React.CSSProperties}
+      className="app-safe-area mx-auto min-h-screen max-w-md bg-slate-950 text-white"
+    >
       <header className="mb-3 rounded-xl bg-indigo-700 px-4 py-3 text-white">
-        <div className="text-lg font-extrabold">DALIguro Phone Scanner</div>
+        <div className="flex items-baseline justify-between gap-2">
+          <div className="text-lg font-extrabold">DALIguro Phone Scanner</div>
+          {/* Build stamp: lets any user screenshot identify a stale cached client. */}
+          <div className="text-[10px] font-mono opacity-70">b{__BUILD_ID__}</div>
+        </div>
         {linkOk ? (
           <div className="text-xs opacity-90">
             Camera companion · PC dashboard is the system of record{assessmentId ? ` · ${assessmentId}` : ""}
@@ -745,8 +1162,10 @@ export default function SmartScanMobilePage() {
 
       {!configured ? (
         <Info>Realtime sync is not enabled on this build. Ask your admin to configure Supabase.</Info>
-      ) : !sessionId || !token || !assessmentId ? (
-        <Info>Invalid pairing link: session, token, or assessment identity is missing. Generate a new phone scanner QR on the PC.</Info>
+      ) : pairingPending ? (
+        <Info>Securely claiming this one-time pairing session…</Info>
+      ) : !sessionId || !capability || !assessmentId ? (
+        <Info>Invalid or expired secure pairing. Generate a new phone scanner QR on the PC.</Info>
       ) : (
         <>
           {(stage === "ready" || stage === "live") ? (
@@ -757,7 +1176,7 @@ export default function SmartScanMobilePage() {
                   <div className="text-xs text-slate-500">Averages {CONSENSUS_FRAMES} steady reads, then requires teacher confirmation before submission.</div>
                   {engineInfo ? (
                     <div className={"mt-0.5 text-[10px] font-bold " + (engineInfo.engine === "worker" ? "text-emerald-600" : "text-amber-600")}>
-                      Engine: {engineInfo.engine === "worker" ? "worker ✓" : "main-thread fallback"} · {engineInfo.ms}ms/frame
+                      Engine: {engineInfo.engine === "worker" ? "worker ✓" : "main-thread fallback"} · {engineInfo.ms}ms decode · {engineInfo.intervalMs}ms schedule
                     </div>
                   ) : null}
                 </div>
@@ -789,16 +1208,54 @@ export default function SmartScanMobilePage() {
                 <Button onClick={() => void startLiveCamera()} disabled={busy || stage === "live"}>
                   {stage === "live" ? "Scanning…" : "Start live camera"}
                 </Button>
-                <Button variant="ghost" onClick={() => fileRef.current?.click()} disabled={busy}>
-                  Scan photo
+                <Button variant="ghost" onClick={() => photoInputRef.current?.click()} disabled={busy}>
+                  Take Photo
+                </Button>
+                <Button variant="ghost" onClick={() => galleryInputRef.current?.click()} disabled={busy}>
+                  Choose Existing Image
                 </Button>
                 {stage === "live" ? (
                   <Button variant="smallDanger" onClick={() => { closeCamera(); setStage("ready"); }}>
                     Stop camera
                   </Button>
                 ) : null}
-                <input ref={fileRef} type="file" accept="image/*" capture="environment" hidden onChange={onPhoto} />
+                <input ref={photoInputRef} type="file" accept="image/jpeg,image/png,.jpg,.jpeg,.png" capture="environment" hidden onChange={(event) => onPhoto(event, "manual-capture")} />
+                <input ref={galleryInputRef} type="file" accept="image/jpeg,image/png,.jpg,.jpeg,.png" hidden onChange={(event) => onPhoto(event, "gallery")} />
               </div>
+              {cameraDevices.length > 1 ? (
+                <label className="mt-3 block text-xs font-bold text-slate-600">
+                  Camera
+                  <select
+                    value={selectedCameraId}
+                    onChange={(event) => {
+                      const deviceId = event.target.value;
+                      selectedCameraRef.current = deviceId;
+                      setSelectedCameraId(deviceId);
+                      try { localStorage.setItem(CAMERA_DEVICE_KEY, deviceId); } catch { /* optional preference */ }
+                      closeCamera();
+                      setStage("ready");
+                      window.setTimeout(() => startCameraRef.current(false), 0);
+                    }}
+                    className="mt-1 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-slate-900"
+                  >
+                    {cameraDevices.map((device) => (
+                      <option key={device.deviceId} value={device.deviceId}>
+                        {device.label}{device.ultrawideLike ? " (ultrawide)" : ""}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              ) : null}
+              {cameraProfile ? (
+                <div className="mt-2 rounded-lg bg-slate-100 px-3 py-2 font-mono text-[10px] text-slate-600" role="status">
+                  Actual camera: {cameraProfile.width ?? "?"}×{cameraProfile.height ?? "?"}
+                  {cameraProfile.frameRate ? ` @ ${Math.round(cameraProfile.frameRate)}fps` : ""}
+                  {cameraProfile.facingMode ? ` · ${cameraProfile.facingMode}` : ""}
+                  {cameraProfile.focusMode ? ` · focus ${cameraProfile.focusMode}` : ""}
+                  {cameraProfile.zoom ? ` · zoom ${cameraProfile.zoom}` : ""}
+                  {cameraProfile.torchSupported ? " · torch" : ""}
+                </div>
+              ) : null}
               {lastFrame?.message ? (
                 <div className="mt-2 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-xs font-bold text-slate-700" role="status" aria-live="polite">
                   {lastFrame.message}
@@ -818,6 +1275,16 @@ export default function SmartScanMobilePage() {
               <div className="text-sm font-extrabold">Confirm detected answers</div>
               <div className="mt-1 grid grid-cols-2 gap-1 text-[11px] text-slate-600">
                 <span>Learner: <b className="text-slate-900">{pendingScan.learnerId}</b></span>
+                <span>Source: <b className="text-slate-900">{pendingScan.captureSource}</b></span>
+                <span>QR path: <b className="text-slate-900">{pendingScan.identitySource ?? "native/unknown"}</b></span>
+                {finalCaptureInfo ? (
+                  <span>
+                    Still:{" "}
+                    <b className="text-slate-900">
+                      {finalCaptureInfo.source} {finalCaptureInfo.width}×{finalCaptureInfo.height}
+                    </b>
+                  </span>
+                ) : null}
                 <span>Version: <b className="text-slate-900">{pendingScan.version || "—"}</b></span>
                 <span>Assessment: <b className="text-slate-900">{assessmentId || "—"}</b></span>
                 <span>Items: <b className="text-slate-900">{pendingScan.detected.length}/{pendingScan.totalItems}</b></span>

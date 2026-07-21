@@ -16,6 +16,12 @@ const EVIDENCE_STORE = "evidence";
 const STATE_KEY = "state";
 const LS_KEY = "daliguro_qr_state";
 
+// Browser artifacts owned by this application. Keep these deliberately scoped:
+// clearing DALIguro data must never behave like localStorage.clear() and erase
+// another application hosted on the same origin.
+const APP_STORAGE_PREFIXES = ["daliguro_", "smartscan_"] as const;
+const APP_CACHE_PREFIXES = ["daliguro-qr-"] as const;
+
 // ---- Capability check --------------------------------------
 
 function hasIndexedDB(): boolean {
@@ -251,6 +257,106 @@ export async function clearState(): Promise<void> {
   } catch {
     // ignore
   }
+}
+
+// ---- Complete local-data purge -----------------------------
+
+export class LocalDataClearError extends Error {
+  readonly failedAreas: string[];
+
+  constructor(failedAreas: string[]) {
+    super(`Could not clear DALIguro data from: ${failedAreas.join(", ")}`);
+    this.name = "LocalDataClearError";
+    this.failedAreas = failedAreas;
+  }
+}
+
+function isAppOwnedStorageKey(key: string): boolean {
+  return APP_STORAGE_PREFIXES.some((prefix) => key.startsWith(prefix));
+}
+
+function isAppOwnedCache(cacheName: string): boolean {
+  return APP_CACHE_PREFIXES.some((prefix) => cacheName.startsWith(prefix));
+}
+
+function matchingStorageKeys(storage: Storage): string[] {
+  const keys: string[] = [];
+  for (let index = 0; index < storage.length; index += 1) {
+    const key = storage.key(index);
+    if (key !== null && isAppOwnedStorageKey(key)) keys.push(key);
+  }
+  return keys;
+}
+
+function clearOwnedStorage(storage: Storage): void {
+  const failures: unknown[] = [];
+  for (const key of matchingStorageKeys(storage)) {
+    try {
+      storage.removeItem(key);
+    } catch (error) {
+      failures.push(error);
+    }
+  }
+
+  // Verify instead of assuming removeItem succeeded (some restricted browser
+  // contexts expose Storage but reject mutations).
+  const remaining = matchingStorageKeys(storage);
+  if (failures.length > 0 || remaining.length > 0) {
+    throw new Error("Browser storage still contains DALIguro-owned keys.");
+  }
+}
+
+async function clearAllIndexedDbStores(): Promise<void> {
+  if (!hasIndexedDB()) return;
+  const db = await openDB();
+  try {
+    const storeNames = Array.from(db.objectStoreNames);
+    if (storeNames.length === 0) return;
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction(storeNames, "readwrite");
+      for (const storeName of storeNames) tx.objectStore(storeName).clear();
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error ?? new Error("IndexedDB clear failed."));
+      tx.onabort = () => reject(tx.error ?? new Error("IndexedDB clear was aborted."));
+    });
+  } finally {
+    db.close();
+  }
+}
+
+async function clearOwnedCaches(): Promise<void> {
+  if (typeof caches === "undefined") return;
+  const cacheNames = (await caches.keys()).filter(isAppOwnedCache);
+  await Promise.all(cacheNames.map((cacheName) => caches.delete(cacheName)));
+  const remaining = (await caches.keys()).filter(isAppOwnedCache);
+  if (remaining.length > 0) {
+    throw new Error("Browser cache still contains DALIguro-owned entries.");
+  }
+}
+
+/**
+ * Permanently remove all DALIguro-owned data from this browser.
+ *
+ * This intentionally does not clear unrelated origin storage or the Supabase
+ * authentication token. Server-synchronized records are outside a local purge.
+ * Every supported storage area is awaited and verified; callers must not show a
+ * success state when this function rejects.
+ */
+export async function clearAllLocalData(): Promise<void> {
+  const operations: Array<[area: string, clear: () => void | Promise<void>]> = [
+    ["assessment and scan archive", clearAllIndexedDbStores],
+    ["local browser storage", () => clearOwnedStorage(window.localStorage)],
+    ["temporary browser storage", () => clearOwnedStorage(window.sessionStorage)],
+    ["offline cache", clearOwnedCaches],
+  ];
+
+  const outcomes = await Promise.allSettled(
+    operations.map(([, clear]) => Promise.resolve().then(clear)),
+  );
+  const failedAreas = outcomes.flatMap((outcome, index) =>
+    outcome.status === "rejected" ? [operations[index][0]] : [],
+  );
+  if (failedAreas.length > 0) throw new LocalDataClearError(failedAreas);
 }
 
 // ---- Scan evidence archive ---------------------------------

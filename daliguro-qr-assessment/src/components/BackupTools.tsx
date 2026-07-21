@@ -1,10 +1,15 @@
 // Local data safety: JSON backup export, restore-from-file import, and a
 // guarded reset. Offline-only; nothing leaves the device.
 
-import { useRef } from "react";
+import { useRef, useState } from "react";
 import type { PanelProps } from "./panel-types";
 import { emptyState } from "../lib/types";
-import { exportBackup, importBackup } from "../lib/offline-store";
+import {
+  clearAllLocalData,
+  exportBackup,
+  importBackup,
+  LocalDataClearError,
+} from "../lib/offline-store";
 import { downloadJson, safeFilename } from "../lib/export";
 import { Button } from "./ui";
 
@@ -18,6 +23,8 @@ export function BackupTools({
   setActiveId: PanelProps["setActiveId"];
 }) {
   const fileRef = useRef<HTMLInputElement>(null);
+  const [clearing, setClearing] = useState(false);
+  const [clearError, setClearError] = useState("");
 
   function exportNow() {
     const stamp = new Date().toISOString().slice(0, 10);
@@ -57,7 +64,8 @@ export function BackupTools({
     e.target.value = "";
   }
 
-  function resetAll() {
+  async function resetAll() {
+    if (clearing) return;
     const counts =
       state.assessments.length +
       " assessment(s), " +
@@ -67,18 +75,37 @@ export function BackupTools({
       " result(s)";
     if (
       !window.confirm(
-        "⚠ Clear ALL local data (" +
+        "⚠ Clear ALL DALIguro data stored in this browser (" +
           counts +
-          ")?\n\nThis cannot be undone. Export a backup first if unsure.",
+          ")?\n\nThis includes answer-sheet images, unsent phone scans, report settings, and scanner calibration. Synchronized server records are not deleted. This cannot be undone. Export a backup first if unsure.",
       )
     ) {
       return;
     }
-    if (!window.confirm("Final check: permanently delete everything on this device?")) {
+    if (!window.confirm("Final check: permanently delete all local DALIguro data from this browser?")) {
       return;
     }
-    setState(emptyState());
-    setActiveId(null);
+
+    setClearing(true);
+    setClearError("");
+    try {
+      await clearAllLocalData();
+      setState(emptyState());
+      setActiveId(null);
+      window.alert("All local DALIguro data was cleared from this browser.");
+    } catch (error) {
+      const areas = error instanceof LocalDataClearError
+        ? ` Failed area(s): ${error.failedAreas.join(", ")}.`
+        : "";
+      const message =
+        "Clear all did not finish. Some local records may remain, and the on-screen data was not reset." +
+        areas +
+        " Retry the operation or export a backup before closing this page.";
+      setClearError(message);
+      window.alert(message);
+    } finally {
+      setClearing(false);
+    }
   }
 
   return (
@@ -104,10 +131,20 @@ export function BackupTools({
           hidden
           onChange={onFile}
         />
-        <Button variant="smallDanger" onClick={resetAll}>
-          🗑 Clear all data
+        <Button
+          variant="smallDanger"
+          onClick={() => void resetAll()}
+          disabled={clearing}
+          aria-busy={clearing}
+        >
+          {clearing ? "Clearing local data…" : "🗑 Clear all data"}
         </Button>
       </div>
+      {clearError ? (
+        <p className="mt-3 text-xs font-semibold text-red-700" role="alert">
+          {clearError}
+        </p>
+      ) : null}
     </div>
   );
 }

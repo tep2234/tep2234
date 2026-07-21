@@ -539,6 +539,7 @@ function CheckEditor({
                 (state.answerKeys[scanResult.assessment.id] ?? {})[scanResult.version] ?? {}
               }
               readings={scanResult.reading.items}
+              captureSource={scanResult.captureSource}
               alreadySaved={Boolean(
                 findResult(
                   state.results,
@@ -584,7 +585,13 @@ function CheckEditor({
                 {scanFeedback}
               </div>
             ) : null}
-            <UsePhoneScannerPanel assessmentId={active.id} onSyncedRows={handleSyncedRows} />
+            <UsePhoneScannerPanel
+              assessmentId={active.id}
+              learnerIds={state.learners.map((learnerRow) => learnerRow.id)}
+              allowedVersions={active.versions}
+              itemCount={items.length}
+              onSyncedRows={handleSyncedRows}
+            />
             {lastSaved ? <SubmittedToSystemCard saved={lastSaved} navigate={navigate} /> : null}
             <AnswerSheetScanner
               state={state}

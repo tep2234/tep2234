@@ -1,17 +1,27 @@
 // PC "Use Phone as Scanner" panel: create a short-lived pairing QR -> use the
-// phone as a temporary camera companion -> receive scans through Supabase
-// Realtime broadcast. The phone never needs teacher sign-in; signed-in PC
-// sessions can additionally persist results to the teacher account.
+// phone as a temporary camera companion -> receive durable inbox rows through
+// RLS-filtered Postgres Changes. Pairing and phone writes use short-lived,
+// server-validated capabilities; no secret is sent through Broadcast.
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import QRCode from "qrcode";
 import { isSupabaseConfigured } from "../../lib/supabase/client";
-import { sendMagicLink, signOut, useSupabaseAuth } from "../../lib/auth/supabaseAuth";
+import { sendMagicLink, useSupabaseAuth } from "../../lib/auth/supabaseAuth";
 import { buildPairingUrl, checkedRowFromScan, isLoopbackOrigin, normalizePairingOrigin, scoredCheckedRow, secondsLeft, validateScanBroadcast } from "../../lib/sync/pairing";
-import { commitCheckedResult, createPairingSession, endSession, fetchCheckedResults, type SessionRow } from "../../lib/sync/smartscanSync";
+import {
+  commitCheckedResult,
+  completePhoneSubmission,
+  createPairingSession,
+  endSession,
+  fetchCheckedResults,
+  fetchPhoneSubmissions,
+  pairingSessionErrorMessage,
+  type SessionRow,
+} from "../../lib/sync/smartscanSync";
 import type { CheckedResultRow, ScanBroadcast, ScoredSummary } from "../../lib/sync/pairing";
-import { joinScanChannel, subscribeCheckedResults, subscribeSession } from "../../lib/sync/realtimeSmartScan";
-import { Button } from "../ui";
+import { subscribeCheckedResults, subscribePhoneSubmissions, subscribeSession } from "../../lib/sync/realtimeSmartScan";
+import type { PhoneInboxRow } from "../../lib/sync/realtime-security";
+import { Button, TextInput } from "../ui";
 
 interface FeedItem {
   learnerId: string;
@@ -29,9 +39,15 @@ const learnerSubmissionKey = (learnerId: string, version: string) => `${learnerI
 
 export function UsePhoneScannerPanel({
   assessmentId,
+  learnerIds,
+  allowedVersions,
+  itemCount,
   onSyncedRows,
 }: {
   assessmentId: string;
+  learnerIds: string[];
+  allowedVersions: string[];
+  itemCount: number;
   // Called with checked-result rows from the phone (initial fetch + realtime),
   // so the PC can score + merge them into its local results. Returns the scored
   // summaries so the PC can send the score back to the phone.
@@ -39,17 +55,16 @@ export function UsePhoneScannerPanel({
 }) {
   const auth = useSupabaseAuth();
   const [authErr, setAuthErr] = useState("");
+  const [teacherEmail, setTeacherEmail] = useState("");
+  const [sendingLink, setSendingLink] = useState(false);
 
-  const [session, setSession] = useState<{ id: string; url: string; expiresAtMs: number; token: string } | null>(null);
+  const [session, setSession] = useState<{ id: string; url: string; expiresAtMs: number } | null>(null);
   const [qrUrl, setQrUrl] = useState("");
   const [phone, setPhone] = useState<SessionRow["status"] | null>(null);
   const [phoneName, setPhoneName] = useState<string>("");
   const [feed, setFeed] = useState<FeedItem[]>([]);
   const [nowMs, setNowMs] = useState(() => Date.now());
   const [creating, setCreating] = useState(false);
-  const [email, setEmail] = useState("");
-  const [authMessage, setAuthMessage] = useState("");
-  const [sendingLink, setSendingLink] = useState(false);
   const [phoneOriginInput, setPhoneOriginInput] = useState(() => {
     try {
       return localStorage.getItem(PHONE_ORIGIN_KEY) ?? "";
@@ -59,7 +74,6 @@ export function UsePhoneScannerPanel({
   });
   const processingScanIdsRef = useRef(new Set<string>());
   const processingLearnersRef = useRef(new Map<string, string>());
-  const completedScanReceiptsRef = useRef(new Map<string, { receiptId: string; score: ScoredSummary }>());
   const committedLearnerScansRef = useRef(new Map<string, string>());
 
   const configured = isSupabaseConfigured();
@@ -79,7 +93,7 @@ export function UsePhoneScannerPanel({
 
   // Tick the clock while a session is live.
   useEffect(() => {
-    if (!session) return;
+    if (!session?.url) return;
     const t = setInterval(() => setNowMs(Date.now()), 500);
     return () => clearInterval(t);
   }, [session]);
@@ -100,6 +114,12 @@ export function UsePhoneScannerPanel({
     const unsub = subscribeSession(session.id, (row) => {
       setPhone(row.status);
       if (row.paired_device_name) setPhoneName(row.paired_device_name);
+      if (row.status === "paired") {
+        // The QR secret is consumed. Remove its URL and rendered image from PC
+        // memory/UI so it cannot be copied as if it were still reusable.
+        setSession((current) => current ? { ...current, url: "" } : current);
+        setQrUrl("");
+      }
     });
     return () => unsub();
   }, [session]);
@@ -156,7 +176,7 @@ export function UsePhoneScannerPanel({
       seed([row], scored);
     });
     // Realtime fallback: re-pull whenever the teacher returns to the tab, so a
-    // missed realtime/broadcast event can never leave a result stuck.
+    // missed Postgres Changes event can never leave a result stuck.
     const onFocus = () => { if (document.visibilityState === "visible") refetch(); };
     window.addEventListener("focus", onFocus);
     document.addEventListener("visibilitychange", onFocus);
@@ -168,152 +188,120 @@ export function UsePhoneScannerPanel({
     };
   }, [configured, auth.teacherUserId, assessmentId, onRows]);
 
-  // Live scan channel: the phone broadcasts scans here with NO phone sign-in
-  // (it only proves it holds the QR's token). The PC verifies the token, scores
-  // immediately, and persists only when the teacher is signed into cloud sync.
-  useEffect(() => {
-    if (!session || !auth.teacherUserId) return;
+  const processPhoneSubmission = useCallback(async (inbox: PhoneInboxRow) => {
     const teacherUserId = auth.teacherUserId;
-    const sessionToken = session.token;
-    let closed = false;
-    const ch = joinScanChannel(session.id, {
-      onHello: (msg) => {
-        if (msg.token !== sessionToken) return;
-        setPhone("paired");
-        if (msg.deviceName) setPhoneName(msg.deviceName);
-      },
-      onScan: (scan: ScanBroadcast) => {
-        if (scan.token !== sessionToken) return; // not this session's paired phone
-        const fail = (reason: string) => {
-          if (closed) return;
-          ch.sendAck({
-            token: sessionToken,
-            scanId: typeof scan.scanId === "string" ? scan.scanId : "invalid-scan",
-            learnerId: typeof scan.learnerId === "string" ? scan.learnerId : "unknown",
-            status: "failed",
-            reason,
-          });
-        };
-        if (Date.now() >= session.expiresAtMs) {
-          fail("This pairing session has expired. Generate a new pairing QR on the PC.");
-          return;
-        }
-        const validation = validateScanBroadcast(scan, {
-          sessionId: session.id,
-          assessmentId,
-        });
-        if (!validation.ok) {
-          fail(validation.reason);
-          return;
-        }
-        const completed = completedScanReceiptsRef.current.get(scan.scanId);
-        if (completed) {
-          ch.sendAck({
-            token: sessionToken,
-            scanId: scan.scanId,
-            learnerId: scan.learnerId,
-            status: "saved",
-            receiptId: completed.receiptId,
-          });
-          ch.sendScore({
-            token: sessionToken,
-            receiptId: completed.receiptId,
-            ...completed.score,
-          });
-          return;
-        }
-        const learnerKey = learnerSubmissionKey(scan.learnerId, scan.version);
-        const committedScanId = committedLearnerScansRef.current.get(learnerKey);
-        if (committedScanId && committedScanId !== scan.scanId) {
-          fail("A pending result already exists for this learner and version. Review it before deciding whether to replace it.");
-          return;
-        }
-        if (processingScanIdsRef.current.has(scan.scanId)) {
-          ch.sendAck({ token: sessionToken, scanId: scan.scanId, learnerId: scan.learnerId, status: "pc_received" });
-          return;
-        }
-        const processingLearnerScan = processingLearnersRef.current.get(learnerKey);
-        if (processingLearnerScan && processingLearnerScan !== scan.scanId) {
-          fail("Another scan for this learner is still being committed. Wait for its receipt before rescanning.");
-          return;
-        }
-        processingScanIdsRef.current.add(scan.scanId);
-        processingLearnersRef.current.set(learnerKey, scan.scanId);
-        const releaseProcessing = () => {
-          processingScanIdsRef.current.delete(scan.scanId);
-          if (processingLearnersRef.current.get(learnerKey) === scan.scanId) {
-            processingLearnersRef.current.delete(learnerKey);
-          }
-        };
-        setPhone("paired");
-        ch.sendAck({ token: sessionToken, scanId: scan.scanId, learnerId: scan.learnerId, status: "pc_received" });
-        const row = checkedRowFromScan(scan, { assessmentId, teacherUserId, sessionId: session.id });
-        let summary: ScoredSummary | undefined;
-        try {
-          const scored = onRows?.([row], false); // pure validation/scoring preview
-          summary = scored?.find((candidate) => candidate.scanId === scan.scanId);
-        } catch {
-          releaseProcessing();
-          fail("The PC could not validate and score this scan. It remains queued on the phone.");
-          return;
-        }
-        if (!summary) {
-          releaseProcessing();
-          fail("The PC rejected this scan because its learner, version, or item mapping is invalid.");
-          return;
-        }
-        const acceptedSummary = summary;
-        const finish = (receiptId: string, committedRow: CheckedResultRow) => {
-          // The local merge is intentionally after the durable receipt. If it
-          // fails, do not acknowledge the phone; an exact retry will recover
-          // the same server receipt and retry this idempotent merge.
-          const merged = onRows?.([committedRow], true) ?? [];
-          if (!merged.some((candidate) => candidate.scanId === scan.scanId)) {
-            throw new Error("durable_scan_local_merge_failed");
-          }
-          completedScanReceiptsRef.current.set(scan.scanId, { receiptId, score: acceptedSummary });
-          committedLearnerScansRef.current.set(learnerKey, scan.scanId);
-          if (closed) return;
-          ch.sendAck({
-            token: sessionToken,
-            scanId: scan.scanId,
-            learnerId: row.learner_id,
-            status: "saved",
-            receiptId,
-          });
-          ch.sendScore({ token: sessionToken, receiptId, ...acceptedSummary });
-          setFeed((prev) => [{
-            learnerId: row.learner_id,
-            name: row.learner_name ?? row.learner_id,
-            when: Date.now(),
-            raw: acceptedSummary.raw,
-            total: acceptedSummary.total,
-            pct: acceptedSummary.pct,
-            review: "Needs review",
-          }, ...prev].slice(0, 20));
-        };
-        void (async () => {
-          try {
-            const scoredRow = scoredCheckedRow(row, acceptedSummary);
-            const receipt = await commitCheckedResult(scoredRow);
-            if (receipt.ok) finish(receipt.receiptId, scoredRow);
-            else {
-              fail("The PC scored this scan but the database did not confirm a durable save. It remains queued on the phone.");
-            }
-          } catch {
-            fail("The durable save failed unexpectedly. The scan remains queued on the phone and can be retried.");
-          } finally {
-            releaseProcessing();
-          }
-        })();
-      },
+    if (!teacherUserId || inbox.teacher_user_id !== teacherUserId || inbox.assessment_id !== assessmentId) return;
+    const scan = inbox.payload as ScanBroadcast;
+    const validation = validateScanBroadcast(scan, {
+      sessionId: inbox.session_id,
+      assessmentId,
     });
-    return () => { closed = true; ch.close(); };
-  }, [session, auth.teacherUserId, assessmentId, onRows]);
+    if (!validation.ok || scan.scanId !== inbox.message_id) {
+      await completePhoneSubmission({ sessionId: inbox.session_id, messageId: inbox.message_id, rejectionCode: "pc_validation_failed" });
+      return;
+    }
+    const learnerKey = learnerSubmissionKey(scan.learnerId, scan.version);
+    const committedScanId = committedLearnerScansRef.current.get(learnerKey);
+    if (committedScanId && committedScanId !== scan.scanId) {
+      await completePhoneSubmission({ sessionId: inbox.session_id, messageId: scan.scanId, rejectionCode: "duplicate_requires_review" });
+      return;
+    }
+    if (processingScanIdsRef.current.has(scan.scanId)) return;
+    const processingLearnerScan = processingLearnersRef.current.get(learnerKey);
+    if (processingLearnerScan && processingLearnerScan !== scan.scanId) return;
+    processingScanIdsRef.current.add(scan.scanId);
+    processingLearnersRef.current.set(learnerKey, scan.scanId);
+    const releaseProcessing = () => {
+      processingScanIdsRef.current.delete(scan.scanId);
+      if (processingLearnersRef.current.get(learnerKey) === scan.scanId) {
+        processingLearnersRef.current.delete(learnerKey);
+      }
+    };
+    try {
+      const row = checkedRowFromScan(scan, {
+        assessmentId,
+        teacherUserId,
+        schoolId: inbox.school_id,
+        sessionId: inbox.session_id,
+      });
+      const summary = onRows?.([row], false)?.find((candidate) => candidate.scanId === scan.scanId);
+      if (!summary) {
+        await completePhoneSubmission({ sessionId: inbox.session_id, messageId: scan.scanId, rejectionCode: "learner_or_version_invalid" });
+        return;
+      }
+      const scoredRow = scoredCheckedRow(row, summary);
+      const receipt = await commitCheckedResult(scoredRow);
+      if (!receipt.ok) return; // durable inbox row remains pending for reconnect recovery
+      const merged = onRows?.([scoredRow], true) ?? [];
+      if (!merged.some((candidate) => candidate.scanId === scan.scanId)) return;
+      const completed = await completePhoneSubmission({
+        sessionId: inbox.session_id,
+        messageId: scan.scanId,
+        resultReceiptId: receipt.receiptId,
+        score: summary,
+      });
+      if (!completed) return;
+      committedLearnerScansRef.current.set(learnerKey, scan.scanId);
+      setFeed((prev) => [{
+        learnerId: row.learner_id,
+        name: row.learner_name ?? row.learner_id,
+        when: Date.now(),
+        raw: summary.raw,
+        total: summary.total,
+        pct: summary.pct,
+        review: "Needs review",
+      }, ...prev].slice(0, 20));
+    } catch {
+      // The immutable inbox row intentionally remains `received`; focus/reload
+      // will fetch and retry it without trusting a delayed client message.
+    } finally {
+      releaseProcessing();
+    }
+  }, [assessmentId, auth.teacherUserId, onRows]);
+
+  useEffect(() => {
+    if (!configured || !auth.teacherUserId) return;
+    const teacherUserId = auth.teacherUserId;
+    let active = true;
+    const refetch = async () => {
+      const rows = await fetchPhoneSubmissions(teacherUserId, assessmentId);
+      if (!active) return;
+      for (const row of rows) {
+        if (!active) break;
+        await processPhoneSubmission(row);
+      }
+    };
+    void refetch();
+    const unsub = subscribePhoneSubmissions(
+      teacherUserId,
+      assessmentId,
+      (row) => {
+        if (active) void processPhoneSubmission(row);
+      },
+      // Supabase can report SUBSCRIBED while a cold local Realtime tenant is
+      // still bringing logical replication online. Reconcile from durable
+      // storage after readiness so channel timing never becomes correctness.
+      () => { if (active) void refetch(); },
+    );
+    // Realtime remains an optimization. Periodic reconciliation closes the
+    // fetch/subscribe race and recovers missed notifications without requiring
+    // the teacher to focus or reload the page.
+    const reconcileTimer = setInterval(() => { if (active) void refetch(); }, 4_000);
+    const onFocus = () => { if (document.visibilityState === "visible") void refetch(); };
+    window.addEventListener("focus", onFocus);
+    document.addEventListener("visibilitychange", onFocus);
+    return () => {
+      active = false;
+      unsub();
+      clearInterval(reconcileTimer);
+      window.removeEventListener("focus", onFocus);
+      document.removeEventListener("visibilitychange", onFocus);
+    };
+  }, [assessmentId, auth.teacherUserId, configured, processPhoneSubmission]);
 
   const start = useCallback(async () => {
     if (!auth.teacherUserId) {
-      setAuthErr("Teacher sign-in is required before phone scanning so every accepted scan receives a durable server receipt.");
+      setAuthErr(auth.error ?? "Direct pairing is still being prepared. Retry in a moment.");
       return;
     }
     if (!pairingOriginValid) {
@@ -324,29 +312,37 @@ export function UsePhoneScannerPanel({
     setCreating(true);
     let created: Awaited<ReturnType<typeof createPairingSession>>;
     try {
-      created = await createPairingSession({ teacherUserId: auth.teacherUserId, assessmentId });
-    } catch {
-      setAuthErr("Could not create a session. Check your connection and try again.");
+      created = await createPairingSession({
+        assessmentId,
+        learnerIds,
+        allowedVersions,
+        itemCount,
+      });
+    } catch (error) {
+      setAuthErr(pairingSessionErrorMessage(error));
       return;
     } finally {
       setCreating(false);
     }
-    if (!created) { setAuthErr("Could not create a session. Check your connection."); return; }
+    if (!created) {
+      setAuthErr("Phone pairing is not configured in this build.");
+      return;
+    }
     try {
       if (savedPhoneOrigin && !savedPhoneOriginIsLoopback) localStorage.setItem(PHONE_ORIGIN_KEY, savedPhoneOrigin);
       if (savedPhoneOriginIsLoopback) localStorage.removeItem(PHONE_ORIGIN_KEY);
     } catch {
       /* ignore */
     }
-    const url = buildPairingUrl(pairingOrigin, created.sessionId, created.token, assessmentId);
-    setSession({ id: created.sessionId, url, expiresAtMs: created.expiresAtMs, token: created.token });
+    const url = buildPairingUrl(pairingOrigin, created.sessionId, created.token);
+    setSession({ id: created.sessionId, url, expiresAtMs: created.expiresAtMs });
     setPhone("active");
-  }, [auth.teacherUserId, assessmentId, pairingOrigin, pairingOriginValid, savedPhoneOrigin, savedPhoneOriginIsLoopback]);
+  }, [allowedVersions, assessmentId, auth.error, auth.teacherUserId, itemCount, learnerIds, pairingOrigin, pairingOriginValid, savedPhoneOrigin, savedPhoneOriginIsLoopback]);
 
   // Auto-generate the pairing QR as soon as auth has settled, so it's visible
-  // immediately (no extra click). Signed-out teachers get local PC pairing;
-  // signed-in teachers additionally get cloud persistence. Runs once per mount; ending the
-  // session leaves it ended until the teacher regenerates it.
+  // immediately (no extra click). A browser-scoped anonymous auth session gives
+  // direct users the same RLS isolation and durable receipts without email.
+  // Runs once per mount; ending the session leaves it ended until regenerated.
   const autoStartedRef = useRef(false);
   useEffect(() => {
     if (!configured || auth.loading || !auth.teacherUserId || session || creating || autoStartedRef.current || !pairingOriginValid) return;
@@ -362,23 +358,6 @@ export function UsePhoneScannerPanel({
     setPhoneName("");
   }, [session]);
 
-  const requestSignIn = useCallback(async () => {
-    if (sendingLink) return;
-    setSendingLink(true);
-    setAuthMessage("");
-    try {
-      const redirectTo = `${window.location.origin}${window.location.pathname}`;
-      const result = await sendMagicLink(email, redirectTo);
-      setAuthMessage(
-        result.ok
-          ? "Sign-in link sent. Open it on this computer, then return to SmartScan."
-          : result.error ?? "Could not send the sign-in link.",
-      );
-    } finally {
-      setSendingLink(false);
-    }
-  }, [email, sendingLink]);
-
   if (!configured) {
     return (
       <div className="mt-4 rounded-xl border border-slate-200 bg-slate-50 p-4 text-sm text-slate-600">
@@ -389,7 +368,7 @@ export function UsePhoneScannerPanel({
     );
   }
 
-  if (auth.loading) return <div className="mt-4 text-sm text-slate-500">Checking sign-in…</div>;
+  if (auth.loading) return <div className="mt-4 text-sm text-slate-500">Preparing secure direct pairing…</div>;
 
   const expired = session && left <= 0;
   const mm = Math.floor(left / 60), ss = String(left % 60).padStart(2, "0");
@@ -406,20 +385,18 @@ export function UsePhoneScannerPanel({
   return (
     <div className="mt-4 rounded-xl border border-slate-200 bg-white p-4">
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <div className="text-sm font-bold">📱 Use Phone as Scanner</div>
+        <div className="text-sm font-bold">
+          📱 Use Phone as Scanner{" "}
+          {/* Build stamp: identifies stale cached clients from screenshots. */}
+          <span className="align-middle font-mono text-[10px] font-normal text-slate-400">b{__BUILD_ID__}</span>
+        </div>
         <div className="flex items-center gap-2 text-xs text-slate-500">
           {auth.teacherUserId ? (
-            <>
-              <span>{auth.email}</span>
-              <button
-                className="font-bold text-indigo-700"
-                onClick={() => void (async () => { await stop(); await signOut(); })()}
-              >
-                sign out
-              </button>
-            </>
+            <span className="rounded-full bg-emerald-50 px-2 py-1 font-bold text-emerald-800">
+              {auth.email ?? "Verified teacher pairing active"}
+            </span>
           ) : (
-            <span className="rounded-full bg-amber-50 px-2 py-1 font-bold text-amber-800">Teacher sign-in required</span>
+            <span className="rounded-full bg-red-50 px-2 py-1 font-bold text-red-700">Direct pairing unavailable</span>
           )}
         </div>
       </div>
@@ -427,28 +404,36 @@ export function UsePhoneScannerPanel({
       {!session ? (
         <div className="mt-3">
           {!auth.teacherUserId ? (
-            <div className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs text-amber-950">
-              <div className="font-extrabold">Sign in on this computer for durable scan receipts</div>
+            <div className="rounded-lg border border-red-200 bg-red-50 p-3 text-xs text-red-950">
+              <div className="font-extrabold">Verified teacher sign-in required</div>
               <p className="mt-1">
-                The phone remains a camera companion and does not sign in. The authenticated PC validates, scores,
-                and stores each capture as a non-official submission before the phone removes it from its queue.
+                {auth.error ?? (auth.isAnonymous
+                  ? "Anonymous sessions cannot create teacher pairing sessions or commit assessment results."
+                  : "Sign in with your teacher email before using phone synchronization.")}
               </p>
-              <form
-                className="mt-2 flex flex-col gap-2 sm:flex-row"
-                onSubmit={(event) => { event.preventDefault(); void requestSignIn(); }}
-              >
-                <input
+              <div className="mt-2 flex flex-wrap gap-2">
+                <TextInput
                   type="email"
-                  required
-                  value={email}
-                  onChange={(event) => setEmail(event.target.value)}
-                  placeholder="Teacher email"
-                  autoComplete="email"
-                  className="min-w-0 flex-1 rounded-lg border border-amber-200 bg-white px-3 py-2 text-sm text-slate-900"
+                  value={teacherEmail}
+                  onChange={(event) => setTeacherEmail(event.target.value)}
+                  placeholder="teacher@school.edu"
+                  className="min-w-64 flex-1"
                 />
-                <Button disabled={sendingLink}>{sendingLink ? "Sending…" : "Send sign-in link"}</Button>
-              </form>
-              {authMessage ? <div className="mt-2 font-semibold" role="status">{authMessage}</div> : null}
+                <Button
+                  disabled={sendingLink || !teacherEmail.trim()}
+                  onClick={() => {
+                    setSendingLink(true);
+                    setAuthErr("");
+                    void sendMagicLink(teacherEmail, window.location.href).then((result) => {
+                      setSendingLink(false);
+                      setAuthErr(result.ok ? "Sign-in link sent. Open it in this browser." : result.error ?? "Sign-in failed.");
+                    });
+                  }}
+                >
+                  {sendingLink ? "Sending…" : "Send sign-in link"}
+                </Button>
+              </div>
+              {authErr ? <p className="mt-2 font-bold">{authErr}</p> : null}
             </div>
           ) : (
             <>
@@ -483,7 +468,9 @@ export function UsePhoneScannerPanel({
             <div className={"mt-1 text-sm font-bold " + (expired ? "text-red-600" : "text-slate-700")}>
               {expired ? "Expired" : `Expires in ${mm}:${ss}`}
             </div>
-            <div className="mt-1 break-all text-[10px] text-slate-400">{session.url}</div>
+            <div className="mt-1 text-[10px] font-bold text-emerald-700">
+              {phone === "paired" ? "One-time QR consumed" : "One-time QR · do not share"}
+            </div>
             <div className="mt-1 text-[10px] font-bold text-emerald-700">Phone address: {pairingOrigin}</div>
             <div className="mt-1 text-[10px] font-bold text-indigo-700">
               Durable cloud session · submissions require teacher review

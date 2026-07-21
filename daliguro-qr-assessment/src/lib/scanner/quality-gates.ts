@@ -13,7 +13,8 @@ export type CaptureQualityReasonCode =
   | "WEAK_PRINT_CONTRAST"
   | "BUBBLE_REGION_UNREADABLE"
   | "LOW_BUBBLE_CONFIDENCE"
-  | "DOUBTFUL_MARKS";
+  | "DOUBTFUL_MARKS"
+  | "FRAME_EVIDENCE_DISAGREEMENT";
 
 export type QualityDisposition = "accept" | "review" | "retake";
 export type QualityGateSeverity = "review" | "retake";

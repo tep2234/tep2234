@@ -1,46 +1,89 @@
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
+import type { ScanBroadcast } from "../src/lib/sync/pairing";
 import {
-  isScanAckBroadcast,
-  isScoreBroadcast,
-  isValidReceiptId,
-} from "../src/lib/sync/realtimeSmartScan";
+  buildPhoneSubmissionEnvelope,
+  capabilityStorageKey,
+  loadPhoneCapability,
+  phonePayloadText,
+  savePhoneCapability,
+  stripPairingSecretFromUrl,
+  type PhoneCapability,
+} from "../src/lib/sync/realtime-security";
 
-const common = {
-  token: "pairing-token",
-  scanId: "scan-id-0001",
-  learnerId: "learner-1",
+const capability: PhoneCapability = {
+  sessionId: "session-0001",
+  capability: "a".repeat(64),
+  capabilityExpiresAtMs: Date.now() + 60_000,
+  assessmentId: "assessment-1",
+  schoolId: "11111111-1111-4111-8111-111111111111",
+  itemCount: 1,
+  allowedVersions: ["A"],
+  nextSequence: 1,
 };
 
-describe("SmartScan realtime receipt boundary", () => {
-  it("accepts saved acknowledgements only with a non-empty scan-specific receipt", () => {
-    expect(isScanAckBroadcast({ ...common, status: "saved", receiptId: "receipt-0001" })).toBe(true);
-    expect(isScanAckBroadcast({ ...common, status: "saved" })).toBe(false);
-    expect(isScanAckBroadcast({ ...common, status: "saved", receiptId: "" })).toBe(false);
-    expect(isScanAckBroadcast({ ...common, status: "saved", receiptId: "short" })).toBe(false);
+const scan: ScanBroadcast = {
+  scanId: "scan-id-0001",
+  sessionId: capability.sessionId,
+  assessmentId: capability.assessmentId,
+  learnerId: "learner-1",
+  version: "A",
+  answerMap: { "1": "B" },
+  detected: [{ item: 1, answer: "B", status: "selected", confidence: 0.95 }],
+  confidence: 0.95,
+  capturedAt: Date.now(),
+  deviceName: "Test phone",
+  identitySource: "zone-rescue",
+};
+
+describe("SmartScan secured Realtime envelope", () => {
+  beforeEach(() => sessionStorage.clear());
+
+  it("binds the exact payload bytes to a SHA-256 digest", async () => {
+    const envelope = await buildPhoneSubmissionEnvelope({ capability, scan, sequenceNumber: 1 });
+    expect(envelope.payloadDigest).toMatch(/^[0-9a-f]{64}$/);
+    const tampered = phonePayloadText({ ...scan, learnerId: "other-learner" });
+    expect(tampered).not.toBe(envelope.payloadText);
+    const tamperedEnvelope = await buildPhoneSubmissionEnvelope({
+      capability,
+      scan: { ...scan, learnerId: "other-learner" },
+      sequenceNumber: 1,
+    });
+    expect(tamperedEnvelope.payloadDigest).not.toBe(envelope.payloadDigest);
   });
 
-  it("keeps transport and failure acknowledgements distinct from durable saves", () => {
-    expect(isScanAckBroadcast({ ...common, status: "pc_received" })).toBe(true);
-    expect(isScanAckBroadcast({ ...common, status: "failed", reason: "expired" })).toBe(true);
-    expect(isScanAckBroadcast({ ...common, status: "unknown" })).toBe(false);
-    expect(isValidReceiptId("receipt-0001")).toBe(true);
+  it("keeps pairing tokens and capabilities out of the persisted scan payload", async () => {
+    const envelope = await buildPhoneSubmissionEnvelope({ capability, scan, sequenceNumber: 1 });
+    expect(envelope.payloadText).not.toContain(capability.capability);
+    expect(envelope.payloadText.toLowerCase()).not.toContain("token");
+    expect(JSON.parse(envelope.payloadText)).not.toHaveProperty("capability");
+    expect(JSON.parse(envelope.payloadText)).toMatchObject({ identitySource: "zone-rescue" });
   });
 
-  it("rejects malformed or uncorrelated score payloads", () => {
-    const score = {
-      ...common,
-      receiptId: "receipt-0001",
-      raw: 8,
-      total: 10,
-      pct: 80,
-      correct: 8,
-      wrong: 2,
-      blank: 0,
-      mastery: "Mastered",
-    };
-    expect(isScoreBroadcast(score)).toBe(true);
-    expect(isScoreBroadcast({ ...score, receiptId: "" })).toBe(false);
-    expect(isScoreBroadcast({ ...score, pct: 101 })).toBe(false);
-    expect(isScoreBroadcast({ ...score, raw: Number.NaN })).toBe(false);
+  it("stores only the scoped capability in sessionStorage and expires it locally", () => {
+    savePhoneCapability(sessionStorage, capability);
+    expect(loadPhoneCapability(sessionStorage, capability.sessionId)).toEqual(capability);
+    expect(sessionStorage.getItem(capabilityStorageKey(capability.sessionId))).not.toContain("pairing-token");
+    expect(loadPhoneCapability(sessionStorage, capability.sessionId, capability.capabilityExpiresAtMs)).toBeNull();
+  });
+
+  it("removes the one-time pairing secret and query string after claim", () => {
+    window.history.replaceState(null, "", "/smartscan/mobile/session-0001?t=raw-secret&a=untrusted#camera");
+    stripPairingSecretFromUrl(window.location, window.history);
+    expect(window.location.pathname).toBe("/smartscan/mobile/session-0001");
+    expect(window.location.search).toBe("");
+    expect(window.location.hash).toBe("#camera");
+  });
+
+  it("rejects cross-session and cross-assessment envelope construction", async () => {
+    await expect(buildPhoneSubmissionEnvelope({
+      capability,
+      scan: { ...scan, sessionId: "other-session" },
+      sequenceNumber: 1,
+    })).rejects.toThrow("phone_submission_session_mismatch");
+    await expect(buildPhoneSubmissionEnvelope({
+      capability,
+      scan: { ...scan, assessmentId: "other-assessment" },
+      sequenceNumber: 1,
+    })).rejects.toThrow("phone_submission_assessment_mismatch");
   });
 });

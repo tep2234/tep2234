@@ -60,14 +60,12 @@ export function secondsLeft(expiresAtMs: number, now = Date.now()): number {
   return Math.max(0, Math.ceil((expiresAtMs - now) / 1000));
 }
 
-// The URL encoded into the pairing QR shown on the PC. The assessment id is
-// carried in the URL so the phone knows which assessment it's scanning WITHOUT
-// reading the (RLS-protected) session row — i.e. without signing in. The phone
-// broadcasts scans to the authenticated PC, which persists + scores them.
-export function buildPairingUrl(origin: string, sessionId: string, token: string, assessmentId?: string): string {
+// The QR carries only the session id and its one-time pairing secret. Assessment
+// and tenant scope come back from the atomic claim RPC after the secret is
+// consumed; placing them in the URL would make client input look authoritative.
+export function buildPairingUrl(origin: string, sessionId: string, token: string): string {
   const base = origin.replace(/\/+$/, "");
-  const a = assessmentId ? `&a=${encodeURIComponent(assessmentId)}` : "";
-  return `${base}${MOBILE_PATH}/${encodeURIComponent(sessionId)}?t=${encodeURIComponent(token)}${a}`;
+  return `${base}${MOBILE_PATH}/${encodeURIComponent(sessionId)}?t=${encodeURIComponent(token)}`;
 }
 
 export function originHost(origin: string): string {
@@ -98,7 +96,6 @@ export function normalizePairingOrigin(input: string): string {
 export interface ParsedPairing {
   sessionId: string;
   token: string;
-  assessmentId?: string;
 }
 
 // Reverse of buildPairingUrl — the phone reads the scanned/opened URL.
@@ -112,8 +109,7 @@ export function parsePairingUrl(url: string): ParsedPairing | null {
   const m = u.pathname.match(new RegExp(`${MOBILE_PATH}/([^/]+)/?$`));
   const token = u.searchParams.get("t") ?? "";
   if (!m || !token) return null;
-  const assessmentId = u.searchParams.get("a") ?? undefined;
-  return { sessionId: decodeURIComponent(m[1]), token, assessmentId };
+  return { sessionId: decodeURIComponent(m[1]), token };
 }
 
 // One raw detected item the phone reads off a sheet.
@@ -126,11 +122,9 @@ export interface ScanDetection {
   unreadableChoices?: number[];
 }
 
-// What the phone broadcasts to the PC over the live channel for each scan. The
-// token proves the sender scanned the PC's QR (the PC verifies it). No teacher
-// credentials ever leave the PC.
+// Minimum scan payload stored by the capability-checked phone ingress RPC.
+// Pairing secrets and capabilities are transport arguments, never payload data.
 export interface ScanBroadcast {
-  token: string;
   // Stable idempotency key generated once when the phone accepts a capture.
   // Retries MUST reuse it; acknowledgements and scores echo it back.
   scanId: string;
@@ -143,12 +137,14 @@ export interface ScanBroadcast {
   confidence: number;
   capturedAt: number;
   deviceName?: string;
+  // Diagnostic only — which decoder produced the identity. "zxing-wasm" is the
+  // WASM fallback tier used where no native BarcodeDetector exists.
+  identitySource?: "provided" | "whole-frame" | "region-cascade" | "zone-rescue" | "zxing-wasm";
 }
 
-// What the PC broadcasts BACK to the phone after scoring a scan against the
-// answer key, so the phone can show the real score immediately (it has no key).
+// Redacted score summary returned by the status RPC after the PC has persisted
+// the authoritative provisional result. It contains no answers or credentials.
 export interface ScoreBroadcast {
-  token: string;
   scanId: string;
   receiptId: string;
   learnerId: string;
@@ -161,9 +157,8 @@ export interface ScoreBroadcast {
   mastery: string;
 }
 
-// The scored result the PC computes for a scan (sent back to the phone, minus
-// the token which the sender adds).
-export type ScoredSummary = Omit<ScoreBroadcast, "token" | "receiptId">;
+// The scored result the PC computes before attaching the durable receipt id.
+export type ScoredSummary = Omit<ScoreBroadcast, "receiptId">;
 
 export type ScanValidation =
   | { ok: true }
@@ -205,6 +200,12 @@ export function validateScanBroadcast(
   }
   if (!Number.isFinite(scan.capturedAt) || (scan.capturedAt as number) <= 0) {
     return { ok: false, reason: "Missing capture timestamp." };
+  }
+  if (
+    scan.identitySource !== undefined &&
+    !["provided", "whole-frame", "region-cascade", "zone-rescue"].includes(scan.identitySource)
+  ) {
+    return { ok: false, reason: "Invalid QR identity source." };
   }
   if (!Array.isArray(scan.detected) || scan.detected.length < 1 || scan.detected.length > 80) {
     return { ok: false, reason: "Detected item count is outside the supported range." };
@@ -254,7 +255,7 @@ export function validateScanBroadcast(
   return { ok: true };
 }
 
-// Build the DB row the authenticated PC upserts from a phone's scan broadcast.
+// Build the DB row the authenticated PC commits from a durable phone inbox row.
 // Mirrors the phone's old direct-write payload; final scoring happens on the PC.
 export function checkedRowFromScan(
   b: ScanBroadcast,
