@@ -1,0 +1,103 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DALIguro camera scanner field validation record",
+  "description": "One record per device test run. PRIVACY: this file must never contain student names, real LRNs, authentication tokens, raw QR payloads, raw answer-sheet images, or any personal identifier. Use synthetic learners only (e.g. learnerRef 'SYNTH-L1'). Every field below is device/telemetry data, not student data.",
+  "_privacy_forbidden_fields": [
+    "student name",
+    "real LRN",
+    "pairing token or secret",
+    "raw QR payload text",
+    "raw or encoded answer-sheet image",
+    "Supabase keys",
+    "teacher account identifiers"
+  ],
+  "_instructions": "Copy the object under 'example' for each run. Read decoder path and still source directly from the scanner UI diagnostics ('QR path:' and 'Still:'). Leave any value you did not measure as null — do not guess. A null is honest; an invented number is not.",
+  "example": {
+    "sessionId": "FIELD-2026-07-21-A",
+    "appCommit": "8b102a2+uncommitted",
+    "appBuildId": "260721-0700",
+    "phase": "7-iphone-safari",
+    "condition": "normal-light-clear-qr",
+
+    "device": {
+      "model": "iPhone 12",
+      "os": "iOS 17.5.1",
+      "browser": "Safari 17.5",
+      "priceTier": "mid",
+      "ramGb": 4
+    },
+
+    "camera": {
+      "selectedLabel": "Back Camera",
+      "previewWidth": 1920,
+      "previewHeight": 1080,
+      "torchUsed": false,
+      "focusMode": "continuous"
+    },
+
+    "decoder": {
+      "qrPath": "zxing-wasm",
+      "nativeBarcodeDetectorAvailable": false,
+      "wasmRequestCount": 1,
+      "wasmRequestOrigin": "https://daliguro-qr-assessment.vercel.app",
+      "jsqrCascadeRan": false
+    },
+
+    "capture": {
+      "stillSource": "canvas",
+      "sourceWidth": 1080,
+      "sourceHeight": 1440,
+      "processingWidth": 1080,
+      "processingHeight": 1440
+    },
+
+    "timingMs": {
+      "toFirstFrame": null,
+      "toStableFrame": null,
+      "toAcceptedQr": null,
+      "toFinalCapture": null,
+      "toFinalResult": null
+    },
+
+    "outcome": {
+      "attempts": 20,
+      "accepted": 20,
+      "retries": 0,
+      "rejectedFrameReasons": [],
+      "finalOutcome": "accepted",
+      "wrongLearnerIdentities": 0,
+      "wrongAssessmentIdentities": 0,
+      "invalidPayloadsAccepted": 0,
+      "ambiguousAnswerCount": 0,
+      "ambiguousAutoFinalized": 0,
+      "duplicateFinalSubmissions": 0,
+      "silentlyLostScans": 0
+    },
+
+    "offline": {
+      "mode": "online",
+      "outboxRetained": null,
+      "syncResumedAfterReconnect": null
+    },
+
+    "stability": {
+      "cameraFreezes": 0,
+      "workerFallbacks": 0,
+      "browserCrashes": 0,
+      "pageReloads": 0,
+      "memoryWarnings": 0
+    },
+
+    "notes": "Free text. Device behaviour only — no student information."
+  },
+
+  "_integrityGates": {
+    "description": "These must ALL be zero in every record for a PASS. Any non-zero value is a blocking defect, not a tuning opportunity.",
+    "wrongLearnerIdentities": 0,
+    "wrongAssessmentIdentities": 0,
+    "invalidPayloadsAccepted": 0,
+    "ambiguousAutoFinalized": 0,
+    "duplicateFinalSubmissions": 0,
+    "silentlyLostScans": 0
+  }
+}

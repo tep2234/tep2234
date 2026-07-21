@@ -12,7 +12,9 @@ export interface HeldScan {
   capturedAt: number;
   sequenceNumber: number;
   issuedAt: string;
-  identitySource?: "provided" | "whole-frame" | "region-cascade" | "zone-rescue";
+  // Diagnostic only — which decoder produced the identity. "zxing-wasm" is the
+  // WASM fallback tier used where no native BarcodeDetector exists.
+  identitySource?: "provided" | "whole-frame" | "region-cascade" | "zone-rescue" | "zxing-wasm";
 }
 
 export interface SafeScanDiagnostic {

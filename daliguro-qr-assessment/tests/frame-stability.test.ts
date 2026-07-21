@@ -148,6 +148,93 @@ describe("automatic-capture temporal stability", () => {
     expect(finalStill.resetReason).toBeNull();
     expect(finalStill.ready).toBe(true);
   });
+
+  it("accepts a full-sensor ImageCapture still, a far larger jump than a canvas capture", () => {
+    // R2 introduced ImageCapture.takePhoto(), which can return a genuine
+    // full-sensor still (e.g. 4000px) rather than the canvas path's ~2200px
+    // cap. That widens the preview->final resolution ratio from ~1.7x to ~3x,
+    // so this asserts the normalization still holds at the new extreme instead
+    // of rejecting good captures with FINAL_CAPTURE_UNSTABLE.
+    const previewWidth = 1300;
+    const finalWidth = 4000;
+    let decision = advanceFrameStability(null, {
+      identity: "qr-a",
+      geometry: geometry(0),
+      freshIdentity: true,
+      luminance: 180,
+      sharpness: 6,
+      sharpnessWidth: previewWidth,
+      observedAt: 100,
+    });
+    for (let frame = 2; frame <= 4; frame += 1) {
+      decision = advanceFrameStability(decision.state, {
+        identity: "qr-a",
+        geometry: geometry(0),
+        freshIdentity: true,
+        luminance: 180,
+        sharpness: 6,
+        sharpnessWidth: previewWidth,
+        observedAt: 100 * frame,
+      });
+    }
+    expect(decision.ready).toBe(true);
+
+    const finalSharpness = 6 * (previewWidth / finalWidth); // ~1.95
+    expect(Math.abs(6 - finalSharpness) / 6).toBeGreaterThan(0.4);
+
+    const finalStill = advanceFrameStability(decision.state, {
+      identity: "qr-a",
+      geometry: geometry(0),
+      freshIdentity: true,
+      luminance: 180,
+      sharpness: finalSharpness,
+      sharpnessWidth: finalWidth,
+      observedAt: 500,
+    });
+    expect(finalStill.resetReason).toBeNull();
+    expect(finalStill.ready).toBe(true);
+  });
+
+  it("still rejects a genuinely blurred high-resolution still", () => {
+    // The normalization must not become a blanket excuse for any sharpness
+    // drop: a real focus loss at high resolution must still fail.
+    const previewWidth = 1300;
+    const finalWidth = 4000;
+    let decision = advanceFrameStability(null, {
+      identity: "qr-a",
+      geometry: geometry(0),
+      freshIdentity: true,
+      luminance: 180,
+      sharpness: 6,
+      sharpnessWidth: previewWidth,
+      observedAt: 100,
+    });
+    for (let frame = 2; frame <= 4; frame += 1) {
+      decision = advanceFrameStability(decision.state, {
+        identity: "qr-a",
+        geometry: geometry(0),
+        freshIdentity: true,
+        luminance: 180,
+        sharpness: 6,
+        sharpnessWidth: previewWidth,
+        observedAt: 100 * frame,
+      });
+    }
+
+    // Half the sharpness the resolution change alone would explain.
+    const blurred = 6 * (previewWidth / finalWidth) * 0.4;
+    const finalStill = advanceFrameStability(decision.state, {
+      identity: "qr-a",
+      geometry: geometry(0),
+      freshIdentity: true,
+      luminance: 180,
+      sharpness: blurred,
+      sharpnessWidth: finalWidth,
+      observedAt: 500,
+    });
+    expect(finalStill.ready).toBe(false);
+    expect(finalStill.resetReason).toBe("quality_changed");
+  });
 });
 
 // Build a 4-frame stable baseline at a given capture width and sharpness.

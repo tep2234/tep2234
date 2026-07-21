@@ -40,6 +40,11 @@ import {
 } from "../lib/scanner/frame-stability";
 import { verifyFinalMobileCapture } from "../lib/scanner/final-capture";
 import {
+  captureFinalStill,
+  createImageCapture,
+  type FinalCaptureSource,
+} from "../lib/scanner/final-still-capture";
+import {
   ingestGalleryImage,
   ScannerGeneration,
 } from "../lib/scanner/image-ingestion";
@@ -49,11 +54,14 @@ import {
   type CameraLifecycleOutcome,
 } from "../lib/scanner/camera-lifecycle";
 import {
-  analyzeFrameData,
   type FrameAnalysis,
   type FrameResult,
   type MobileScan,
 } from "../lib/scanner/mobile-analyze";
+// Main-thread fallback shares the worker's exact decoder cascade (native ->
+// ZXing WASM -> jsQR), so a device without workers is not also a device
+// without the WASM tier.
+import { analyzeFrameAsync } from "../lib/scanner/analyze-frame";
 import {
   acknowledgeHeldScan,
   buildSafeScanDiagnostic,
@@ -165,6 +173,8 @@ export default function SmartScanMobilePage() {
   const workerFailedRef = useRef(forceSyncEngine);
   const lastEngineRef = useRef<"worker" | "fallback">(forceSyncEngine ? "fallback" : "worker");
   const workerReqIdRef = useRef(0);
+  // Prevents a parallel final capture for the same stable hold (R2).
+  const finalCaptureInFlightRef = useRef(false);
   const workerPendingRef = useRef(new Map<number, (a: FrameAnalysis) => void>());
   const submittingRef = useRef(false);
   const retryingRef = useRef(false);
@@ -191,6 +201,14 @@ export default function SmartScanMobilePage() {
   const [selectedCameraId, setSelectedCameraId] = useState(initialCameraId);
   const [cameraProfile, setCameraProfile] = useState<CameraTrackProfile | null>(null);
   const [engineInfo, setEngineInfo] = useState<{ engine: "worker" | "fallback"; ms: number; intervalMs: number } | null>(null);
+  // Which rung of the final-still ladder produced the scored image, and the
+  // TRUE source dimensions (before the processing downscale). Surfaced so field
+  // testers can tell a genuine takePhoto still from an upscaled preview frame.
+  const [finalCaptureInfo, setFinalCaptureInfo] = useState<{
+    source: FinalCaptureSource;
+    width: number;
+    height: number;
+  } | null>(null);
   // Outbox of captured-but-unsent scans, persisted per session so neither
   // "Scan next sheet" nor a page reload can lose a teacher's work.
   const outboxKey = `smartscan_outbox_${sessionId}_${assessmentId}`;
@@ -365,6 +383,36 @@ export default function SmartScanMobilePage() {
     return ctx.getImageData(0, 0, canvas.width, canvas.height);
   }, []);
 
+  // Draw an ImageCapture bitmap into the analysis canvas, capping the LONGER
+  // side so a full-sensor still (e.g. 4000x3000) is downscaled to a size the
+  // OMR pipeline and phone memory can handle. Aspect ratio is preserved, so the
+  // marker/homography mapping stays valid.
+  const drawBitmapToCanvas = useCallback((bitmap: ImageBitmap): ImageData | null => {
+    const canvas = canvasRef.current;
+    if (!canvas || !bitmap.width || !bitmap.height) return null;
+    const scale = Math.min(1, FINAL_CAPTURE_W / Math.max(bitmap.width, bitmap.height));
+    canvas.width = Math.max(1, Math.round(bitmap.width * scale));
+    canvas.height = Math.max(1, Math.round(bitmap.height * scale));
+    const ctx = canvas.getContext("2d", { willReadFrequently: true });
+    if (!ctx) return null;
+    ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+    return ctx.getImageData(0, 0, canvas.width, canvas.height);
+  }, []);
+
+  // The full final-still ladder: takePhoto -> grabFrame -> canvas. Leaves the
+  // chosen still painted on canvasRef, so the independent final QR decode below
+  // reads the exact image that will be scored.
+  const captureFinalFrame = useCallback(async () => {
+    const track = streamRef.current?.getVideoTracks()[0] ?? null;
+    return captureFinalStill({
+      imageCapture: createImageCapture(track),
+      isTrackLive: () => track?.readyState === "live",
+      decodeBlob: (blob) => createImageBitmap(blob),
+      drawBitmap: drawBitmapToCanvas,
+      canvasCapture: () => grabFrame(FINAL_CAPTURE_W),
+    });
+  }, [drawBitmapToCanvas, grabFrame]);
+
   // Worker-first frame analysis. QR decoding + OMR run off the main thread so
   // the camera preview and buttons never stutter; the pixel buffer is
   // TRANSFERRED (zero-copy). If workers are unavailable, error, or hang, we
@@ -373,7 +421,7 @@ export default function SmartScanMobilePage() {
     (img: ImageData, qrText: string | null, thoroughQr: boolean): Promise<FrameAnalysis> => {
       if (workerFailedRef.current) {
         lastEngineRef.current = "fallback";
-        return Promise.resolve(analyzeFrameData(img, assessmentId, qrText, thoroughQr));
+        return analyzeFrameAsync(img, assessmentId, qrText, thoroughQr);
       }
       lastEngineRef.current = "worker";
       try {
@@ -421,7 +469,7 @@ export default function SmartScanMobilePage() {
       } catch {
         workerFailedRef.current = true;
         lastEngineRef.current = "fallback";
-        return Promise.resolve(analyzeFrameData(img, assessmentId, qrText, thoroughQr));
+        return analyzeFrameAsync(img, assessmentId, qrText, thoroughQr);
       }
     },
     [assessmentId],
@@ -746,8 +794,30 @@ export default function SmartScanMobilePage() {
           const expectation = stability.state
             ? { identity: genuineQr, state: stability.state }
             : null;
-          const finalFrame = grabFrame(FINAL_CAPTURE_W);
+          // Guard against a second final capture for the same stable hold: the
+          // ladder awaits, and another loop tick must not start a parallel
+          // takePhoto against the same track.
+          if (finalCaptureInFlightRef.current) {
+            if (runIsActive()) scheduleNextFrame();
+            return;
+          }
+          finalCaptureInFlightRef.current = true;
+          // `finally` rather than try/catch: the ladder already contains its own
+          // failures and resolves to null, but the in-flight flag must clear
+          // even if something unexpected rejects.
+          const finalStill = await captureFinalFrame().finally(() => {
+            finalCaptureInFlightRef.current = false;
+          });
+          if (!runIsActive()) return;
+          const finalFrame = finalStill?.image ?? null;
           const capturedAt = Date.now();
+          if (finalStill) {
+            setFinalCaptureInfo({
+              source: finalStill.source,
+              width: finalStill.sourceWidth,
+              height: finalStill.sourceHeight,
+            });
+          }
           if (!expectation || !finalFrame) {
             stabilityRef.current = null;
             accumRef.current = null;
@@ -813,7 +883,7 @@ export default function SmartScanMobilePage() {
       }
     }
     if (runIsActive()) scheduleNextFrame();
-  }, [analyzeAsync, grabFrame, handleStableScan, scheduleNextFrame]);
+  }, [analyzeAsync, captureFinalFrame, grabFrame, handleStableScan, scheduleNextFrame]);
 
   useEffect(() => {
     loopRef.current = loop;
@@ -1053,7 +1123,15 @@ export default function SmartScanMobilePage() {
   );
 
   return (
-    <div className="mx-auto min-h-screen max-w-md bg-slate-950 p-3 text-white">
+    // `app-safe-area` replaces the plain `p-3`: viewport-fit=cover puts this
+    // shell under the iOS status bar and home indicator, so the device insets
+    // must be added to the padding or the header sits behind the clock.
+    // --app-shell-pad is the 0.75rem this layout used before (Tailwind p-3).
+    <div
+      data-testid="scanner-shell"
+      style={{ "--app-shell-pad": "0.75rem" } as React.CSSProperties}
+      className="app-safe-area mx-auto min-h-screen max-w-md bg-slate-950 text-white"
+    >
       <header className="mb-3 rounded-xl bg-indigo-700 px-4 py-3 text-white">
         <div className="flex items-baseline justify-between gap-2">
           <div className="text-lg font-extrabold">DALIguro Phone Scanner</div>
@@ -1199,6 +1277,14 @@ export default function SmartScanMobilePage() {
                 <span>Learner: <b className="text-slate-900">{pendingScan.learnerId}</b></span>
                 <span>Source: <b className="text-slate-900">{pendingScan.captureSource}</b></span>
                 <span>QR path: <b className="text-slate-900">{pendingScan.identitySource ?? "native/unknown"}</b></span>
+                {finalCaptureInfo ? (
+                  <span>
+                    Still:{" "}
+                    <b className="text-slate-900">
+                      {finalCaptureInfo.source} {finalCaptureInfo.width}×{finalCaptureInfo.height}
+                    </b>
+                  </span>
+                ) : null}
                 <span>Version: <b className="text-slate-900">{pendingScan.version || "—"}</b></span>
                 <span>Assessment: <b className="text-slate-900">{assessmentId || "—"}</b></span>
                 <span>Items: <b className="text-slate-900">{pendingScan.detected.length}/{pendingScan.totalItems}</b></span>

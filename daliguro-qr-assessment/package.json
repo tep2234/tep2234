@@ -13,6 +13,9 @@
     "preview:https": "cross-env HTTPS=true vite preview",
     "test": "vitest run",
     "test:browser": "playwright test",
+    "test:browser:verify": "node scripts/verify-browser-tests.mjs",
+    "camera:field:manifest": "node scripts/create-camera-field-manifest.mjs",
+    "camera:field:validate": "node scripts/validate-camera-field-results.mjs",
     "test:db": "bash scripts/test-postgres-migrations.sh"
   },
   "dependencies": {
@@ -22,7 +25,8 @@
     "qrcode": "^1.5.4",
     "react": "^19.2.6",
     "react-dom": "^19.2.6",
-    "react-router-dom": "^7.18.1"
+    "react-router-dom": "^7.18.1",
+    "zxing-wasm": "3.1.1"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
